@@ -6,8 +6,10 @@ and the project-owned requirements matrix, without making a conformance
 claim of any kind.
 """
 
-from helpers import (default_facts, finding_by_id, fragment, pkg,
-                     profile_config, render_all)
+import helpers
+import meta_cyclonedx
+from helpers import (default_facts, finding_by_id, fragment,
+                     pkg, profile_config, render_all)
 
 
 def test_no_profile_emits_no_alignment_report():
@@ -213,3 +215,25 @@ def test_report_enforcement_never_fails_on_findings():
     assert "failure" not in docs
     assert any(f["verdict"] in ("unmet", "unverifiable")
                for f in docs["report"]["findings"])
+
+def test_alignment_report_bytes_are_deterministic_for_equivalent_facts():
+    first, _logs = render_all(default_facts(config=profile_config()))
+    second, _logs = render_all(default_facts(config=profile_config()))
+    assert meta_cyclonedx.serialize_report(first["report"]) == \
+        meta_cyclonedx.serialize_report(second["report"])
+
+
+def test_alignment_report_carries_no_wall_clock_or_document_serial():
+    docs, _logs = render_all(default_facts(config=profile_config()))
+    text = meta_cyclonedx.serialize_report(docs["report"])
+    assert "urn:uuid" not in text
+    assert helpers.TIMESTAMP not in text
+
+def test_generated_alignment_report_makes_no_conformance_claim():
+    docs, _logs = render_all(default_facts(config=profile_config()))
+    report = docs["report"]
+    text = meta_cyclonedx.serialize_report(report)
+    assert "conformant" not in text.lower()
+    statement = report["conformanceDetermination"].lower()
+    assert "conformance determination" in statement
+    assert "meta-cyclonedx makes no tr-03183-2 or cra conformance claim" in statement

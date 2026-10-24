@@ -79,6 +79,16 @@ def _alignment_profile():
 
 SUPPORTED_SPEC_VERSIONS = ["1.6", "1.7"]
 
+# Vocabulary note (ADR-0011): meta-cyclonedx produces alignment evidence,
+# never a conformance claim; the conformance determination stays with the
+# manufacturer. This statement rides along in every alignment report.
+CONFORMANCE_DETERMINATION_NOTE = (
+    "meta-cyclonedx makes no TR-03183-2 or CRA conformance claim; this "
+    "alignment report is evidence for the manufacturer's conformance "
+    "determination, which also requires completeness evidence unavailable "
+    "to meta-cyclonedx."
+)
+
 # Image types supported by CycloneDX 1.6 and 1.7
 SUPPORTED_IMAGE_TYPES = [
     "application",
@@ -138,6 +148,18 @@ def config_errors(spec_version, image_type, profile=None, enforcement=None):
         return ("CYCLONEDX_PROFILE_ENFORCEMENT requires CYCLONEDX_PROFILE "
                 "to select an alignment profile")
     return None
+
+
+def serialize_report(report):
+    """
+    Serialize an alignment report to its canonical artifact text.
+
+    The findings are ordered by requirement identifier and the keys are
+    sorted, so equivalent normalized facts always produce byte-identical
+    output; the report carries no wall-clock time and no values derived
+    from per-render random identifiers.
+    """
+    return json.dumps(report, indent=2, sort_keys=True) + "\n"
 
 
 def component_identity(products_names, version, purl, external_references=None):
@@ -636,6 +658,7 @@ def render(facts):
         "alignmentProfile": profile,
         "alignmentEnforcement": enforcement,
         "profileBaseline": baseline,
+        "conformanceDetermination": CONFORMANCE_DETERMINATION_NOTE,
         "findings": findings,
     }
     if enforcement == "strict":
