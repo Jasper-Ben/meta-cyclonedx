@@ -128,6 +128,69 @@ _applies_source_uris, _check_source_uris = _uri_field({"vcs", "source-distributi
 _applies_deployable_uris, _check_deployable_uris = _uri_field({"distribution"}, "deployable form")
 
 
+def _check_component_names(context):
+    missing = [component["bom-ref"]
+               for component in context["sbom"].get("components") or []
+               if not component.get("name")]
+    if not missing:
+        return "verified", "every component carries a component name"
+    return "unmet", "components lack a component name", missing
+
+
+def _check_component_versions(context):
+    missing = [component["bom-ref"]
+               for component in context["sbom"].get("components") or []
+               if not component.get("version")
+               or component.get("version") == "unknown"]
+    if not missing:
+        return "verified", ("every component carries a usable component "
+                            "version")
+    return "unmet", ("components carry no usable component version (empty or "
+                     "the unknown placeholder)"), missing
+
+
+def _check_sbom_timestamp(context):
+    if (context["sbom"].get("metadata") or {}).get("timestamp"):
+        return "verified", "the SBOM records the generation timestamp"
+    return "unmet", "the SBOM carries no generation timestamp"
+
+
+def _check_dependency_completeness_declaration(context):
+    sbom = context["sbom"]
+    if "dependencies" not in sbom:
+        return "unmet", "the SBOM carries no dependency graph"
+    if not sbom.get("composition"):
+        return "unmet", ("the SBOM does not declare dependency completeness "
+                         "through CycloneDX composition data")
+    return "verified", ("the dependency graph is present and declares its "
+                        "completeness")
+
+
+def _check_component_creators(context):
+    missing = [component["bom-ref"]
+               for component in context["sbom"].get("components") or []
+               if not component.get("author") and not component.get("contact")]
+    if not missing:
+        return "verified", ("every component carries a creator identifiable "
+                            "by email address or URL")
+    return "unmet", ("components carry no creator identifiable by email "
+                     "address or URL"), missing
+
+
+def _check_distribution_licences(context):
+    return "unmet", ("recipe-declared licences are original licence evidence "
+                     "only; no authoritative distribution licence source is "
+                     "represented in the SBOM")
+
+
+def _check_no_vulnerability_data_in_sbom(context):
+    if "vulnerabilities" in context["sbom"]:
+        return "unmet", ("the SBOM embeds vulnerability records; vulnerability "
+                         "status belongs in the separate VEX document")
+    return "verified", ("the SBOM carries no vulnerability data; status lives "
+                        "in the separate VEX document")
+
+
 def _check_primary_component_assertion(context):
     primary = context["facts"].get("primary") or {}
     if primary.get("name") and primary.get("version") and primary.get("type"):
@@ -154,6 +217,22 @@ TR03183_2_REQUIREMENTS = [
         "representation": "metadata.authors entry with an email address or URL",
         "origin": "generated-document",
         "check": _check_sbom_creator,
+    },
+    {
+        "id": "REQ-COMP-001",
+        "source": ("BSI TR-03183-2 v2.1.0 §5.2.2 (component-level data "
+                   "fields: component name)"),
+        "representation": "components[].name",
+        "origin": "generated-document",
+        "check": _check_component_names,
+    },
+    {
+        "id": "REQ-COMP-002",
+        "source": ("BSI TR-03183-2 v2.1.0 §5.2.2 (component-level data "
+                   "fields: component version)"),
+        "representation": "components[].version",
+        "origin": "generated-document",
+        "check": _check_component_versions,
     },
     {
         "id": "REQ-COMP-003",
@@ -246,6 +325,49 @@ TR03183_2_REQUIREMENTS = [
         "origin": "generated-document",
         "applies": _applies_deployable_uris,
         "check": _check_deployable_uris,
+    },
+    {
+        "id": "REQ-SBOM-002",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.1 (SBOM-level data fields: "
+                   "timestamp)"),
+        "representation": "metadata.timestamp",
+        "origin": "generated-document",
+        "check": _check_sbom_timestamp,
+    },
+    {
+        "id": "REQ-COMP-009",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.2 (dependencies with a "
+                   "completeness indicator)"),
+        "representation": ("dependencies graph plus CycloneDX composition "
+                           "completeness data"),
+        "origin": "generated-document",
+        "check": _check_dependency_completeness_declaration,
+    },
+    {
+        "id": "REQ-COMP-010",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.2 (component-level data "
+                   "fields: component creator)"),
+        "representation": ("component author or contact with an email address "
+                           "or URL"),
+        "origin": "generated-document",
+        "check": _check_component_creators,
+    },
+    {
+        "id": "REQ-COMP-011",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.2 (distribution licences) "
+                   "and \u00a76.1 (SPDX licence identifiers)"),
+        "representation": ("distribution licence with SPDX identifiers or "
+                           "expressions"),
+        "origin": "generated-document",
+        "check": _check_distribution_licences,
+    },
+    {
+        "id": "REQ-VULN-001",
+        "source": "BSI TR-03183-2 v2.1.0 \u00a73.1 (no vulnerability data in the SBOM)",
+        "representation": ("vulnerability status in the separate VEX document "
+                           "only"),
+        "origin": "generated-document",
+        "check": _check_no_vulnerability_data_in_sbom,
     },
 ]
 

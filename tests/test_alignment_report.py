@@ -151,3 +151,65 @@ def test_conditional_uri_requirements_record_their_applicability():
     finding = finding_by_id(docs["report"], "REQ-URI-002")
     assert finding["applicability"] == "applicable"
     assert finding["verdict"] == "verified"
+
+def test_component_version_finding_names_affected_components():
+    facts = default_facts(
+        config=profile_config(),
+        fragments={"busybox": fragment(pkgs=[
+            pkg("busybox", "unknown", "ref-busybox"),
+            pkg("zlib", "1.3", "ref-zlib"),
+        ])},
+    )
+    docs, _logs = render_all(facts)
+
+    version = finding_by_id(docs["report"], "REQ-COMP-002")
+    assert version["verdict"] == "unmet"
+    assert version["bomRefs"] == ["ref-busybox"]
+
+    name = finding_by_id(docs["report"], "REQ-COMP-001")
+    assert name["verdict"] == "verified"
+    assert "bomRefs" not in name
+
+def test_requirements_matrix_assigns_the_four_attributes_to_every_row():
+    docs, _logs = render_all(default_facts(config=profile_config()))
+    findings = docs["report"]["findings"]
+    assert len(findings) == len({f["requirementId"] for f in findings})
+    for finding in findings:
+        assert set(finding) >= {"requirementId", "normativeSource",
+                                "cyclonedxRepresentation", "applicability",
+                                "verdict", "evidenceOrigin",
+                                "diagnosticMessage"}
+        assert finding["verdict"] in ("verified", "asserted", "unmet",
+                                      "unverifiable")
+        assert finding["applicability"] in ("applicable", "not-applicable")
+        assert finding["normativeSource"].startswith("BSI TR-03183-2 v2.1.0")
+        assert finding["cyclonedxRepresentation"]
+        assert finding["diagnosticMessage"]
+
+    sources = " ".join(f["normativeSource"] for f in findings)
+    for section in ("\u00a73.1", "\u00a74 ", "\u00a75.2.1", "\u00a75.2.2",
+                    "\u00a75.2.3", "\u00a75.2.4", "\u00a76.1"):
+        assert section in sources, section
+
+def test_strict_enforcement_fails_on_machine_detectable_violations():
+    docs, _logs = render_all(default_facts(config=profile_config(
+        enforcement="strict")))
+    assert "sbom" not in docs
+    assert "vex" not in docs
+    failure = docs["failure"]
+    assert failure["alignmentEnforcement"] == "strict"
+    # Machine-detectable violations block the output...
+    assert "REQ-COMP-011" in failure["unmetRequirementIds"]
+    assert failure["unmetRequirementIds"] == sorted(failure["unmetRequirementIds"])
+    # ...while unverifiable findings do not.
+    assert "REQ-DEPS-001" not in failure["unmetRequirementIds"]
+    assert "REQ-COMP-011" in failure["diagnosticMessage"]
+    # The evaluated report rides along for build-log diagnostics.
+    assert failure["report"]["alignmentProfile"] == "tr03183-2.1"
+
+
+def test_report_enforcement_never_fails_on_findings():
+    docs, _logs = render_all(default_facts(config=profile_config()))
+    assert "failure" not in docs
+    assert any(f["verdict"] in ("unmet", "unverifiable")
+               for f in docs["report"]["findings"])

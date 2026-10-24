@@ -638,6 +638,21 @@ def render(facts):
         "profileBaseline": baseline,
         "findings": findings,
     }
+    if enforcement == "strict":
+        unmet = sorted(finding["requirementId"] for finding in findings
+                       if finding["verdict"] == "unmet"
+                       and finding["applicability"] == "applicable")
+        if unmet:
+            return {"failure": {
+                "alignmentEnforcement": "strict",
+                "unmetRequirementIds": unmet,
+                "diagnosticMessage": (
+                    f"Alignment profile {profile} with strict enforcement "
+                    f"rejects the output over {len(unmet)} unmet requirement(s): "
+                    f"{', '.join(unmet)}. Strict enforcement is an alignment "
+                    "gate and makes no conformance claim."),
+                "report": report,
+            }}
     return {"sbom": sbom, "vex": vex, "report": report}
 
 
