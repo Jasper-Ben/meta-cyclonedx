@@ -143,6 +143,7 @@ class KasRunRecorder:
                 )
         if not self._pinned:
             try:
+                kas_env.ensure_kas_submodule()
                 if self.engine == kas_env.KAS_DIRECT:
                     running = kas_env.direct_kas_version()
                     if running is None:
@@ -152,10 +153,8 @@ class KasRunRecorder:
                             "kas tool (the CI runner image ships it) or unset "
                             "the override"
                         )
-                    kas_env.ensure_kas_submodule()
                     tag, version = kas_env.check_kas_pin(running_version=running)
                 else:
-                    kas_env.ensure_kas_submodule()
                     tag, version = kas_env.check_kas_pin()
             except (RuntimeError, subprocess.CalledProcessError) as exc:
                 # Prerequisite gaps (submodule not checked out and not

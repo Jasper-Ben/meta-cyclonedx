@@ -613,24 +613,24 @@ def runtime_env_args(env):
     return args
 
 
-def kas_invocation(engine, extra_env=None, wrapper=KAS_CONTAINER, config="kas.yml"):
+def kas_invocation(engine, extra_env=None):
     """The (command, process-env extras) for one kas build invocation.
 
-    Container mode drives kas through the submodule's *wrapper*, whose
-    environment whitelist forces *extra_env* onto the --runtime-args
-    channel (see runtime_env_args). Direct mode execs the kas tool
-    installed in the current image — a plain invocation, no wrapper
-    argument chain — so *extra_env* rides the process environment
-    instead, and the project config's env: block forwards it into
-    BitBake the same way; the R5 install-list change reaches the build
-    config identically in both modes.
+    Container mode drives kas through the submodule's wrapper
+    (*KAS_CONTAINER*), whose environment whitelist forces *extra_env*
+    onto the --runtime-args channel (see runtime_env_args). Direct mode
+    execs the kas tool installed in the current image — a plain
+    invocation, no wrapper argument chain — so *extra_env* rides the
+    process environment instead, and the project config's env: block
+    forwards it into BitBake the same way; the R5 install-list change
+    reaches the build config identically in both modes.
     """
     if engine == KAS_DIRECT:
-        return ["kas", "build", config], dict(extra_env or {})
-    command = [str(wrapper)]
+        return ["kas", "build", "kas.yml"], dict(extra_env or {})
+    command = [str(KAS_CONTAINER)]
     if extra_env:
         command += runtime_env_args(extra_env)
-    return command + ["build", config], {}
+    return command + ["build", "kas.yml"], {}
 
 
 def tail(text, lines=60):
