@@ -59,3 +59,23 @@ def test_report_enforcement_emits_documents_despite_unmet_requirements():
     assert docs["sbom"]["bomFormat"] == "CycloneDX"
     assert docs["vex"]["bomFormat"] == "CycloneDX"
     assert any(f["verdict"] == "unmet" for f in docs["report"]["findings"])
+
+def test_creator_asserted_identity_yields_asserted_not_verified():
+    docs, _logs = render_all(default_facts(config=profile_config()))
+    finding = finding_by_id(docs["report"], "REQ-COMP-003")
+    assert finding["verdict"] == "asserted"
+    assert finding["evidenceOrigin"] == "caller-assertion"
+
+
+def test_missing_assertion_is_unmet_never_verified():
+    facts = default_facts(config=profile_config(), primary={})
+    docs, _logs = render_all(facts)
+    finding = finding_by_id(docs["report"], "REQ-COMP-003")
+    assert finding["verdict"] == "unmet"
+
+
+def test_assertion_evidence_alone_never_produces_verified():
+    docs, _logs = render_all(default_facts(config=profile_config()))
+    for finding in docs["report"]["findings"]:
+        if finding["evidenceOrigin"] == "caller-assertion":
+            assert finding["verdict"] in ("asserted", "unmet")

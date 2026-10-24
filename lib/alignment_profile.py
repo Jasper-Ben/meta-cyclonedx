@@ -43,6 +43,17 @@ def _check_sbom_creator(context):
                      "email address or URL")
 
 
+def _check_primary_component_assertion(context):
+    primary = context["facts"].get("primary") or {}
+    if primary.get("name") and primary.get("version") and primary.get("type"):
+        return "asserted", ("the product integration asserts the primary "
+                            "component type, name and version; creator-assigned "
+                            "identity cannot be independently checked by "
+                            "meta-cyclonedx")
+    return "unmet", ("the product integration did not assert the primary "
+                     "component type, name and version")
+
+
 TR03183_2_REQUIREMENTS = [
     {
         "id": "REQ-FMT-001",
@@ -58,6 +69,15 @@ TR03183_2_REQUIREMENTS = [
         "representation": "metadata.authors entry with an email address or URL",
         "origin": "generated-document",
         "check": _check_sbom_creator,
+    },
+    {
+        "id": "REQ-COMP-003",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.2 (component-level data "
+                   "fields: primary component name and version)"),
+        "representation": ("metadata.component type, name and version "
+                           "identifying the delivered product"),
+        "origin": "caller-assertion",
+        "check": _check_primary_component_assertion,
     },
 ]
 
