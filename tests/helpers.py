@@ -120,6 +120,24 @@ def render_docs(facts):
     return docs["sbom"], docs["vex"], logs
 
 
+def render_all(facts):
+    """Render and capture diagnostics; returns (docs, logs).
+
+    Use when the test needs the full renderer return value, e.g. the
+    alignment report or a strict-enforcement failure.
+    """
+    logs = []
+    facts.setdefault("log", lambda level, message: logs.append((level, message)))
+    return meta_cyclonedx.render(facts), logs
+
+
+def profile_config(**overrides):
+    """Renderer config that selects the TR-03183-2.1 alignment profile."""
+    config = default_config(profile="tr03183-2.1", enforcement="report")
+    config.update(overrides)
+    return config
+
+
 def component_names(sbom):
     return [c["name"] for c in sbom["components"]]
 
@@ -155,3 +173,9 @@ def vuln_by_id(vex, cve_id):
 
 def affect_refs(vuln):
     return [a["ref"] for a in vuln["affects"]]
+
+
+def finding_by_id(report, requirement_id):
+    matches = [f for f in report["findings"] if f["requirementId"] == requirement_id]
+    assert len(matches) == 1, f"expected exactly one finding {requirement_id}, got {len(matches)}"
+    return matches[0]

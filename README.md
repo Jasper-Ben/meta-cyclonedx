@@ -584,6 +584,57 @@ The following CycloneDX 1.7 features are **not currently supported** due to the 
 
 If you have specific requirements for these features, consider using external SBOM enrichment tools after generation or contributing implementations that integrate with specialized crypto scanners.
 
+### BSI TR-03183-2 Alignment Profile
+
+Selecting an **alignment profile** makes meta-cyclonedx apply BSI TR-03183-2
+mappings and checks and publish a machine-processable **alignment report**
+next to the SBOM and the separate VEX document. The alignment capability is
+**not a conformance claim**: meta-cyclonedx never labels an SBOM, product or
+manufacturer conformant with TR-03183-2 or the CRA. The **conformance
+determination** remains the manufacturer's own conclusion and requires
+completeness evidence that meta-cyclonedx cannot see.
+
+```sh
+# Versioned alignment profile; empty disables alignment output (default).
+# "tr03183-2.1" pins the profile baseline to BSI TR-03183-2 v2.1.0 and the
+# BSI CycloneDX property taxonomy v0.1.2 on CycloneDX 1.6 or 1.7.
+CYCLONEDX_PROFILE = "tr03183-2.1"
+
+# Alignment enforcement (default: "report"):
+#   report - publish SBOM, VEX and alignment report despite known gaps
+#   strict - fail the build on machine-detectable violations or missing
+#            required assertions (still no conformance claim)
+CYCLONEDX_PROFILE_ENFORCEMENT = "report"
+```
+
+Unsupported profile names, unsupported enforcement values, enforcement
+without a profile, and profile selections below CycloneDX 1.6 fail during
+configuration.
+
+The report is deployed as `${CYCLONEDX_EXPORT_BASENAME}.alignment-report.json`
+(configurable via `CYCLONEDX_EXPORT_ALIGNMENT_REPORT`). It is byte-for-byte
+deterministic for equivalent build facts: it records the exact profile
+baseline (TR-03183-2 v2.1.0, BSI CycloneDX property taxonomy v0.1.2, the
+selected CycloneDX schema and the requirements-matrix version), and one
+finding per requirements-matrix row with a stable requirement identifier,
+its normative source, applicability, verdict (`verified`, `asserted`,
+`unmet` or `unverifiable`), evidence origin, affected component references
+where applicable and a diagnostic message. Caller assertions can only ever
+produce `asserted` findings, never `verified` ones, and `unverifiable`
+findings never block the output.
+
+The versioned mapping from each baseline requirement to its CycloneDX
+representation and evaluation rule is project-owned data in
+`lib/alignment_profile.py`; an existing profile never floats to a newer
+guideline, taxonomy or schema version.
+
+Note: at this stage the profile's requirements matrix covers the
+TR-03183-2 v2.1.0 data-field baseline; requirements whose generator support
+arrives with later alignment work (file inventory, creator and licence
+evidence, dependency completeness declarations) are reported as `unmet`
+under `report` enforcement, so `strict` enforcement currently fails until
+that work has landed.
+
 ### Minimal SBOM Configuration
 
 Meta-cyclonedx supports generating a **minimal SBOM** that includes only the essential information required by the CycloneDX specification. This is useful for:
@@ -685,6 +736,11 @@ CYCLONEDX_TLP_MARKING = ""           # TLP marking (CLEAR|GREEN|AMBER|AMBER_AND_
 # Space-separated list of recipes to always include with scope "required",
 # even if they do not produce rootfs packages (default: "").
 CYCLONEDX_EXTRA_RUNTIME_RECIPES = ""
+
+# BSI TR-03183-2 alignment profile (default: "", no alignment output)
+CYCLONEDX_PROFILE = ""                    # or "tr03183-2.1"
+CYCLONEDX_PROFILE_ENFORCEMENT = "report"  # or "strict"
+CYCLONEDX_EXPORT_ALIGNMENT_REPORT = "${CYCLONEDX_EXPORT_BASENAME}.alignment-report.json"
 ```
 
 ### Use with non-rootfs image recipes

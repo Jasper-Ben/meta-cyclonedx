@@ -125,6 +125,21 @@ CYCLONEDX_ADD_CITATION ??= "1"
 # See: https://www.first.org/tlp/
 CYCLONEDX_TLP_MARKING ??= ""
 
+# Versioned BSI TR-03183-2 alignment profile; empty (default) keeps the
+# plain SBOM/VEX output. Supported: "tr03183-2.1", whose profile baseline
+# is BSI TR-03183-2 v2.1.0 plus the BSI CycloneDX property taxonomy v0.1.2
+# evaluated against CycloneDX 1.6 or 1.7. The profile applies TR-03183-2
+# mappings and checks without claiming conformance; the project-owned
+# requirements matrix lives in lib/alignment_profile.py.
+CYCLONEDX_PROFILE ??= ""
+
+# Alignment enforcement for the selected profile: "report" publishes the
+# SBOM, the separate VEX and the adjacent alignment report even when
+# requirements are unmet or unverifiable; "strict" fails the build on every
+# machine-detectable violation or missing required assertion. Neither mode
+# makes a conformance claim. Requires CYCLONEDX_PROFILE to be set.
+CYCLONEDX_PROFILE_ENFORCEMENT ??= "report"
+
 CYCLONEDX_TMP_EXPORT_DIR = "${WORKDIR}/cyclonedx-export"
 CYCLONEDX_EXPORT_DIR ??= "${DEPLOY_DIR_IMAGE}"
 # Try to set meaningful default filenames for both image and non-image recipes
@@ -132,10 +147,12 @@ CYCLONEDX_EXPORT_BASENAME ?= "${@d.getVar('IMAGE_NAME') or d.getVar('IMAGE_BASEN
 CYCLONEDX_EXPORT_SBOM ??= "${CYCLONEDX_EXPORT_BASENAME}.bom.json"
 CYCLONEDX_EXPORT_VEX ??= "${CYCLONEDX_EXPORT_BASENAME}.vex.json"
 CYCLONEDX_EXPORT_SBOM_CVE_CHECK_VEX ??= "${CYCLONEDX_EXPORT_BASENAME}.sbom-cve-check.vex.json"
+CYCLONEDX_EXPORT_ALIGNMENT_REPORT ??= "${CYCLONEDX_EXPORT_BASENAME}.alignment-report.json"
 # Create symlinks for image recipes similar to the image files by default.
 IMAGE_LINK_NAME ??= ""
 CYCLONEDX_EXPORT_SBOM_LINK ??= "${@'${IMAGE_LINK_NAME}.cyclonedx.bom.json' if d.getVar('IMAGE_LINK_NAME') else ''}"
 CYCLONEDX_EXPORT_VEX_LINK ??= "${@'${IMAGE_LINK_NAME}.cyclonedx.vex.json' if d.getVar('IMAGE_LINK_NAME') else ''}"
+CYCLONEDX_EXPORT_ALIGNMENT_REPORT_LINK ??= "${@'${IMAGE_LINK_NAME}.cyclonedx.alignment-report.json' if d.getVar('IMAGE_LINK_NAME') else ''}"
 CYCLONEDX_PNDATA_WORKDIR = "${WORKDIR}/cyclonedx"
 CYCLONEDX_PNDATA = "${TMPDIR}/cyclonedx/pn"
 CYCLONEDX_IMAGEDATA_WORKDIR = "${WORKDIR}/cyclonedx-image"
@@ -194,10 +211,13 @@ python () {
     extend_cve_status(d)
 
     # Validate renderer-relevant configuration; the supported CycloneDX
-    # versions and image types are owned by the renderer.
+    # versions, image types and alignment profile/enforcement combinations
+    # are owned by the renderer.
     error = _cyclonedx_renderer(d).config_errors(
         d.getVar("CYCLONEDX_SPEC_VERSION"), d.getVar("CYCLONEDX_IMAGE_TYPE"),
-        d.getVar("CYCLONEDX_IMAGE_CPE"))
+        d.getVar("CYCLONEDX_IMAGE_CPE"),
+        profile=d.getVar("CYCLONEDX_PROFILE"),
+        enforcement=d.getVar("CYCLONEDX_PROFILE_ENFORCEMENT"))
     if error:
         bb.fatal(error)
 }
@@ -1206,7 +1226,8 @@ def write_cyclonedx_image_data(d, sbom, vex):
 def export_cyclonedx(d):
     """
     Collect normalized build facts and artifact facts, hand them to the
-    renderer and deploy the SBOM and VEX documents it returns.
+    renderer and deploy the SBOM, VEX and (for a selected alignment
+    profile) alignment report it returns.
     """
     import os
     from pathlib import Path
@@ -1322,6 +1343,8 @@ def export_cyclonedx(d):
             "tlp_marking": d.getVar('CYCLONEDX_TLP_MARKING'),
             "add_vuln_timestamps": d.getVar('CYCLONEDX_ADD_VULN_TIMESTAMPS') == "1",
             "sbom_serial_placeholder": d.getVar('CYCLONEDX_SBOM_SERIAL_PLACEHOLDER'),
+            "profile": d.getVar('CYCLONEDX_PROFILE') or "",
+            "enforcement": d.getVar('CYCLONEDX_PROFILE_ENFORCEMENT') or "report",
         },
         "timestamp": timestamp,
         "log": _cyclonedx_log,
@@ -1332,8 +1355,11 @@ def export_cyclonedx(d):
         "runtime_edges": {pkg: sorted(deps) for pkg, deps in runtime_edges.items()},
         "included_images": included_images,
     })
+    if "failure" in docs:
+        bb.fatal(docs["failure"]["diagnosticMessage"])
     sbom = docs["sbom"]
     vex = docs["vex"]
+    report = docs.get("report")
 
     export_dir = d.getVar("CYCLONEDX_EXPORT_DIR")
     tmp_export_dir = d.getVar("CYCLONEDX_TMP_EXPORT_DIR")
@@ -1361,14 +1387,24 @@ def export_cyclonedx(d):
     export_sbom = get_cyclonedx_export_path("CYCLONEDX_EXPORT_SBOM", required=True)
     export_vex = get_cyclonedx_export_path("CYCLONEDX_EXPORT_VEX", required=True)
 
-    write_json(export_sbom, sbom)
-    write_json(export_vex, vex)
-    write_cyclonedx_image_data(d, sbom, vex)
-
     def make_deploy_symlink(target, link_name):
         if link_name and target != link_name:
             target = Path(target).relative_to(os.path.dirname(link_name))
             os.symlink(target, link_name)
+
+    write_json(export_sbom, sbom)
+    write_json(export_vex, vex)
+    if report is not None:
+        # The alignment report is written through the renderer's canonical
+        # serialization so equivalent facts always deploy identical bytes.
+        export_report = get_cyclonedx_export_path(
+            "CYCLONEDX_EXPORT_ALIGNMENT_REPORT", required=True)
+        with open(export_report, "w") as f:
+            f.write(_cyclonedx_renderer(d).serialize_report(report))
+        make_deploy_symlink(export_report,
+                            get_cyclonedx_export_path("CYCLONEDX_EXPORT_ALIGNMENT_REPORT_LINK"))
+    write_cyclonedx_image_data(d, sbom, vex)
+
     make_deploy_symlink(export_sbom, get_cyclonedx_export_path("CYCLONEDX_EXPORT_SBOM_LINK"))
     if not cyclonedx_sbom_cve_check_enabled(d):
         make_deploy_symlink(export_vex, get_cyclonedx_export_path("CYCLONEDX_EXPORT_VEX_LINK"))
@@ -1383,7 +1419,9 @@ python do_export_cyclonedx() {
 ROOTFS_POSTUNINSTALL_COMMAND =+ "do_export_cyclonedx"
 # Looked up through a variable name argument, invisible to the signature
 export_cyclonedx[vardeps] += "CYCLONEDX_EXPORT_SBOM CYCLONEDX_EXPORT_VEX \
-    CYCLONEDX_EXPORT_SBOM_LINK CYCLONEDX_EXPORT_VEX_LINK"
+    CYCLONEDX_EXPORT_SBOM_LINK CYCLONEDX_EXPORT_VEX_LINK \
+    CYCLONEDX_EXPORT_ALIGNMENT_REPORT CYCLONEDX_EXPORT_ALIGNMENT_REPORT_LINK \
+    CYCLONEDX_PROFILE CYCLONEDX_PROFILE_ENFORCEMENT"
 
 SSTATETASKS += "do_deploy_cyclonedx"
 do_deploy_cyclonedx[sstate-inputdirs] = "${CYCLONEDX_TMP_EXPORT_DIR} ${CYCLONEDX_IMAGEDATA_WORKDIR}"
@@ -1392,6 +1430,7 @@ do_deploy_cyclonedx[vardeps] += "CYCLONEDX_EXPORT_DIR"
 # Link names are stable (no timestamp) so they can safely invalidate sstate without churn.
 do_deploy_cyclonedx[vardeps] += "CYCLONEDX_EXPORT_SBOM_LINK"
 do_deploy_cyclonedx[vardeps] += "CYCLONEDX_EXPORT_VEX_LINK"
+do_deploy_cyclonedx[vardeps] += "CYCLONEDX_EXPORT_ALIGNMENT_REPORT CYCLONEDX_EXPORT_ALIGNMENT_REPORT_LINK"
 python do_deploy_cyclonedx_setscene() {
     sstate_setscene(d)
 }
@@ -1474,6 +1513,12 @@ do_populate_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/meta_cyclone
 do_rootfs[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/meta_cyclonedx.py:True"
 do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/meta_cyclonedx.py:True"
 do_cyclonedx_sbom_cve_check[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/meta_cyclonedx.py:True"
+# The requirements-matrix module is loaded by the renderer, so its bytes
+# belong in the same task signatures.
+do_populate_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/alignment_profile.py:True"
+do_rootfs[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/alignment_profile.py:True"
+do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/alignment_profile.py:True"
+do_cyclonedx_sbom_cve_check[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/alignment_profile.py:True"
 python do_cyclonedx_sbom_cve_check_setscene() {
     sstate_setscene(d)
 }

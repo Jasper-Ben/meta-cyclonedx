@@ -25,6 +25,8 @@ config                rendered document options:
     include_unpatched_vulns       bool   (sbom-cve-check merge only)
     unpatched_vulns_state         str    (sbom-cve-check merge only)
     sbom_serial_placeholder       str    placeholder used in fragment VEX refs
+    profile                       str    alignment profile name ("" = none)
+    enforcement                   str    "report" (default) | "strict"
 timestamp             ISO-8601 string used for both document metadata blocks
 log                   callable(level, message); level is an int debug level
                       or one of "warn", "error", "note"
@@ -53,11 +55,45 @@ included_images       ordered embedded-image documents:
 """
 
 import copy
+import importlib
+import importlib.util
+import json
+import os
 import re
 import uuid
 from datetime import datetime, timezone
 
+
+def _alignment_profile():
+    """
+    Load the project-owned requirements-matrix module that sits next to
+    this file. Under BitBake the layer's lib directory is not on the
+    worker's module search path, so fall back to loading by path, mirroring
+    how the adapter loads this module itself.
+    """
+    try:
+        return importlib.import_module("alignment_profile")
+    except ImportError:
+        name = "cyclonedx_alignment_profile"
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "alignment_profile.py")
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+
 SUPPORTED_SPEC_VERSIONS = ["1.6", "1.7"]
+
+# Vocabulary note (ADR-0011): meta-cyclonedx produces alignment evidence,
+# never a conformance claim; the conformance determination stays with the
+# manufacturer. This statement rides along in every alignment report.
+CONFORMANCE_DETERMINATION_NOTE = (
+    "meta-cyclonedx makes no TR-03183-2 or CRA conformance claim; this "
+    "alignment report is evidence for the manufacturer's conformance "
+    "determination, which also requires completeness evidence unavailable "
+    "to meta-cyclonedx."
+)
 
 # Image types supported by CycloneDX 1.6 and 1.7
 SUPPORTED_IMAGE_TYPES = [
@@ -150,12 +186,26 @@ def image_purl(base_purl, layer_version=None, repository_url=None):
     return base_purl + "?" + "&".join(qualifiers)
 
 
-def config_errors(spec_version, image_type, image_cpe=None):
+def config_errors(spec_version, image_type, image_cpe=None, profile=None, enforcement=None):
     """
     Validate renderer-relevant configuration and return a human-readable
     fatal error string, or None when the configuration is supported. The
-    image_cpe argument carries the optional CYCLONEDX_IMAGE_CPE override.
+    image_cpe carries the optional CYCLONEDX_IMAGE_CPE override. An absent
+    profile keeps the plain output; strict enforcement requires a profile.
     """
+    matrix = _alignment_profile()
+    if profile:
+        baseline = matrix.PROFILES.get(profile)
+        if baseline is None:
+            return (f"Unsupported CYCLONEDX_PROFILE: {profile}. "
+                    f"Supported profiles: {', '.join(sorted(matrix.PROFILES))}")
+        if spec_version not in baseline["specVersions"]:
+            return (
+                f"Alignment profile '{profile}' supports CycloneDX "
+                f"{', '.join(baseline['specVersions'])}; CYCLONEDX_SPEC_VERSION "
+                f"'{spec_version}' is an unsupported profile/schema combination"
+            )
+
     if spec_version not in SUPPORTED_SPEC_VERSIONS:
         return (f"Unsupported CYCLONEDX_SPEC_VERSION: {spec_version}. "
                 f"Supported versions: {', '.join(SUPPORTED_SPEC_VERSIONS)}")
@@ -168,8 +218,26 @@ def config_errors(spec_version, image_type, image_cpe=None):
 
     if image_cpe and not cpe_23_is_valid(image_cpe):
         return f"Invalid CPE 2.3 in CYCLONEDX_IMAGE_CPE: '{image_cpe}'"
+    if enforcement and enforcement not in matrix.ENFORCEMENT_VALUES:
+        return (f"Unsupported CYCLONEDX_PROFILE_ENFORCEMENT: {enforcement}. "
+                f"Supported values: {', '.join(matrix.ENFORCEMENT_VALUES)}")
+
+    if not profile and enforcement and enforcement != "report":
+        return ("CYCLONEDX_PROFILE_ENFORCEMENT requires CYCLONEDX_PROFILE "
+                "to select an alignment profile")
     return None
 
+
+def serialize_report(report):
+    """
+    Serialize an alignment report to its canonical artifact text.
+
+    The findings are ordered by requirement identifier and the keys are
+    sorted, so equivalent normalized facts always produce byte-identical
+    output; the report carries no wall-clock time and no values derived
+    from per-render random identifiers.
+    """
+    return json.dumps(report, indent=2, sort_keys=True) + "\n"
 
 def component_identity(products_names, version, cpe_update, purl, external_references=None):
     """
@@ -324,8 +392,11 @@ def render(facts):
     """
     Render the SBOM and VEX documents from normalized build facts.
 
-    Returns {"sbom": ..., "vex": ...}. The documents depend only on the
-    facts; diagnostics are reported through the facts["log"] callback.
+    Returns {"sbom": ..., "vex": ...}, plus {"report": ...} when an
+    alignment profile is selected. With strict alignment enforcement and
+    at least one machine-detectable violation the renderer returns no
+    documents but {"failure": ...}. Everything depends only on the facts;
+    diagnostics are reported through the facts["log"] callback.
     """
     timestamp = facts.get("timestamp")
     log = facts.get("log")
@@ -333,6 +404,8 @@ def render(facts):
     spec_version = config.get("spec_version") or "1.7"
     add_scopes = config.get("add_component_scopes", True)
     placeholder = config.get("sbom_serial_placeholder", "")
+    profile = config.get("profile") or ""
+    enforcement = config.get("enforcement") or "report"
 
     fragments = copy.deepcopy(facts.get("fragments") or {})
     runtime_recipes = set(facts.get("runtime_recipes") or ())
@@ -660,7 +733,34 @@ def render(facts):
     # Sort vulnerabilities by CVE id for a stable, human-readable order.
     vex["vulnerabilities"].sort(key=lambda v: v["id"])
 
-    return {"sbom": sbom, "vex": vex}
+    if not profile:
+        return {"sbom": sbom, "vex": vex}
+
+    baseline, findings = _alignment_profile().evaluate(
+        profile, spec_version, sbom, vex, facts)
+    report = {
+        "alignmentProfile": profile,
+        "alignmentEnforcement": enforcement,
+        "profileBaseline": baseline,
+        "conformanceDetermination": CONFORMANCE_DETERMINATION_NOTE,
+        "findings": findings,
+    }
+    if enforcement == "strict":
+        unmet = sorted(finding["requirementId"] for finding in findings
+                       if finding["verdict"] == "unmet"
+                       and finding["applicability"] == "applicable")
+        if unmet:
+            return {"failure": {
+                "alignmentEnforcement": "strict",
+                "unmetRequirementIds": unmet,
+                "diagnosticMessage": (
+                    f"Alignment profile {profile} with strict enforcement "
+                    f"rejects the output over {len(unmet)} unmet requirement(s): "
+                    f"{', '.join(unmet)}. Strict enforcement is an alignment "
+                    "gate and makes no conformance claim."),
+                "report": report,
+            }}
+    return {"sbom": sbom, "vex": vex, "report": report}
 
 
 def merge_sbom_cve_check(sbom, vex, report, config, log=None):
