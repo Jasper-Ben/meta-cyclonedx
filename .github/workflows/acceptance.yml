@@ -62,6 +62,9 @@ jobs:
           submodules: true
           fetch-depth: 0
       - name: Run the R1-R5 acceptance matrix
+        # Explicit bash shell: -eo pipefail, so a red matrix is red even
+        # through the tee into the build log.
+        shell: bash
         run: >-
           python3 -m pytest -m integration --junitxml=comparison-summary.xml
           2>&1 | tee kas-build.log
