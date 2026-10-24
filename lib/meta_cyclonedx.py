@@ -302,6 +302,8 @@ def render(facts):
     spec_version = config.get("spec_version") or "1.7"
     add_scopes = config.get("add_component_scopes", True)
     placeholder = config.get("sbom_serial_placeholder", "")
+    profile = config.get("profile") or ""
+    enforcement = config.get("enforcement") or "report"
 
     fragments = copy.deepcopy(facts.get("fragments") or {})
     runtime_recipes = set(facts.get("runtime_recipes") or ())
@@ -625,7 +627,18 @@ def render(facts):
     # Sort vulnerabilities by CVE id for a stable, human-readable order.
     vex["vulnerabilities"].sort(key=lambda v: v["id"])
 
-    return {"sbom": sbom, "vex": vex}
+    if not profile:
+        return {"sbom": sbom, "vex": vex}
+
+    baseline, findings = _alignment_profile().evaluate(
+        profile, spec_version, sbom, vex, facts)
+    report = {
+        "alignmentProfile": profile,
+        "alignmentEnforcement": enforcement,
+        "profileBaseline": baseline,
+        "findings": findings,
+    }
+    return {"sbom": sbom, "vex": vex, "report": report}
 
 
 def merge_sbom_cve_check(sbom, vex, report, config, log=None):

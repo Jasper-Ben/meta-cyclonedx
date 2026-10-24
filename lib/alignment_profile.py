@@ -23,7 +23,43 @@ SBOM, product or manufacturer conformant with TR-03183-2 or the CRA.
 # Evaluation rules return a verdict for one requirement against one
 # rendered document set; they live next to the rows they evaluate.
 
-TR03183_2_REQUIREMENTS = []
+
+def _check_cyclonedx_format(context):
+    sbom = context["sbom"]
+    version = sbom.get("specVersion")
+    if sbom.get("bomFormat") == "CycloneDX" and version in ("1.6", "1.7"):
+        return "verified", (f"the SBOM is a CycloneDX JSON document at "
+                            f"spec version {version}")
+    return "unmet", (f"the SBOM is not a CycloneDX JSON document at spec "
+                     f"version 1.6 or later (bomFormat {sbom.get('bomFormat')!r}, "
+                     f"specVersion {version!r})")
+
+
+def _check_sbom_creator(context):
+    metadata = context["sbom"].get("metadata") or {}
+    if metadata.get("authors"):
+        return "verified", "the SBOM names its creator through metadata.authors"
+    return "unmet", ("the SBOM does not identify an SBOM creator with an "
+                     "email address or URL")
+
+
+TR03183_2_REQUIREMENTS = [
+    {
+        "id": "REQ-FMT-001",
+        "source": "BSI TR-03183-2 v2.1.0 §4 (format requirements)",
+        "representation": "bomFormat CycloneDX with specVersion 1.6 or later",
+        "origin": "generated-document",
+        "check": _check_cyclonedx_format,
+    },
+    {
+        "id": "REQ-SBOM-001",
+        "source": ("BSI TR-03183-2 v2.1.0 §5.2.1 (SBOM-level data fields: "
+                   "creator of SBOM)"),
+        "representation": "metadata.authors entry with an email address or URL",
+        "origin": "generated-document",
+        "check": _check_sbom_creator,
+    },
+]
 
 PROFILES = {
     # The versioned TR-03183-2 alignment profile. The name carries the
@@ -44,3 +80,55 @@ PROFILES = {
 # and the alignment report despite known gaps; "strict" fails the build on
 # every machine-detectable violation or missing required assertion.
 ENFORCEMENT_VALUES = ["report", "strict"]
+
+
+def evaluate(profile_id, spec_version, sbom, vex, facts):
+    """
+    Evaluate the requirements matrix of one alignment profile against the
+    rendered documents and their facts.
+
+    Returns (profile baseline, findings): the exact guideline, property
+    taxonomy, CycloneDX schema and matrix versions used, and one finding
+    per matrix row, ordered by requirement identifier.
+    """
+    profile = PROFILES[profile_id]
+    baseline = {
+        "guideline": profile["guideline"],
+        "guidelineVersion": profile["guidelineVersion"],
+        "propertyTaxonomyVersion": profile["propertyTaxonomyVersion"],
+        "cyclonedxSchemaVersion": spec_version,
+        "requirementsMatrixVersion": profile["requirementsMatrixVersion"],
+    }
+    findings = [_evaluate_requirement(row, spec_version, sbom, vex, facts)
+                for row in profile["requirements"]]
+    findings.sort(key=lambda finding: finding["requirementId"])
+    return baseline, findings
+
+
+def _evaluate_requirement(row, spec_version, sbom, vex, facts):
+    """Turn one requirements-matrix row into one alignment report finding."""
+    context = {"spec_version": spec_version, "sbom": sbom, "vex": vex,
+               "facts": facts}
+    applicability = "applicable"
+    if row.get("applies"):
+        applies, reason = row["applies"](context)
+        if not applies:
+            applicability = "not-applicable"
+            result = ("unverifiable", reason)
+
+    if applicability == "applicable":
+        result = row["check"](context)
+
+    verdict, message = result[0], result[1]
+    finding = {
+        "requirementId": row["id"],
+        "normativeSource": row["source"],
+        "cyclonedxRepresentation": row["representation"],
+        "applicability": applicability,
+        "verdict": verdict,
+        "evidenceOrigin": row["origin"],
+        "diagnosticMessage": message,
+    }
+    if len(result) > 2 and result[2]:
+        finding["bomRefs"] = sorted(result[2])
+    return finding
