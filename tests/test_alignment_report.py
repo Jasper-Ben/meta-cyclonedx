@@ -6,8 +6,8 @@ and the project-owned requirements matrix, without making a conformance
 claim of any kind.
 """
 
-from helpers import (default_facts, finding_by_id, profile_config,
-                     render_all)
+from helpers import (default_facts, finding_by_id, fragment, pkg,
+                     profile_config, render_all)
 
 
 def test_no_profile_emits_no_alignment_report():
@@ -79,3 +79,75 @@ def test_assertion_evidence_alone_never_produces_verified():
     for finding in docs["report"]["findings"]:
         if finding["evidenceOrigin"] == "caller-assertion":
             assert finding["verdict"] in ("asserted", "unmet")
+
+def test_report_records_unverifiable_requirements_without_blocking_output():
+    docs, _logs = render_all(default_facts(config=profile_config()))
+    finding = finding_by_id(docs["report"], "REQ-DEPS-001")
+    assert finding["verdict"] == "unverifiable"
+    assert finding["applicability"] == "applicable"
+    assert finding["evidenceOrigin"] == "external-evidence"
+    assert docs["sbom"]["bomFormat"] == "CycloneDX"
+    assert docs["vex"]["bomFormat"] == "CycloneDX"
+
+def test_file_component_requirements_are_not_applicable_without_file_components():
+    docs, _logs = render_all(default_facts(config=profile_config()))
+    for requirement_id in ("REQ-COMP-004", "REQ-COMP-005", "REQ-COMP-006",
+                           "REQ-COMP-007", "REQ-COMP-008"):
+        finding = finding_by_id(docs["report"], requirement_id)
+        assert finding["applicability"] == "not-applicable"
+        assert finding["verdict"] == "unverifiable"
+        assert "file component" in finding["diagnosticMessage"]
+
+
+def test_file_component_requirements_apply_and_report_missing_bsi_fields():
+    facts = default_facts(
+        config=profile_config(),
+        fragments={"busybox": fragment(
+            pkgs=[pkg("busybox", "1.36", "ref-busybox", type="file")])},
+    )
+    docs, _logs = render_all(facts)
+    for requirement_id in ("REQ-COMP-004", "REQ-COMP-005", "REQ-COMP-006",
+                           "REQ-COMP-007", "REQ-COMP-008"):
+        finding = finding_by_id(docs["report"], requirement_id)
+        assert finding["applicability"] == "applicable"
+        assert finding["verdict"] == "unmet"
+        assert finding["bomRefs"] == ["ref-busybox"]
+
+
+def test_file_component_requirements_pass_with_bsi_fields_and_hash():
+    file_component = pkg(
+        "busybox", "1.36", "ref-busybox", type="file",
+        hashes=[{"alg": "SHA-512", "content": "0" * 128}],
+        properties=[
+            {"name": "bsi:component:filename", "value": "busybox"},
+            {"name": "bsi:component:executable", "value": "executable"},
+            {"name": "bsi:component:archive", "value": "no archive"},
+            {"name": "bsi:component:structured", "value": "unstructured"},
+        ],
+    )
+    facts = default_facts(
+        config=profile_config(),
+        fragments={"busybox": fragment(pkgs=[file_component])},
+    )
+    docs, _logs = render_all(facts)
+    for requirement_id in ("REQ-COMP-004", "REQ-COMP-005", "REQ-COMP-006",
+                           "REQ-COMP-007", "REQ-COMP-008"):
+        finding = finding_by_id(docs["report"], requirement_id)
+        assert finding["verdict"] == "verified", requirement_id
+
+
+def test_conditional_uri_requirements_record_their_applicability():
+    docs, _logs = render_all(default_facts(config=profile_config()))
+    for requirement_id in ("REQ-URI-001", "REQ-URI-002", "REQ-URI-003"):
+        finding = finding_by_id(docs["report"], requirement_id)
+        assert finding["applicability"] == "not-applicable"
+        assert finding["verdict"] == "unverifiable"
+
+    primary = {"type": "firmware", "name": "core-image", "version": "1.0",
+               "external_references": [
+                   {"type": "vcs", "url": "https://example.invalid/layer.git"}]}
+    docs, _logs = render_all(default_facts(config=profile_config(),
+                                           primary=primary))
+    finding = finding_by_id(docs["report"], "REQ-URI-002")
+    assert finding["applicability"] == "applicable"
+    assert finding["verdict"] == "verified"
