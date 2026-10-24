@@ -50,9 +50,32 @@ included_images       ordered embedded-image documents:
 """
 
 import copy
+import importlib
+import importlib.util
+import json
+import os
 import re
 import uuid
 from datetime import datetime, timezone
+
+
+def _alignment_profile():
+    """
+    Load the project-owned requirements-matrix module that sits next to
+    this file. Under BitBake the layer's lib directory is not on the
+    worker's module search path, so fall back to loading by path, mirroring
+    how the adapter loads this module itself.
+    """
+    try:
+        return importlib.import_module("alignment_profile")
+    except ImportError:
+        name = "cyclonedx_alignment_profile"
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "alignment_profile.py")
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
 
 SUPPORTED_SPEC_VERSIONS = ["1.6", "1.7"]
 
@@ -74,11 +97,29 @@ SUPPORTED_IMAGE_TYPES = [
 ]
 
 
-def config_errors(spec_version, image_type):
+def config_errors(spec_version, image_type, profile=None, enforcement=None):
     """
     Validate renderer-relevant configuration and return a human-readable
     fatal error string, or None when the configuration is supported.
+
+    profile and enforcement carry the CYCLONEDX_PROFILE and
+    CYCLONEDX_PROFILE_ENFORCEMENT selections; an absent or empty profile
+    keeps the plain (unaligned) output, so demanding enforcement without a
+    profile is a configuration error.
     """
+    matrix = _alignment_profile()
+    if profile:
+        baseline = matrix.PROFILES.get(profile)
+        if baseline is None:
+            return (f"Unsupported CYCLONEDX_PROFILE: {profile}. "
+                    f"Supported profiles: {', '.join(sorted(matrix.PROFILES))}")
+        if spec_version not in baseline["specVersions"]:
+            return (
+                f"Alignment profile '{profile}' supports CycloneDX "
+                f"{', '.join(baseline['specVersions'])}; CYCLONEDX_SPEC_VERSION "
+                f"'{spec_version}' is an unsupported profile/schema combination"
+            )
+
     if spec_version not in SUPPORTED_SPEC_VERSIONS:
         return (f"Unsupported CYCLONEDX_SPEC_VERSION: {spec_version}. "
                 f"Supported versions: {', '.join(SUPPORTED_SPEC_VERSIONS)}")
@@ -88,6 +129,14 @@ def config_errors(spec_version, image_type):
             f"Unsupported CYCLONEDX_IMAGE_TYPE value '{image_type}'. "
             f"Valid types are: {', '.join(SUPPORTED_IMAGE_TYPES)}"
         )
+
+    if enforcement and enforcement not in matrix.ENFORCEMENT_VALUES:
+        return (f"Unsupported CYCLONEDX_PROFILE_ENFORCEMENT: {enforcement}. "
+                f"Supported values: {', '.join(matrix.ENFORCEMENT_VALUES)}")
+
+    if not profile and enforcement and enforcement != "report":
+        return ("CYCLONEDX_PROFILE_ENFORCEMENT requires CYCLONEDX_PROFILE "
+                "to select an alignment profile")
     return None
 
 
