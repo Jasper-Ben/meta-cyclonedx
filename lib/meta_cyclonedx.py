@@ -25,6 +25,8 @@ config                rendered document options:
     include_unpatched_vulns       bool   (sbom-cve-check merge only)
     unpatched_vulns_state         str    (sbom-cve-check merge only)
     sbom_serial_placeholder       str    placeholder used in fragment VEX refs
+    profile                       str    alignment profile name ("" = none)
+    enforcement                   str    "report" (default) | "strict"
 timestamp             ISO-8601 string used for both document metadata blocks
 log                   callable(level, message); level is an int debug level
                       or one of "warn", "error", "note"
@@ -315,8 +317,11 @@ def render(facts):
     """
     Render the SBOM and VEX documents from normalized build facts.
 
-    Returns {"sbom": ..., "vex": ...}. The documents depend only on the
-    facts; diagnostics are reported through the facts["log"] callback.
+    Returns {"sbom": ..., "vex": ...}, plus {"report": ...} when an
+    alignment profile is selected. With strict alignment enforcement and
+    at least one machine-detectable violation the renderer returns no
+    documents but {"failure": ...}. Everything depends only on the facts;
+    diagnostics are reported through the facts["log"] callback.
     """
     timestamp = facts.get("timestamp")
     log = facts.get("log")
