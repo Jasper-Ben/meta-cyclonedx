@@ -55,10 +55,6 @@ def _applies_file_components(context):
                    "file-component data field does not apply")
 
 
-def _applies_always(context):
-    return True, ""
-
-
 def _property_presence(property_name):
     def check(context):
         missing = [component["bom-ref"] for component in _file_components(context)

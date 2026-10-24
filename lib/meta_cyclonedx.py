@@ -79,6 +79,7 @@ def _alignment_profile():
         spec.loader.exec_module(module)
         return module
 
+
 SUPPORTED_SPEC_VERSIONS = ["1.6", "1.7"]
 
 # Vocabulary note (ADR-0011): meta-cyclonedx produces alignment evidence,
