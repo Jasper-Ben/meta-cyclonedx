@@ -214,7 +214,7 @@ identical workflow file safe to merge upstream:
    skipped, never queued.
 3. Branch protection on main, blacksail, wrynose and scarthgap:
    require the three `unit (Python …)` checks before merge with admin
-   enforcement, and require code-owner review for `.github/` changes
+   enforcement, and require code-owner review for `.github/workflows/`
    (CODEOWNERS). Applied identically in both repositories.
 4. Prove the tier on this repository: one dispatch-driven full-matrix
    run and one nightly, both green with downloadable artifacts.
