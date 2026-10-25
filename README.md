@@ -773,14 +773,67 @@ representation and evaluation rule is project-owned data in
 guideline, taxonomy or schema version.
 
 Note: at this stage the profile's requirements matrix covers the
-TR-03183-2 v2.1.0 data-field and dependency-graph baseline; requirements
-whose generator support arrives with later alignment work (the
-file-component inventory) are reported as `unmet` under `report`
-enforcement, so `strict` enforcement currently fails until that work has
-landed. Where the build itself cannot establish completeness (component
-discovery, dependency depth beyond the scope of delivery, missing debug
-information), the findings are `unverifiable` - a valid result that never
-blocks the output.
+TR-03183-2 v2.1.0 data-field, dependency-graph and mandatory file
+inventory baseline. Where the build itself cannot establish completeness
+(component discovery, dependency depth beyond the scope of delivery,
+missing debug information), the findings are `unverifiable` - a valid
+result that never blocks the output.
+
+#### File Inventory
+
+With an alignment profile selected, the build additionally inventories
+the **mandatory delivered files** of the assembled root filesystem and
+represents each as a CycloneDX `type: file` component (ADR-0005): every
+delivered executable and archive owned by a package of the image.
+Without a profile the inventory is fully inactive - no file is read,
+hashed or represented, and the SBOM is byte-comparable to earlier
+logical-component output. This default is intentional: ordinary
+configuration, documentation and data files stay omitted, and no
+configuration option extends the mandatory scope in this release.
+
+Representation per inventoried file:
+
+- `name`: the delivered filename (path basename); the `version` is the
+  creator-assigned version of the delivering recipe's logical component
+- `hashes`: one SHA-512 over the delivered bytes - the artifact
+  identity; modes, paths and timestamps never enter the hash
+- `properties`: the pinned taxonomy's `bsi:component:filename`
+  (`executable|non-executable`), `bsi:component:archive`
+  (`archive|no archive`) and `bsi:component:structured`
+  (`structured|unstructured`) values
+- `bom-ref`: the deterministic `yocto-file:<recipe>:<delivered path>`,
+  so reruns and findings reference the same artifact
+- graph participation: the delivering logical component's dependency
+  entry gains the file reference; the file is a leaf with an empty
+  list. File components never copy the logical component's CPE, purl,
+  licences, creator or vulnerability findings (ADR-0006); VEX keeps
+  addressing logical component instances only.
+
+Classification is deterministic artifact inspection (ADR-0002): mode
+exec bits, `#!` shebangs and ELF signatures decide executability;
+container and compressed-stream magics (zip, tar, cpio, ar/deb, rpm,
+7z, gzip, xz, bzip2, zstd) decide archive status; `structured` reflects
+the metadata the artifact still carries - entry tables for archives,
+an ELF symbol table (a stripped ELF is `unstructured`) - inspected one
+nesting level deep for compressed tars. No binary analysis, dependency
+inference, debug-info extraction or plugin/`dlopen()` discovery ever
+happens; static-link attribution comes from pkgdata debug-source
+records only. Symlinks are not inventoried as separate artifacts: a
+link is a second name for the regular file it resolves to, which is
+inventoried itself. Discovery reads the pkgdata `files_info` records
+and uses the root filesystem as delivery ground truth, and hashes are
+stable across rebuilds because they cover content only. Cost: one
+pkgdata pass, a 64 KiB signature read of claimed files, and a full
+read plus SHA-512 of each mandatory file - well under a second added
+to `do_rootfs` for a `core-image-minimal`, since non-mandatory files
+are never hashed.
+
+Mandatory artifacts that are missing, unreadable or too truncated to
+classify never vanish from the output: they produce `REQ-FILE-00x`
+alignment findings naming the affected file references (`REQ-FILE-001`
+inventory coverage, `REQ-FILE-002` artifact inspection, `REQ-FILE-003`
+graph participation). `report` enforcement publishes documents and
+findings; `strict` enforcement fails on them.
 
 ### Minimal SBOM Configuration
 

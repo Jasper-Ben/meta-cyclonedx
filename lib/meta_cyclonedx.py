@@ -79,6 +79,22 @@ debug_sources         recipe -> delivered file -> debug-source paths recorded
                       in pkgdata; prefixes of other recipes become statically
                       linked dependency edges (missing/empty = unknown
                       static coverage, never absent dependencies)
+file_inventory         recipe -> ordered delivered-file artifact facts,
+                      collected only while an alignment profile is
+                      selected and covering only mandatory files
+                      (executables and archives); each entry:
+    path                        delivered path inside the root filesystem
+    sha512                      SHA-512 of the delivered bytes (absent on
+                                defective entries)
+    executable / archive /
+      structured                taxonomy values (absent on defective
+                                entries)
+    error                       "missing", "unreadable" or
+                                "ambiguous-classification" (defective
+                                entries stay reported, never vanish)
+                      The adapter skips symlinks and other non-regular
+                      entries: their content identity belongs to the
+                      regular file they resolve to.
 included_images       ordered embedded-image documents:
     name                          recipe name of the included image
     sbom                          its completed SBOM document, or None when
@@ -89,14 +105,20 @@ included_images       ordered embedded-image documents:
                                   SBOM itself is unreadable, else absent
 """
 
+import bz2
 import copy
 import importlib
 import importlib.util
 import json
+import lzma
 import os
+import posixpath
 import re
+import stat
+import struct
 import urllib.parse
 import uuid
+import zlib
 from datetime import datetime, timezone
 
 
@@ -296,6 +318,167 @@ ALIAS_CPE_PROPERTY = "yocto:cve:cpe"
 # recipe that compiled the file it names.
 DEBUG_SRC_RECIPE_PREFIX = re.compile(r"^/usr/src/debug/([^/]+)/[^/]+(?:/|$)")
 DEPENDENCY_EVIDENCE_PROPERTY = "yocto:dependency:evidence"
+
+# File inventory (BSI TR-03183-2 v2.1.0 §3.2.1 and §5.2.2): delivered
+# executables and archives arrive as normalized artifact facts and compose
+# into exact file components. The bom-ref is derived from the delivering
+# recipe and the delivered path, so reruns mint stable references without
+# randomness; file components carry artifact identity only and never a
+# purl, CPE or licence (ADR-0006).
+BSI_FILENAME_PROPERTY = "bsi:component:filename"
+BSI_EXECUTABLE_PROPERTY = "bsi:component:executable"
+BSI_ARCHIVE_PROPERTY = "bsi:component:archive"
+BSI_STRUCTURED_PROPERTY = "bsi:component:structured"
+
+
+def _file_bom_ref(recipe, path):
+    """The deterministic bom-ref of one inventoried delivered file."""
+    return f"yocto-file:{recipe}:{path}"
+
+
+# Artifact inspection signatures (ADR-0002): deterministic magic numbers
+# and file-structure metadata used only for inventory classification -
+# never to infer dependencies, embedded software or debug information.
+ARTIFACT_HEAD_SIZE = 65536
+_ELF_MAGIC = b"\x7fELF"
+_ZIP_LOCAL_MAGIC = b"PK\x03\x04"
+_ZIP_EMPTY_MAGIC = b"PK\x05\x06"
+_GZIP_MAGIC = b"\x1f\x8b"
+_XZ_MAGIC = b"\xfd7zXZ\x00"
+_BZIP2_MAGIC = b"BZh"
+_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+_7Z_MAGIC = b"7z\xbc\xaf\x27\x1c"
+_RPM_MAGIC = b"\xed\xab\xee\xdb"
+_AR_MAGIC = b"!<arch>\n"
+_CPIO_MAGICS = (b"070701", b"070707")
+_TAR_MAGIC = b"ustar"
+_SHT_SYMTAB = 2
+
+
+def _archive_kind(data):
+    """The container or compressed-stream family a signature reveals."""
+    if data.startswith((_ZIP_LOCAL_MAGIC, _ZIP_EMPTY_MAGIC)):
+        return "zip"
+    if data.startswith(_GZIP_MAGIC):
+        return "gzip"
+    if data.startswith(_XZ_MAGIC):
+        return "xz"
+    if data[0:3] == _BZIP2_MAGIC and data[3:4] in b"123456789":
+        return "bzip2"
+    if data.startswith(_ZSTD_MAGIC):
+        return "zstd"
+    if data.startswith(_7Z_MAGIC):
+        return "7z"
+    if data.startswith(_RPM_MAGIC):
+        return "rpm"
+    if data[:6] in _CPIO_MAGICS:
+        return "cpio"
+    if data[257:262] == _TAR_MAGIC:
+        return "tar"
+    if data.startswith(_AR_MAGIC):
+        return "ar"
+    return None
+
+
+def _decompressed_head(kind, data):
+    """The leading inner bytes of a single-stream compressed container."""
+    try:
+        if kind == "gzip":
+            return zlib.decompressobj(zlib.MAX_WBITS | 31).decompress(
+                data, 4096)
+        if kind == "xz":
+            return lzma.LZMADecompressor().decompress(
+                data[:ARTIFACT_HEAD_SIZE])
+        if kind == "bzip2":
+            return bz2.BZ2Decompressor().decompress(data[:ARTIFACT_HEAD_SIZE])
+    except Exception:
+        return b""
+    return b""
+
+
+def _elf_has_symbol_table(data):
+    """True when the ELF section header table still carries a symtab.
+
+    Reading the fixed-offset header and section entries is metadata
+    inspection only: an unstripped image keeps the structured content
+    metadata BSI counts, a stripped one does not (TR-03183-2 v2.1.0
+    §8.1.6); no code analysis happens here (ADR-0002).
+    """
+    if len(data) < 64:
+        return False
+    endian = "<" if data[5] == 1 else ">"
+    if data[4] == 2:  # ELFCLASS64
+        sh_off = struct.unpack_from(endian + "Q", data, 0x28)[0]
+        sh_entsize = struct.unpack_from(endian + "H", data, 0x3a)[0]
+        sh_num = struct.unpack_from(endian + "H", data, 0x3c)[0]
+    else:  # ELFCLASS32
+        sh_off = struct.unpack_from(endian + "I", data, 0x20)[0]
+        sh_entsize = struct.unpack_from(endian + "H", data, 0x2e)[0]
+        sh_num = struct.unpack_from(endian + "H", data, 0x30)[0]
+    if not sh_off or not sh_entsize or not 0 < sh_num <= 4096:
+        return False
+    for index in range(sh_num):
+        entry = sh_off + index * sh_entsize
+        if entry + 4 > len(data):
+            return False
+        if struct.unpack_from(endian + "I", data, entry)[0] == _SHT_SYMTAB:
+            return True
+    return False
+
+
+def classify_delivered_file(path, mode, data):
+    """Classify one delivered file for the mandatory file inventory.
+
+    Inputs: the delivered path, the lstat mode of the delivered entry
+    and the leading bytes (or full content) of the delivered bytes.
+    The decision table is deterministic:
+
+    - regular files only: symlinks and other special entries are not
+      separate delivered artifacts - their content identity belongs to
+      the regular file they resolve to, which is inventoried itself.
+    - executable: any mode exec bit, a shebang at offset 0 or an ELF
+      signature.
+    - archive: a recognized container or compressed-stream signature.
+    - mandatory (= inventoried here): executable or archive; ordinary
+      configuration, documentation and data files stay omitted
+      (ADR-0005).
+    - structured: the container still carries content metadata -
+      entry/directory tables (zip, tar, cpio, ar, rpm, 7z) or an ELF
+      symbol table; stripped ELFs, scripts and single-stream
+      compressed files are unstructured.
+    - error "ambiguous-classification": a recognized signature too
+      truncated or corrupt to classify; the entry is reported, never
+      guessed.
+    """
+    if not stat.S_ISREG(mode):
+        return {"inventory": False, "mandatory": False,
+                "executable": "non-executable", "archive": "no archive",
+                "structured": "unstructured"}
+    executable = (bool(mode & 0o111) or data.startswith(b"#!")
+                  or data.startswith(_ELF_MAGIC))
+    kind = _archive_kind(data)
+    structured = "unstructured"
+    error = None
+    if kind in ("zip", "tar", "cpio", "ar", "rpm", "7z"):
+        structured = "structured"
+    elif kind in ("gzip", "xz", "bzip2"):
+        inner = _decompressed_head(kind, data)
+        if _archive_kind(inner) in ("zip", "tar", "cpio", "ar", "rpm", "7z",
+                                    "gzip", "xz", "bzip2"):
+            structured = "structured"
+    if data.startswith(_ELF_MAGIC):
+        if len(data) < 64:
+            error = "ambiguous-classification"
+        elif _elf_has_symbol_table(data):
+            structured = "structured"
+    if data.startswith(_ZIP_LOCAL_MAGIC) and len(data) < 30:
+        error = "ambiguous-classification"
+    return {"inventory": True,
+            "mandatory": executable or kind is not None,
+            "executable": "executable" if executable else "non-executable",
+            "archive": "archive" if kind else "no archive",
+            "structured": structured,
+            **({"error": error} if error else {})}
 
 
 # The dependency graph crosses the scope of delivery exactly once per
@@ -1354,6 +1537,64 @@ def render(facts):
                     _add_dependency_evidence(components_by_ref[owner_ref],
                                              "debugsrc")
 
+
+    # Compose the file inventory: every delivered mandatory file becomes
+    # an exact file component owned by the recipe's logical component,
+    # whose graph entry gains the file reference. Active only with a
+    # selected alignment profile; ordinary output stays a logical-component
+    # SBOM (ADR-0005), and the renderer never inspects files itself -
+    # classification and hashing stay artifact facts (ADR-0002). Entries
+    # the adapter could not classify carry an error kind and stay
+    # reported, never silently dropped (ADR-0004).
+    file_inventory = facts.get("file_inventory") or {}
+    file_facts = []
+    for recipe in sorted(file_inventory):
+        for entry in file_inventory[recipe]:
+            file_facts.append({**entry, "recipe": recipe,
+                               "ref": _file_bom_ref(recipe, entry["path"])})
+    for artifact in file_facts:
+        if artifact.get("error"):
+            _log(log, "warn", f"File inventory: {artifact['recipe']}: "
+                              f"mandatory delivered file "
+                              f"{artifact['path']} is {artifact['error']}")
+    if profile:
+        for artifact in file_facts:
+            if artifact.get("error"):
+                continue
+            recipe = artifact["recipe"]
+            owner_refs = recipe_refs.get(recipe) or []
+            version = next((component.get("version")
+                            for component in
+                            (fragments.get(recipe) or {}).get("pkgs", ())
+                            if component.get("version")), "unknown")
+            name = posixpath.basename(artifact["path"])
+            sbom["components"].append({
+                "type": "file",
+                "name": name,
+                "version": version,
+                "bom-ref": artifact["ref"],
+                "hashes": [{"alg": "SHA-512",
+                            "content": artifact["sha512"]}],
+                "properties": [
+                    {"name": BSI_FILENAME_PROPERTY, "value": name},
+                    {"name": BSI_EXECUTABLE_PROPERTY,
+                     "value": artifact["executable"]},
+                    {"name": BSI_ARCHIVE_PROPERTY,
+                     "value": artifact["archive"]},
+                    {"name": BSI_STRUCTURED_PROPERTY,
+                     "value": artifact["structured"]},
+                ],
+            })
+            owner_ref = owner_refs[0] if owner_refs else None
+            if owner_ref:
+                owner_entry = next((dep for dep in sbom["dependencies"]
+                                    if dep["ref"] == owner_ref), None)
+                if owner_entry is None:
+                    owner_entry = {"ref": owner_ref, "dependsOn": []}
+                    sbom["dependencies"].append(owner_entry)
+                if artifact["ref"] not in owner_entry["dependsOn"]:
+                    owner_entry["dependsOn"].append(artifact["ref"])
+
     # The component declaration order is fixed here, after EVERY append:
     # the recipe set above is unordered, boundary, contributed and
     # embedded components are appended in discovery order, which moves
@@ -1442,6 +1683,11 @@ def render(facts):
 
     graph = _graph_evidence(sbom, metadata_component_ref, ref_recipes,
                             debug_evidence_recipes, merge_defects, log)
+    if file_facts:
+        graph["fileInventory"] = {"entries": [
+            {key: artifact.get(key)
+             for key in ("recipe", "path", "ref", "error")}
+            for artifact in file_facts]}
 
     # Replace SBOM serial placeholder in VEX vulnerabilities
     # This must be done after all vulnerabilities are collected to ensure each image

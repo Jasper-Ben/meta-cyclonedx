@@ -136,6 +136,39 @@ def profile_config(**overrides):
     return config
 
 
+def file_entry(path, sha512=None, executable="executable",
+               archive="no archive", structured="unstructured", error=None):
+    """One delivered-file artifact fact (adapter-normalized classification).
+
+    Values carry the pinned taxonomy's spellings directly; error entries
+    record why a mandatory artifact could not be inventoried (missing,
+    unreadable or ambiguous-classification) instead of vanishing.
+    """
+    entry = {"path": path, "executable": executable, "archive": archive,
+             "structured": structured}
+    if sha512 is not None:
+        entry["sha512"] = sha512
+    if error is not None:
+        entry["error"] = error
+    return entry
+
+
+def file_ref(recipe, path):
+    """The bom-ref convention for inventoried delivered files."""
+    return f"yocto-file:{recipe}:{path}"
+
+
+def file_components(sbom):
+    return [c for c in sbom["components"] if c.get("type") == "file"]
+
+
+def file_component(sbom, recipe, path):
+    ref = file_ref(recipe, path)
+    matches = [c for c in sbom["components"] if c.get("bom-ref") == ref]
+    assert len(matches) == 1, f"expected exactly one file component {ref}, got {len(matches)}"
+    return matches[0]
+
+
 def component_names(sbom):
     return [c["name"] for c in sbom["components"]]
 
