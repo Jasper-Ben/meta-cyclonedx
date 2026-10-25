@@ -97,6 +97,170 @@ def _check_vex_schema(context):
     return _document_schema_check("VEX", "vex")(context)
 
 
+# The pinned BSI CycloneDX property taxonomy registry (v0.1.2,
+# https://github.com/tr-03183/tr-03183-cyclonedx-property-taxonomy tag
+# 0.1.2), vendored verbatim under lib/data/ for provenance; the drift
+# guard in tests/test_taxonomy_validation.py keeps this registry and
+# that document naming exactly the same properties. The registry only
+# allows these properties in components[]/properties and
+# metadata/component/properties; per-component presence rules are the
+# registry's own wording ("MUST occur exactly once per component" when
+# the property is used, filename "at most once").
+BSI_TAXONOMY_VERSION = "0.1.2"
+BSI_TAXONOMY_NAMESPACE = "bsi:"
+BSI_TAXONOMY = {
+    "bsi:component:executable":
+        {"values": ("executable", "non-executable")},
+    "bsi:component:archive":
+        {"values": ("archive", "no archive")},
+    "bsi:component:structured":
+        {"values": ("structured", "unstructured")},
+    "bsi:component:filename":
+        {"values": None, "atMostOnce": True, "bareFilename": True},
+    "bsi:component:effectiveLicence":
+        {"values": None, "atMostOnce": True},
+    # Registered in v0.1.2 but deprecated (spelled for TR v2.0.0).
+    "bsi:component:associatedLicences":
+        {"values": None, "atMostOnce": True},
+}
+# The classifiable-file triple: when one of these applies to a
+# component, the registry expects all three, exactly once each.
+BSI_TAXONOMY_CLASSIFIABLE_TRIPLE = ("bsi:component:executable",
+                                    "bsi:component:archive",
+                                    "bsi:component:structured")
+
+
+def _taxonomy_property_holders(sbom):
+    """Every component property holder the registry allows: the primary
+    component and every components[] entry (recursively). The primary
+    component's bom-ref is document-random and never named in findings."""
+    holders = [(None, (sbom.get("metadata") or {}).get("component") or {})]
+    stack = list(sbom.get("components") or [])
+    while stack:
+        component = stack.pop()
+        if not isinstance(component, dict):
+            continue
+        holders.append((component.get("bom-ref"), component))
+        stack.extend(entry for entry in component.get("components") or []
+                     if isinstance(entry, dict))
+    return holders
+
+
+def _taxonomy_property_occurrences(sbom):
+    """(holder ref or None, property dict, misplaced) for every bsi:
+    property entry in the document, misplaced ones named by their
+    containing location instead of a component."""
+    occurrences = []
+    holders = {id(component): ref
+               for ref, component in _taxonomy_property_holders(sbom)}
+
+    def walk(node, holder_ref):
+        if isinstance(node, dict):
+            own_ref = holders.get(id(node))
+            if own_ref is not None:
+                holder_ref = own_ref
+            for key, value in node.items():
+                if key == "properties" and isinstance(value, list):
+                    for prop in value:
+                        if (isinstance(prop, dict) and str(
+                                prop.get("name") or "").startswith(
+                                    BSI_TAXONOMY_NAMESPACE)):
+                            occurrences.append(
+                                (holder_ref, prop, holder_ref is None))
+                else:
+                    walk(value, holder_ref)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, holder_ref)
+
+    walk(sbom, None)
+    return occurrences
+
+
+def _check_taxonomy_registry(context):
+    occurrences = _taxonomy_property_occurrences(context["sbom"])
+    offending = [(ref, str(prop.get("name")), misplaced)
+                 for ref, prop, misplaced in occurrences
+                 if misplaced or prop.get("name") not in BSI_TAXONOMY]
+    if offending:
+        names = sorted({name for _ref, name, _misplaced in offending})
+        message = ("the document carries bsi: properties the pinned "
+                   f"v{BSI_TAXONOMY_VERSION} taxonomy does not register "
+                   "here: " + ", ".join(names))
+        if any(misplaced for _ref, _name, misplaced in offending):
+            message += ("; registered properties may only appear in "
+                        "components[]/properties or "
+                        "metadata/component/properties")
+        refs = sorted({ref for ref, _name, _misplaced in offending if ref})
+        return "unmet", message, refs
+    return ("verified",
+            f"every bsi: property in the document is registered in the "
+            f"pinned v{BSI_TAXONOMY_VERSION} taxonomy and placed where "
+            "the registry allows")
+
+
+def _check_taxonomy_values(context):
+    violations = []
+    for ref, prop, misplaced in _taxonomy_property_occurrences(
+            context["sbom"]):
+        if misplaced:
+            continue  # placement is REQ-TAX-001's verdict
+        spec = BSI_TAXONOMY.get(prop.get("name"))
+        if spec is None:
+            continue  # unknown properties are REQ-TAX-001's verdict
+        value = prop.get("value")
+        bad = not isinstance(value, str) or not value.strip()
+        if not bad and spec["values"] and value not in spec["values"]:
+            bad = True
+        if (not bad and spec.get("bareFilename")
+                and ("/" in value or "\\" in value)):
+            bad = True
+        if bad:
+            violations.append((ref, prop.get("name"), value))
+    if violations:
+        detail = sorted({f"{name}={value!r}"
+                         for _ref, name, value in violations})
+        refs = sorted({ref for ref, _name, _value in violations if ref})
+        return ("unmet", "the document carries taxonomy property values "
+                         "outside the pinned registry's value domains: "
+                         + ", ".join(detail), refs)
+    return ("verified", "every registered taxonomy property value is a "
+                        "non-empty string inside the registry's value "
+                        "domain")
+
+
+def _check_taxonomy_cardinality(context):
+    violations = []
+    for ref, component in _taxonomy_property_holders(context["sbom"]):
+        names = [prop.get("name")
+                 for prop in component.get("properties") or []
+                 if prop.get("name") in BSI_TAXONOMY]
+        if not names:
+            continue
+        counts = {name: names.count(name) for name in set(names)}
+        violated = any(count > 1 for name, count in counts.items()
+                       if BSI_TAXONOMY[name].get("atMostOnce"))
+        triple_present = [name for name in BSI_TAXONOMY_CLASSIFIABLE_TRIPLE
+                          if counts.get(name, 0)]
+        if triple_present:
+            violated = violated or any(counts.get(name, 0) != 1
+                                       for name
+                                       in BSI_TAXONOMY_CLASSIFIABLE_TRIPLE)
+        if violated:
+            violations.append(ref)
+    if violations:
+        named = sorted({ref for ref in violations if ref})
+        message = ("taxonomy properties violate the pinned registry's "
+                   "cardinality: properties that must occur at most once "
+                   "per component repeat, or a partial executable/archive/"
+                   "structured triple occurs where one of them applies")
+        return "unmet", message, named
+    return ("verified", "every component's registered taxonomy properties "
+                        "obey the pinned registry's cardinality: the "
+                        "classifiable triple occurs complete exactly once, "
+                        "filename and licence properties at most once")
+
+
 def _check_sbom_creator(context):
     metadata = context["sbom"].get("metadata") or {}
     if metadata.get("authors"):
@@ -775,6 +939,41 @@ TR03183_2_REQUIREMENTS = [
                            "CycloneDX JSON schema of the selected version"),
         "origin": "generated-document",
         "check": _check_vex_schema,
+    },
+    {
+        "id": "REQ-TAX-001",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a78.1 (property taxonomy "
+                   "v0.1.2: registered properties and allowed locations)"),
+        "representation": ("every bsi: property is registered in the "
+                           "pinned taxonomy and appears only in "
+                           "components[]/properties or "
+                           "metadata/component/properties"),
+        "origin": "generated-document",
+        "check": _check_taxonomy_registry,
+    },
+    {
+        "id": "REQ-TAX-002",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a78.1 (property taxonomy "
+                   "v0.1.2: property value domains)"),
+        "representation": ("registered property values are non-empty "
+                           "strings inside the registry's value domains "
+                           "(executable/non-executable, archive/no "
+                           "archive, structured/unstructured, bare "
+                           "filenames, licence expressions)"),
+        "origin": "generated-document",
+        "check": _check_taxonomy_values,
+    },
+    {
+        "id": "REQ-TAX-003",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a78.1 (property taxonomy "
+                   "v0.1.2: per-component cardinality)"),
+        "representation": ("per component: the executable/archive/"
+                           "structured triple occurs complete exactly "
+                           "once when it applies; filename, effective"
+                           "Licence and associatedLicences occur at most "
+                           "once"),
+        "origin": "generated-document",
+        "check": _check_taxonomy_cardinality,
     },
     {
         "id": "REQ-SBOM-001",

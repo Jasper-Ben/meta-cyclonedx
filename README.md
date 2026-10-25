@@ -660,6 +660,17 @@ every other finding:
   build host without it records `unverifiable` schema findings - a
   validator that cannot run never reports a silent pass, and
   `unverifiable` never blocks `strict` enforcement.
+- **BSI property taxonomy.** Every `bsi:` property is validated against
+  the pinned registry of the profile baseline (property taxonomy
+  v0.1.2, vendored verbatim under `lib/data/` and mirrored as the
+  matrix's own registry): only registered names count and only in the
+  locations the registry allows (`REQ-TAX-001`), values must sit in the
+  registry's value domains (`REQ-TAX-002`), and per-component
+  cardinality must hold - the executable/archive/structured triple
+  complete exactly once when it applies, filename and licence
+  properties at most once (`REQ-TAX-003`). Drift away from the pinned
+  registry is an `unmet` finding in report mode and a
+  strict-enforcement rejection.
 - **Report enforcement publishes documents with findings** - that
   includes a schema-invalid document: it is published with loud
   `unmet` findings naming the violated schema locations, and the
