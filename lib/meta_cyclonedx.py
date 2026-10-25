@@ -893,13 +893,11 @@ def render(facts):
             aggregate = "complete"
         else:
             aggregate = "unknown"
-        composition = {"aggregate": aggregate, "assemblies": [component_ref]}
-        if entry is not None:
-            composition["dependencies"] = [{
-                "ref": entry["ref"],
-                "dependsOn": list(entry.get("dependsOn") or []),
-            }]
-        sbom["compositions"].append(composition)
+        # The CycloneDX composition declares the completeness of exactly
+        # one assembly; 1.6 and 1.7 spell its dependencies field
+        # differently, so the declaration rides on assemblies only.
+        sbom["compositions"].append({"aggregate": aggregate,
+                                     "assemblies": [component_ref]})
 
     graph = _graph_evidence(sbom, metadata_component_ref, ref_recipes,
                             debug_evidence_recipes, log)

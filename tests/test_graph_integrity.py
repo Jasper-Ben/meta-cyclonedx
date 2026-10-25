@@ -150,8 +150,8 @@ def test_compositions_mirror_the_dependency_entry_of_every_component():
 
     ghost = component_by_name(sbom, "ghost")
     app_comp = composition_for(sbom, "ref-app")
-    assert app_comp["dependencies"] == [{"ref": "ref-app",
-                                         "dependsOn": ["ref-b", ghost["bom-ref"]]}]
+    assert app_comp == {"aggregate": "complete", "assemblies": ["ref-app"]}
+    assert dep_entry(sbom, "ref-app")["dependsOn"] == ["ref-b", ghost["bom-ref"]]
     # The external component's own composition is honest about what the
     # build cannot see: unknown, never complete.
     assert composition_for(sbom, ghost["bom-ref"])["aggregate"] == "unknown"
