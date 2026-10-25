@@ -342,13 +342,22 @@ def test_deployed_documents_validate_against_the_pinned_schema(
 def test_sbom_carries_file_components_with_bsi_sha512_identity(profile_run):
     """Mandatory delivered-file discovery: the rootfs executable is a
     file component with a SHA-512 artifact identity and the pinned
-    taxonomy's classifier triple, not a copy of the logical record."""
+    taxonomy's classifier triple, not a copy of the logical record.
+
+    File components carry the delivered basename, and busybox installs
+    through update-alternatives as busybox.nosuid/busybox.suid (the
+    bare busybox entry is a symlink, which the inventory attributes to
+    its target, so it never names a component of its own).
+    """
     sbom = profile_run.documents.sbom
+    delivered = re.compile(
+        rf"^{ROOTFS_PACKAGE}(\.[A-Za-z0-9_-]+)?$", re.IGNORECASE
+    )
     files = _file_components(
-        sbom, lambda c: (c.get("name") or "").lower() == ROOTFS_PACKAGE
+        sbom, lambda c: delivered.match(c.get("name") or "")
     )
     assert files, (
-        f"no file component names the delivered {ROOTFS_PACKAGE} binary; "
+        f"no file component names a delivered {ROOTFS_PACKAGE} binary; "
         f"file components: "
         f"{sorted(c.get('name', '') for c in _file_components(sbom))[:20]}"
     )
@@ -646,7 +655,7 @@ def test_strict_rejection_deploys_nothing_new(violation_runs):
         deploy_compare.cyclonedx_checksums(twin.checksums)
     ), (
         "the strict run changed deployed CycloneDX artifacts\n"
-        + deploy_compare.identity_report(strict, twin)
+        + deploy_compare.identity_report(strict, twin, now=live)
     )
 
 
@@ -658,9 +667,11 @@ def test_baseline_reinvocation_restores_deployed_bytes(
 ):
     """Scenario isolation, proven: the plain re-invocation restores the
     cold run's deployed SBOM and VEX byte-for-byte (the sstate objects
-    its signatures name again), the profile's report artifacts are gone
-    from the deploy directory, and the rest of the matrix resumes on a
-    workspace byte-identical to the cold baseline."""
+    its signatures name again) and removes the profile's report
+    artifacts from the deploy directory. Image artifacts fall under the
+    cache module's own claim: DATETIME-named hardlinks rotate whenever
+    any config flip replays the image tasks, so the profile scenario
+    chain stays CycloneDX-scoped."""
     _record_guard(baseline_restored, "alignment-reverted")
     _succeeded(baseline_restored, "alignment-reverted")
     cold = kas_runs["cold"]

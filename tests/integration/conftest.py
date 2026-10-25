@@ -123,6 +123,17 @@ class KasRunRecorder:
     def __getitem__(self, name):
         return self.results[name]
 
+    def prior(self, record):
+        """The invocation recorded immediately before *record*.
+
+        Byte-identity claims about an unchanged re-invocation compare a
+        run with its same-config neighbour; anchoring them on the
+        preceding record keeps them valid regardless of which other
+        configurations the matrix ran in between.
+        """
+        ordered = list(self.results.values())
+        return ordered[ordered.index(record) - 1]
+
     def invoke(self, name, extra_env=None, expect_failure=False):
         """Run the matrix configuration under this name; return its record.
 
