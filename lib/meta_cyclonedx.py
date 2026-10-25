@@ -834,6 +834,26 @@ def _compatible_component_records(existing, candidate):
     return True
 
 
+def _merge_instance_evidence(existing, incoming, add_scopes):
+    """
+    Fold one component instance's evidence into the surviving instance:
+    the higher-priority scope wins and licence entries union. Dependency
+    evidence unions separately as the graph edges merge, so a reconciled
+    instance never loses what either document declared about it.
+    """
+    if add_scopes:
+        merged_scope = _highest_priority_scope(existing.get("scope"),
+                                               incoming.get("scope"))
+        if merged_scope:
+            existing["scope"] = merged_scope
+    licences = incoming.get("licenses")
+    if licences:
+        kept = existing.setdefault("licenses", [])
+        for licence in licences:
+            if licence not in kept:
+                kept.append(licence)
+
+
 def render(facts):
     """
     Render the SBOM and VEX documents from normalized build facts.
@@ -1095,28 +1115,73 @@ def render(facts):
     # remapping above applies to components derived from Yocto packages and
     # would corrupt an externally resolved tree.
     extra_ref_components = {}
+    extra_identity_index = {}
     for component in sbom["components"]:
-        if component.get("bom-ref"):
-            extra_ref_components.setdefault(component["bom-ref"], component)
+        ref = component.get("bom-ref")
+        if ref:
+            extra_ref_components.setdefault(ref, component)
+        key = _instance_key(component)
+        if key and key not in extra_identity_index:
+            extra_identity_index[key] = component
+    contributed_ref_remap = {}
     for pkg in sorted(fragments):
         pn_list = fragments[pkg]
         for component in pn_list.get("extra_components", []):
             ref = component.get("bom-ref")
+            key = _instance_key(component)
+            survivor = extra_identity_index.get(key) if key else None
+            if survivor is not None and survivor.get("bom-ref") != ref:
+                # Same logical name, version and package build seen
+                # through two ecosystem documents: one component
+                # instance, reconciled onto the surviving bom-ref. Both
+                # graphs' edges converge on it below; a shared CPE alone
+                # never reconciles anything (ADR-0006).
+                if ref:
+                    contributed_ref_remap[ref] = survivor["bom-ref"]
+                _merge_instance_evidence(survivor, component, add_scopes)
+                continue
             if ref and ref in extra_ref_components and \
                     _compatible_component_records(extra_ref_components[ref],
                                                   component):
                 # The very same record is already in the graph; merging
                 # onto it loses no evidence. Contradicting evidence under
                 # the same bom-ref keeps both instances and surfaces as a
-                # reference-integrity finding, never a silent drop (the
-                # purl alone never merges instances either, ADR-0006).
+                # reference-integrity finding, never a silent drop.
                 continue
             sbom["components"].append(component)
             if ref:
                 extra_ref_components.setdefault(ref, component)
-        for dep_entry in pn_list.get("extra_dependencies", []):
-            if dep_entry not in sbom["dependencies"]:
-                sbom["dependencies"].append(dep_entry)
+            if key and key not in extra_identity_index:
+                extra_identity_index[key] = component
+
+    # Fold the imported edges in after the whole contributed graph is
+    # reconciled, so ref rewrites apply consistently. Edges are merged,
+    # never recomputed or flattened: the ecosystem document remains
+    # authoritative for its own resolution (no package-manager
+    # reimplementation here), this layer only composes it.
+    for pkg in sorted(fragments):
+        pn_list = fragments[pkg]
+        for edge in pn_list.get("extra_dependencies") or []:
+            edge_ref = contributed_ref_remap.get(edge.get("ref"),
+                                                 edge.get("ref"))
+            if not edge_ref:
+                _log(log, "warn", f"CYCLONEDX_EXTRA_BOM_FILES: {pkg}: "
+                                  f"contributed dependency entry without "
+                                  f"a ref; its edges cannot be attached")
+                continue
+            depends_on = [contributed_ref_remap.get(target, target)
+                          for target in edge.get("dependsOn") or []
+                          if contributed_ref_remap.get(target,
+                                                       target) != edge_ref]
+            existing_entry = next((entry for entry in sbom["dependencies"]
+                                   if entry["ref"] == edge_ref), None)
+            if existing_entry is None:
+                sbom["dependencies"].append({"ref": edge_ref,
+                                             "dependsOn": depends_on})
+            else:
+                existing_entry["dependsOn"].extend(
+                    target for target in depends_on
+                    if target not in existing_entry["dependsOn"])
 
         # Attach each contributed tree to the recipe that produced it, so the
         # modules are attributable to the binary they are linked into instead of
@@ -1135,6 +1200,7 @@ def render(facts):
             owner_entry = {"ref": owner_ref, "dependsOn": []}
             sbom["dependencies"].append(owner_entry)
         for root_ref in extra_roots:
+            root_ref = contributed_ref_remap.get(root_ref, root_ref)
             if root_ref in extra_ref_components and \
                     root_ref not in owner_entry["dependsOn"]:
                 owner_entry["dependsOn"].append(root_ref)

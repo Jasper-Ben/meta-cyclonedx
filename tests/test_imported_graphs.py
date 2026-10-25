@@ -48,3 +48,45 @@ def test_imported_component_with_colliding_ref_and_different_evidence_is_kept():
     finding = finding_by_id(docs["report"], "REQ-REF-001")
     assert finding["verdict"] == "unmet"
     assert "cargo://shared" in finding["bomRefs"]
+
+
+def test_one_imported_instance_reconciles_across_contributed_graphs():
+    # Two recipes' ecosystem BOMs both link serde 1.0 (same name, version
+    # and purl: the very same component instance) and each resolves it to
+    # its own copy of the module graph. The instances reconcile onto one
+    # node with both graphs' edges intact — no duplicate instance and no
+    # flattened graph.
+    serde_a = {"bom-ref": "cargo://a/serde", "type": "library",
+               "name": "serde", "version": "1.0",
+               "purl": "pkg:cargo/serde@1.0"}
+    serde_b = {"bom-ref": "cargo://b/serde", "type": "library",
+               "name": "serde", "version": "1.0",
+               "purl": "pkg:cargo/serde@1.0"}
+    libc_a = {"bom-ref": "cargo://a/libc", "type": "library", "name": "libc",
+              "version": "0.2", "purl": "pkg:cargo/libc@0.2"}
+    libc_b = {"bom-ref": "cargo://b/libc", "type": "library", "name": "libc",
+              "version": "0.3", "purl": "pkg:cargo/libc@0.3"}
+    facts = default_facts(fragments={
+        "rust-app": fragment(
+            pkgs=[pkg("rust-app", "1", "ref-r")],
+            **contributed([serde_a, libc_a],
+                          [{"ref": "cargo://a/serde",
+                            "dependsOn": ["cargo://a/libc"]}],
+                          ["cargo://a/serde"])),
+        "other-app": fragment(
+            pkgs=[pkg("other-app", "1", "ref-o")],
+            **contributed([serde_b, libc_b],
+                          [{"ref": "cargo://b/serde",
+                            "dependsOn": ["cargo://b/libc"]}],
+                          ["cargo://b/serde"])),
+    })
+    sbom, _vex, _logs = render_docs(facts)
+
+    serdes = [c for c in sbom["components"] if c["name"] == "serde"]
+    assert len(serdes) == 1, "one serde instance, not one per contributing BOM"
+    shared = serdes[0]["bom-ref"]
+    assert sorted(dep_entry(sbom, shared)["dependsOn"]) == \
+        ["cargo://a/libc", "cargo://b/libc"]
+    # Both consuming recipes still reach the shared instance.
+    assert dep_entry(sbom, "ref-r")["dependsOn"] == [shared]
+    assert dep_entry(sbom, "ref-o")["dependsOn"] == [shared]
