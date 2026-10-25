@@ -120,6 +120,24 @@ the kas wrapper and records every run against the same workspace:
   manifest and as a component with a dependency edge in the deployed
   SBOM.
 
+**Alignment-profile scenario** —
+`tests/integration/test_alignment_profile.py`
+reuses the same recorder for the profile acceptance runs, configured
+only through the public channel (the `env:` variables
+`CYCLONEDX_PROFILE`/`CYCLONEDX_PROFILE_ENFORCEMENT`, plus
+`CYCLONEDX_PRIMARY_COMPONENT_CREATOR` for one controlled violation): a
+report-enforcement run deploying SBOM, VEX and the alignment report; an
+identical re-invocation proving the deployed bytes deterministic; the
+violation through both enforcements (report publishes it, strict fails
+the build at the CycloneDX generation task without deploying anything
+new — an *expected* failure that gates nothing downstream); and a final
+plain re-invocation restoring the baseline bytes and removing the
+profile's report artifacts from the deploy directory (sstate installs
+never delete, and R2 compares whole deploy-directory checksum maps).
+This scenario is development-branch evidence only: a branch may claim
+support for the profile only after running an equivalent scenario on
+that branch itself.
+
 R2/R4 comparisons are byte-level; cross-regeneration comparisons (R3)
 use the `canonicalize` helper and never claim byte-identity. The
 graph-isolation fixture layer lives as a local (URL-less) repository
