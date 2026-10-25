@@ -146,15 +146,22 @@ def test_missing_included_vex_skips_only_the_vex_merge():
     assert vex["vulnerabilities"] == []
 
 
-def test_unparseable_included_vex_is_warned_and_skipped():
+def test_unparseable_included_vex_is_reported_not_silently_skipped():
+    # The image's SBOM still merges and its VEX statements cannot be
+    # salvaged, but the loss is an explicit composition finding now -
+    # report enforcement publishes it, strict enforcement rejects it.
     entry = included_image()
     entry["vex"] = None
     entry["vex_error"] = "Expecting value: line 1 column 1 (char 0)"
-    _sbom, vex, logs = render_docs(parent_facts(included_images=[entry]))
+    facts = parent_facts(config=profile_config(), included_images=[entry])
+    docs, logs = render_all(facts)
 
     assert any(level == "warn" and "cannot parse VEX" in message
                for level, message in logs)
-    assert vex["vulnerabilities"] == []
+    assert docs["vex"]["vulnerabilities"] == []
+    assert component_by_name(docs["sbom"], "busybox")
+    finding = finding_by_id(docs["report"], "REQ-MERGE-001")
+    assert finding["verdict"] == "unmet"
 
 
 def test_included_component_with_conflicting_ref_and_other_instance_is_kept():
@@ -224,3 +231,27 @@ def test_included_vex_statement_with_a_different_analysis_stays_separate():
                       if v["analysis"]["state"] == "unresolved")
     serial = sbom["serialNumber"].removeprefix("urn:uuid:")
     assert affect_refs(unresolved) == [f"urn:cdx:{serial}/1#inc-u"]
+
+
+def test_included_image_without_metadata_root_is_found_and_dangling():
+    # A parseable image SBOM whose metadata.component root is absent:
+    # the graph cannot silently re-home its edges. The dangling root
+    # reference and the composition finding make the malformed input
+    # visible instead.
+    other = document(
+        INC_SERIAL,
+        components=[pkg("busybox", "1.36", "inc-u")],
+        dependencies=[{"ref": "inc-meta", "dependsOn": ["inc-u"]}],
+        metadata_component=None)
+    facts = parent_facts(config=profile_config(),
+                         included_images=[{"name": "initramfs",
+                                           "sbom": other, "vex": None,
+                                           "vex_error": None}])
+    docs, _logs = render_all(facts)
+
+    assert component_by_name(docs["sbom"], "busybox")["bom-ref"] == "inc-u"
+    entry_refs = [e["ref"] for e in docs["sbom"]["dependencies"]]
+    assert "inc-meta" in entry_refs
+    finding = finding_by_id(docs["report"], "REQ-MERGE-001")
+    assert finding["verdict"] == "unmet"
+    assert "inc-meta" in finding["diagnosticMessage"]

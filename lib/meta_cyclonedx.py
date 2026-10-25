@@ -1703,6 +1703,32 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
         inc_metadata_ref = inc_metadata_comp.get("bom-ref")
         if inc_metadata_ref:
             included_bom_ref_remap[inc_metadata_ref] = img_firmware_ref
+        else:
+            # No root to hang the graph on: the document is malformed.
+            # Its components and edges stay in the merged graph and the
+            # missing attachment is published as a finding instead of
+            # being tidied away (ADR-0004).
+            unattached = sorted({
+                included_bom_ref_remap.get(entry.get("ref", ""),
+                                           entry.get("ref", ""))
+                for entry in img_sbom_data.get("dependencies") or []
+                if entry.get("ref")
+                and included_bom_ref_remap.get(entry.get("ref", ""),
+                                               entry.get("ref", "")) not in
+                extra_seen_image_refs})
+            _log(log, "warn", f"CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES: "
+                              f"{img_name} SBOM has no metadata.component "
+                              f"bom-ref; its graph cannot be attached as "
+                              f"a tree")
+            merge_defects.append({
+                "kind": "embedded-root-missing",
+                "source": img_name,
+                "message": "embedded image SBOM has no metadata.component "
+                           "root" + (f"; unattached graph reference(s): "
+                                     + ", ".join(unattached)
+                                     if unattached else ""),
+                "refs": unattached,
+            })
 
         def remap_ref(ref, _remap=included_bom_ref_remap):
             return _remap.get(ref, ref)
@@ -1736,6 +1762,14 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
         # Merge VEX vulnerabilities: remap included SBOM serial and shared bom-refs, avoid CVE ID duplicates.
         if img_vex_error:
             _log(log, "warn", f"CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES: cannot parse VEX for {img_name}: {img_vex_error}")
+            merge_defects.append({
+                "kind": "embedded-vex-unusable",
+                "source": img_name,
+                "message": f"embedded image VEX could not be read: "
+                           f"{img_vex_error}; its SBOM graph was still "
+                           f"merged",
+                "refs": [],
+            })
             continue
         if img_vex_data is None:
             _log(log, 1, f"CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES: no VEX for {img_name}")
