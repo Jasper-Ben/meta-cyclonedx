@@ -365,7 +365,11 @@ def _check_component_creators(context):
                                       or {}).values()
                      if fragment.get("creator")
                      for component in fragment.get("pkgs") or ()}
-    components = context["sbom"].get("components") or []
+    # Applicability is component-category aware (TR-03183-2 v2.1.0 §5.2.2):
+    # file components carry artifact identity, not a creator of their own.
+    components = [component
+                  for component in context["sbom"].get("components") or []
+                  if component.get("type") != "file"]
     missing = [component["bom-ref"] for component in components
                if not component.get("author") and not component.get("contact")]
     if missing:
@@ -388,18 +392,20 @@ def _check_component_creators(context):
 # Components the licence-role requirements evaluate: the delivered
 # logical components and the primary component. Identified boundary
 # components outside the scope of delivery only carry creator, name,
-# version and identifiers (TR-03183-2 v2.1.0 §3.2.4), never licence
-# claims the SBOM creator could substantiate. The primary component is
-# evaluated too, but its bom-ref is generated per document and never
-# named in findings.
+# version and identifiers (TR-03183-2 v2.1.0 §3.2.4), and file
+# components carry artifact identity without licence claims of their
+# own (TR-03183-2 v2.1.0 §3.2.1); neither category is a licence
+# subject. The primary component is evaluated too, but its bom-ref is
+# generated per document and never named in findings.
 DELIVERY_SCOPE_MARKER = "yocto:delivery:scope"
 
 
 def _licence_components(context):
     return [(component.get("bom-ref"), component)
             for component in context["sbom"].get("components") or []
-            if not any(p.get("name") == DELIVERY_SCOPE_MARKER
-                       for p in component.get("properties") or [])]
+            if component.get("type") != "file"
+            and not any(p.get("name") == DELIVERY_SCOPE_MARKER
+                        for p in component.get("properties") or [])]
 
 
 def _primary_component(context):

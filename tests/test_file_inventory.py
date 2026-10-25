@@ -14,10 +14,10 @@ import re
 
 import helpers
 import meta_cyclonedx
-from helpers import (default_facts, dep_entry, file_components,
-                     file_entry, file_component, file_ref, finding_by_id,
-                     fragment, pkg, profile_config, ref_of, render_all,
-                     render_docs)
+from helpers import (affect_refs, default_facts, dep_entry,
+                     file_components, file_entry, file_component, file_ref,
+                     finding_by_id, fragment, pkg, profile_config, ref_of,
+                     render_all, render_docs, vuln, vuln_by_id)
 
 
 def test_ordinary_output_omits_the_file_inventory_by_default():
@@ -185,3 +185,31 @@ def test_file_inventory_requirements_are_not_applicable_without_inventory():
     assert all(finding["applicability"] == "not-applicable"
                for finding in report["findings"]
                if finding["requirementId"].startswith("REQ-FILE"))
+
+
+def test_file_components_never_borrow_logical_component_identity_evidence():
+    # ADR-0006: the file component carries artifact identity only. The
+    # owning logical component keeps purl, CPE, licences, creator and the
+    # vulnerability findings; nothing is copied onto the artifact (and
+    # requirements apply per component category, never indiscriminately).
+    facts = default_facts(
+        config=profile_config(),
+        fragments={"busybox": fragment(
+            pkgs=[pkg("busybox", "1.36", "ref-busybox")],
+            cves=[vuln("CVE-2026-0001", "ref-busybox")],
+        )},
+        file_inventory={"busybox": [file_entry("/bin/sh", sha512="a" * 128)]},
+    )
+    docs, _logs = render_all(facts)
+    sbom, vex = docs["sbom"], docs["vex"]
+    sh = file_component(sbom, "busybox", "/bin/sh")
+
+    assert set(sh) == {"type", "name", "version", "bom-ref", "hashes",
+                       "properties"}
+    statement = vuln_by_id(vex, "CVE-2026-0001")
+    assert not any(sh["bom-ref"] in ref for ref in affect_refs(statement))
+
+    for requirement_id in ("REQ-COMP-010", "REQ-COMP-011", "REQ-COMP-013"):
+        finding = finding_by_id(docs["report"], requirement_id)
+        assert sh["bom-ref"] not in finding.get("bomRefs", []), requirement_id
+    assert file_components(sbom)[0]["bom-ref"] == sh["bom-ref"]
