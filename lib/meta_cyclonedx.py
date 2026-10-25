@@ -93,6 +93,8 @@ import json
 import os
 import posixpath
 import re
+import stat
+import struct
 import urllib.parse
 import uuid
 from datetime import datetime, timezone
@@ -238,6 +240,89 @@ BSI_STRUCTURED_PROPERTY = "bsi:component:structured"
 def _file_bom_ref(recipe, path):
     """The deterministic bom-ref of one inventoried delivered file."""
     return f"yocto-file:{recipe}:{path}"
+
+
+# Artifact inspection signatures (ADR-0002): deterministic magic numbers
+# and file-structure metadata used only for inventory classification -
+# never to infer dependencies, embedded software or debug information.
+ARTIFACT_HEAD_SIZE = 65536
+_ELF_MAGIC = b"\x7fELF"
+_ZIP_MAGIC = b"PK\x03\x04"
+_SHT_SYMTAB = 2
+
+
+def _elf_has_symbol_table(data):
+    """True when the ELF section header table still carries a symtab.
+
+    Reading the fixed-offset header and section entries is metadata
+    inspection only: an unstripped image keeps the structured content
+    metadata BSI counts, a stripped one does not (TR-03183-2 v2.1.0
+    §8.1.6); no code analysis happens here (ADR-0002).
+    """
+    if len(data) < 64:
+        return False
+    endian = "<" if data[5] == 1 else ">"
+    if data[4] == 2:  # ELFCLASS64
+        sh_off = struct.unpack_from(endian + "Q", data, 0x28)[0]
+        sh_entsize = struct.unpack_from(endian + "H", data, 0x3a)[0]
+        sh_num = struct.unpack_from(endian + "H", data, 0x3c)[0]
+    else:  # ELFCLASS32
+        sh_off = struct.unpack_from(endian + "I", data, 0x20)[0]
+        sh_entsize = struct.unpack_from(endian + "H", data, 0x2e)[0]
+        sh_num = struct.unpack_from(endian + "H", data, 0x30)[0]
+    if not sh_off or not sh_entsize or not 0 < sh_num <= 4096:
+        return False
+    for index in range(sh_num):
+        entry = sh_off + index * sh_entsize
+        if entry + 4 > len(data):
+            return False
+        if struct.unpack_from(endian + "I", data, entry)[0] == _SHT_SYMTAB:
+            return True
+    return False
+
+
+def classify_delivered_file(path, mode, data):
+    """Classify one delivered file for the mandatory file inventory.
+
+    Inputs: the delivered path, the lstat mode of the delivered entry
+    and the leading bytes (or full content) of the delivered bytes.
+    The decision table is deterministic:
+
+    - regular files only: symlinks and other special entries are not
+      separate delivered artifacts - their content identity belongs to
+      the regular file they resolve to, which is inventoried itself.
+    - executable: any mode exec bit, a shebang at offset 0 or an ELF
+      signature.
+    - archive: a recognized container or compressed-stream signature.
+    - mandatory (= inventoried here): executable or archive; ordinary
+      configuration, documentation and data files stay omitted
+      (ADR-0005).
+    - structured: the container still carries content metadata -
+      entry/directory tables (zip, tar, cpio, ar, rpm, 7z) or an ELF
+      symbol table; stripped ELFs, scripts and single-stream
+      compressed files are unstructured.
+    - error "ambiguous-classification": a recognized signature too
+      truncated or corrupt to classify; the entry is reported, never
+      guessed.
+    """
+    if not stat.S_ISREG(mode):
+        return {"inventory": False, "mandatory": False,
+                "executable": "non-executable", "archive": "no archive",
+                "structured": "unstructured"}
+    executable = (bool(mode & 0o111) or data.startswith(b"#!")
+                  or data.startswith(_ELF_MAGIC))
+    archive = "no archive"
+    structured = "unstructured"
+    error = None
+    if data.startswith(_ELF_MAGIC):
+        if len(data) < 64:
+            error = "ambiguous-classification"
+        elif _elf_has_symbol_table(data):
+            structured = "structured"
+    return {"inventory": True, "mandatory": executable,
+            "executable": "executable" if executable else "non-executable",
+            "archive": archive, "structured": structured,
+            **({"error": error} if error else {})}
 
 
 # The dependency graph crosses the scope of delivery exactly once per
