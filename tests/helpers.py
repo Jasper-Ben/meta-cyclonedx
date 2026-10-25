@@ -23,13 +23,11 @@ def pkg(name, version, bom_ref, cpe=None, purl=None, **extra):
     return component
 
 
-def fragment(pkgs=(), cves=(), dependencies=(), dedup=None, **extra):
+def fragment(pkgs=(), cves=(), dependencies=(), **extra):
     """A recipe fragment in the on-disk do_populate_cyclonedx format."""
     result = {"pkgs": list(pkgs), "cves": list(cves)}
     if dependencies:
         result["dependencies"] = list(dependencies)
-    if dedup:
-        result["bom_ref_dedup_map"] = dict(dedup)
     result.update(extra)
     return result
 
