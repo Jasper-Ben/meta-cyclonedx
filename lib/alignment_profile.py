@@ -82,6 +82,84 @@ def _check_file_hashes(context):
                      "deployable artifact"), missing
 
 
+# Mandatory file inventory (TR-03183-2 v2.1.0 §3.2.1 and §5.2.2): the
+# delivered executables and archives must reach the document as exact
+# file components, defective artifacts must be reported instead of
+# vanishing, and every file component must sit traceably in the graph.
+def _file_inventory_entries(context):
+    return ((context.get("graph") or {}).get("fileInventory")
+            or {}).get("entries") or []
+
+
+def _applies_file_inventory(context):
+    if _file_inventory_entries(context) or _file_components(context):
+        return True, None
+    return False, ("the build recorded no delivered-file artifact facts "
+                   "and the document contains no file components; the "
+                   "mandatory file inventory does not apply")
+
+
+def _check_file_inventory_coverage(context):
+    entries = _file_inventory_entries(context)
+    entry_refs = {entry["ref"] for entry in entries}
+    component_refs = {component["bom-ref"]
+                      for component in _file_components(context)}
+    delivered = {entry["ref"] for entry in entries if not entry.get("error")}
+    unrepresented = sorted(delivered - component_refs)
+    unattributed = sorted(component_refs - entry_refs)
+    if not unrepresented and not unattributed:
+        return "verified", ("every delivered mandatory artifact is "
+                            "represented by exactly one file component")
+    paths = {entry["ref"]: entry["path"] for entry in entries}
+    parts = []
+    if unrepresented:
+        parts.append("mandatory delivered artifacts are not represented as "
+                     "file components: "
+                     + ", ".join(paths.get(ref, ref) for ref in unrepresented))
+    if unattributed:
+        parts.append("file components have no delivered-file artifact "
+                     "fact: " + ", ".join(unattributed))
+    return "unmet", "; ".join(parts), unrepresented + unattributed
+
+
+def _check_file_artifact_inspection(context):
+    defective = [entry for entry in _file_inventory_entries(context)
+                 if entry.get("error")]
+    if not defective:
+        return "verified", ("every inventoried mandatory artifact was "
+                            "readable and classified deterministically")
+    return ("unmet",
+            "mandatory delivered artifacts lack a verifiable artifact "
+            "identity: "
+            + ", ".join(f"{entry['path']} ({entry['error']})"
+                        for entry in defective),
+            [entry["ref"] for entry in defective],
+            "artifact-inspection")
+
+
+def _check_file_component_graph(context):
+    refs = [component["bom-ref"]
+            for component in _file_components(context)]
+    counts = {}
+    referenced = set()
+    for entry in context["sbom"].get("dependencies") or []:
+        if entry.get("ref"):
+            counts[entry["ref"]] = counts.get(entry["ref"], 0) + 1
+        referenced.update(entry.get("dependsOn") or [])
+    violations = sorted(
+        {ref for ref in refs
+         if not ref or counts.get(ref) != 1 or ref not in referenced}
+        | {ref for ref in refs if ref and refs.count(ref) > 1})
+    if violations:
+        return ("unmet",
+                "file components lack a unique bom-ref, exactly one "
+                "dependency entry or a traceable owning component",
+                violations)
+    return "verified", ("every file component has a unique bom-ref, exactly "
+                        "one dependency entry and a traceable owning "
+                        "component")
+
+
 def _check_dependency_coverage(context):
     return "unverifiable", ("Yocto metadata and imported BOMs cannot establish "
                             "that every delivered or dynamically loaded "
@@ -714,6 +792,38 @@ TR03183_2_REQUIREMENTS = [
         "check": _check_file_hashes,
     },
     {
+        "id": "REQ-FILE-001",
+        "source": ("BSI TR-03183-2 v2.1.0 §3.2.1 (file components) and "
+                   "§5.2.2 (mandatory inventory of delivered executables "
+                   "and archives)"),
+        "representation": ("one type:file component with artifact identity "
+                           "per delivered mandatory file"),
+        "origin": "generated-document",
+        "applies": _applies_file_inventory,
+        "check": _check_file_inventory_coverage,
+    },
+    {
+        "id": "REQ-FILE-002",
+        "source": ("BSI TR-03183-2 v2.1.0 §3.2.1 (artifact identity) and "
+                   "§5.2.2 (hash of the deployable artifact)"),
+        "representation": ("SHA-512 and classification facts for every "
+                           "mandatory artifact; defective artifacts are "
+                           "reported instead of vanishing"),
+        "origin": "artifact-inspection",
+        "applies": _applies_file_inventory,
+        "check": _check_file_artifact_inspection,
+    },
+    {
+        "id": "REQ-FILE-003",
+        "source": ("BSI TR-03183-2 v2.1.0 §5.2.2 (dependency graph "
+                   "participation of file components)"),
+        "representation": ("file components as graph leaves owned by their "
+                           "delivering logical component"),
+        "origin": "generated-document",
+        "applies": _applies_file_components,
+        "check": _check_file_component_graph,
+    },
+    {
         "id": "REQ-URI-001",
         "source": "BSI TR-03183-2 v2.1.0 §5.2.3 (SBOM-URI, conditional)",
         "representation": "declared canonical URI of the SBOM document",
@@ -828,7 +938,7 @@ PROFILES = {
         "guideline": "BSI TR-03183-2",
         "guidelineVersion": "2.1.0",
         "propertyTaxonomyVersion": "0.1.2",
-        "requirementsMatrixVersion": "2.1.0-r5",
+        "requirementsMatrixVersion": "2.1.0-r6",
         "specVersions": ["1.6", "1.7"],
         "requirements": TR03183_2_REQUIREMENTS,
     },

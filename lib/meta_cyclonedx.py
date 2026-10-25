@@ -1298,44 +1298,57 @@ def render(facts):
     # whose graph entry gains the file reference. Active only with a
     # selected alignment profile; ordinary output stays a logical-component
     # SBOM (ADR-0005), and the renderer never inspects files itself -
-    # classification and hashing stay artifact facts (ADR-0002).
+    # classification and hashing stay artifact facts (ADR-0002). Entries
+    # the adapter could not classify carry an error kind and stay
+    # reported, never silently dropped (ADR-0004).
     file_inventory = facts.get("file_inventory") or {}
-    if profile and file_inventory:
-        for recipe in sorted(file_inventory):
+    file_facts = []
+    for recipe in sorted(file_inventory):
+        for entry in file_inventory[recipe]:
+            file_facts.append({**entry, "recipe": recipe,
+                               "ref": _file_bom_ref(recipe, entry["path"])})
+    for artifact in file_facts:
+        if artifact.get("error"):
+            _log(log, "warn", f"File inventory: {artifact['recipe']}: "
+                              f"mandatory delivered file "
+                              f"{artifact['path']} is {artifact['error']}")
+    if profile:
+        for artifact in file_facts:
+            if artifact.get("error"):
+                continue
+            recipe = artifact["recipe"]
             owner_refs = recipe_refs.get(recipe) or []
             version = next((component.get("version")
                             for component in
                             (fragments.get(recipe) or {}).get("pkgs", ())
                             if component.get("version")), "unknown")
-            for entry in file_inventory[recipe]:
-                ref = _file_bom_ref(recipe, entry["path"])
-                name = posixpath.basename(entry["path"])
-                sbom["components"].append({
-                    "type": "file",
-                    "name": name,
-                    "version": version,
-                    "bom-ref": ref,
-                    "hashes": [{"alg": "SHA-512",
-                                "content": entry["sha512"]}],
-                    "properties": [
-                        {"name": BSI_FILENAME_PROPERTY, "value": name},
-                        {"name": BSI_EXECUTABLE_PROPERTY,
-                         "value": entry["executable"]},
-                        {"name": BSI_ARCHIVE_PROPERTY,
-                         "value": entry["archive"]},
-                        {"name": BSI_STRUCTURED_PROPERTY,
-                         "value": entry["structured"]},
-                    ],
-                })
-                owner_ref = owner_refs[0] if owner_refs else None
-                if owner_ref:
-                    owner_entry = next((dep for dep in sbom["dependencies"]
-                                        if dep["ref"] == owner_ref), None)
-                    if owner_entry is None:
-                        owner_entry = {"ref": owner_ref, "dependsOn": []}
-                        sbom["dependencies"].append(owner_entry)
-                    if ref not in owner_entry["dependsOn"]:
-                        owner_entry["dependsOn"].append(ref)
+            name = posixpath.basename(artifact["path"])
+            sbom["components"].append({
+                "type": "file",
+                "name": name,
+                "version": version,
+                "bom-ref": artifact["ref"],
+                "hashes": [{"alg": "SHA-512",
+                            "content": artifact["sha512"]}],
+                "properties": [
+                    {"name": BSI_FILENAME_PROPERTY, "value": name},
+                    {"name": BSI_EXECUTABLE_PROPERTY,
+                     "value": artifact["executable"]},
+                    {"name": BSI_ARCHIVE_PROPERTY,
+                     "value": artifact["archive"]},
+                    {"name": BSI_STRUCTURED_PROPERTY,
+                     "value": artifact["structured"]},
+                ],
+            })
+            owner_ref = owner_refs[0] if owner_refs else None
+            if owner_ref:
+                owner_entry = next((dep for dep in sbom["dependencies"]
+                                    if dep["ref"] == owner_ref), None)
+                if owner_entry is None:
+                    owner_entry = {"ref": owner_ref, "dependsOn": []}
+                    sbom["dependencies"].append(owner_entry)
+                if artifact["ref"] not in owner_entry["dependsOn"]:
+                    owner_entry["dependsOn"].append(artifact["ref"])
 
     # The component declaration order is fixed here, after EVERY append:
     # the recipe set above is unordered, boundary, contributed and
@@ -1425,6 +1438,11 @@ def render(facts):
 
     graph = _graph_evidence(sbom, metadata_component_ref, ref_recipes,
                             debug_evidence_recipes, merge_defects, log)
+    if file_facts:
+        graph["fileInventory"] = {"entries": [
+            {key: artifact.get(key)
+             for key in ("recipe", "path", "ref", "error")}
+            for artifact in file_facts]}
 
     # Replace SBOM serial placeholder in VEX vulnerabilities
     # This must be done after all vulnerabilities are collected to ensure each image

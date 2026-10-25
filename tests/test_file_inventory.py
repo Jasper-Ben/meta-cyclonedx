@@ -121,3 +121,28 @@ def _stable_refs(sbom):
     return [entry["ref"] for entry in sbom["dependencies"]
             if not re.fullmatch(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}",
                                 entry["ref"])]
+
+
+def test_unreadable_mandatory_artifact_produces_an_alignment_finding():
+    facts = default_facts(
+        config=profile_config(),
+        file_inventory={"busybox": [
+            file_entry("/bin/sh", sha512="a" * 128),
+            file_entry("/usr/bin/broken", error="unreadable"),
+        ]},
+    )
+    docs, _logs = render_all(facts)
+
+    finding = finding_by_id(docs["report"], "REQ-FILE-002")
+    assert finding["verdict"] == "unmet"
+    assert finding["applicability"] == "applicable"
+    assert finding["bomRefs"] == [file_ref("busybox", "/usr/bin/broken")]
+    assert "/usr/bin/broken" in finding["diagnosticMessage"]
+    assert "unreadable" in finding["diagnosticMessage"]
+    # Report enforcement never drops the rest of the output.
+    assert docs["sbom"]["bomFormat"] == "CycloneDX"
+    assert [component["bom-ref"]
+            for component in file_components(docs["sbom"])] == \
+        [file_ref("busybox", "/bin/sh")]
+    assert finding_by_id(docs["report"], "REQ-FILE-001")["verdict"] == "verified"
+    assert finding_by_id(docs["report"], "REQ-FILE-003")["verdict"] == "verified"
