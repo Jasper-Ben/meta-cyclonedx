@@ -43,10 +43,9 @@ class KasBuildResult:
     @property
     def image_metadata_dir(self):
         """CycloneDX sstate output for this single-config, machine-specific image."""
-        machine_arch = kas_env.MACHINE.replace("-", "_")
         return (
             self.build_dir / "tmp" / "cyclonedx" / "image"
-            / machine_arch / kas_env.TARGET
+            / kas_env.MACHINE.replace("-", "_") / kas_env.TARGET
         )
 
     def deployed(self, name):
@@ -63,9 +62,16 @@ class RunRecord:
     deployed, not the current occupants of the file. Also parses
     BitBake's task-execution lines, the log observation distinguishing
     "nothing reran" from a build that redid work.
+
+    Under *profile* (the invocation requested an alignment profile through
+    its environment) the deployed alignment report is captured alongside
+    the SBOM and VEX: profile runs overwrite each other's report bytes in
+    the shared deploy directory, while a run without a profile deploys no
+    report at all — capturing one there would attribute a stale file to
+    the wrong invocation.
     """
 
-    def __init__(self, name, build, output):
+    def __init__(self, name, build, output, profile=False):
         self.name = name
         self.build = build
         self.returncode = build.returncode
@@ -76,7 +82,10 @@ class RunRecord:
         self.image_metadata_captures = {}
         if build.returncode == 0:
             self.checksums = kas_env.artifact_checksums(build.deploy_dir)
-            for doc_name in (kas_env.SBOM_NAME, kas_env.VEX_NAME):
+            captured = [kas_env.SBOM_NAME, kas_env.VEX_NAME]
+            if profile:
+                captured.append(kas_env.ALIGNMENT_REPORT_NAME)
+            for doc_name in captured:
                 path = build.deployed(doc_name)
                 if path.is_file():
                     self.document_captures[doc_name] = path.read_text()
@@ -109,15 +118,17 @@ class KasRunRecorder:
         self.engine = container_runtime
         self.results: dict[str, RunRecord] = {}
         self._pinned = False
+        self._expected_failures: set[str] = set()
 
     def __getitem__(self, name):
         return self.results[name]
 
-    def invoke(self, name, extra_env=None):
+    def invoke(self, name, extra_env=None, expect_failure=False):
         """Run the matrix configuration under this name; return its record.
 
         *extra_env* is set in the build environment (the image-change
-        run's install-list forwarding) through the mode-appropriate
+        run's install-list forwarding, the alignment-profile scenario's
+        profile and enforcement selection) through the mode-appropriate
         channel — the wrapper's --runtime-args channel in container
         mode (a plain host export would be dropped by the wrapper's
         environment whitelist), the process environment in direct mode
@@ -130,11 +141,21 @@ class KasRunRecorder:
         observation is guarded off the failed build anyway. Zero-exit
         invocations never gate, keeping stage independence for
         assertion failures.
+
+        *expect_failure* marks a deliberate product-level rejection —
+        the strict-enforcement scenario is *supposed* to fail the build.
+        Its failure is environment-scoped by construction: the violation
+        rides that invocation's own *extra_env*, so a later invocation
+        without it cannot replay it and must not be gated. The exemption
+        is per-record; accidental failures still gate every stage.
         """
         if name in self.results:
             return self.results[name]
         for failed in self.results.values():
-            if failed.returncode != 0:
+            if (
+                failed.returncode != 0
+                and failed.name not in self._expected_failures
+            ):
                 pytest.skip(
                     f"prior kas invocation {failed.name!r} failed "
                     f"(exit {failed.returncode}); later stages would "
@@ -179,7 +200,14 @@ class KasRunRecorder:
             output=lines,
             build_dir=kas_env.build_dir(),
         )
-        self.results[name] = record = RunRecord(name, build, lines)
+        if expect_failure:
+            self._expected_failures.add(name)
+        self.results[name] = record = RunRecord(
+            name,
+            build,
+            lines,
+            profile=bool((extra_env or {}).get("CYCLONEDX_PROFILE")),
+        )
         return record
 
     def _stream(self, command, env):
@@ -301,6 +329,10 @@ class RunDocuments:
     @property
     def vex(self):
         return self.document(kas_env.VEX_NAME, "image VEX")
+
+    @property
+    def alignment_report(self):
+        return self.document(kas_env.ALIGNMENT_REPORT_NAME, "alignment report")
 
 
 @pytest.fixture(scope="session")
