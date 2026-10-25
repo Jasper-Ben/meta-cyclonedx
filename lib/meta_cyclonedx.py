@@ -212,6 +212,38 @@ DEPENDENCY_EVIDENCE_PROPERTY = "yocto:dependency:evidence"
 DELIVERY_SCOPE_PROPERTY = "yocto:delivery:scope"
 
 
+# Licence roles (BSI TR-03183-2 v2.1.0 §3.2.8 and the §8.2 mapping
+# tables): ORIGINAL licences are the licences assigned by the component
+# creator and ride the CycloneDX licences field with acknowledgement
+# "declared"; DISTRIBUTION licences ("concluded") are the licences under
+# which a recipient may use the component and require a semantically
+# authoritative source; the EFFECTIVE licence is the licence under which
+# the creator of the current SBOM uses the component and rides the
+# official BSI property. The property name follows the pinned property
+# taxonomy v0.1.2 registry spelling ("Licence"); the TR-03183-2 v2.1.0
+# PDF tables carry a "License" variant of the same property. The
+# generator performs no legal or composition analysis and never derives
+# one licence role from another (ADR-0003).
+EFFECTIVE_LICENCE_PROPERTY = "bsi:component:effectiveLicence"
+ORIGINAL_LICENCE_ACKNOWLEDGEMENT = "declared"
+DISTRIBUTION_LICENCE_ACKNOWLEDGEMENT = "concluded"
+
+
+def _mark_original_licences(component):
+    """Make the original licence role explicit on every licence entry.
+
+    Recipe LICENSE metadata is original licence evidence only; entries
+    that already carry an acknowledgement keep whatever role the
+    document states, and none is ever rewritten into another.
+    """
+    for entry in component.get("licenses") or []:
+        if "acknowledgement" in entry:
+            continue
+        target = entry["license"] if isinstance(entry.get("license"),
+                                                 dict) else entry
+        target.setdefault("acknowledgement", ORIGINAL_LICENCE_ACKNOWLEDGEMENT)
+
+
 def _identified_component(recipe_name, add_scope):
     """The minimal CycloneDX representation of an external dependency."""
     component = {
@@ -745,6 +777,7 @@ def render(facts):
             sbom_metadata["component"].setdefault(
                 "externalReferences", []).append(
                     {"type": reference_type, "url": primary[reference_key]})
+    _mark_original_licences(sbom_metadata["component"])
 
     sbom = {
         "bomFormat": "CycloneDX",
@@ -844,6 +877,11 @@ def render(facts):
                     pn_pkg.setdefault("externalReferences", []).append(
                         {"type": reference_type,
                          "url": pn_list[reference_key]})
+
+            # Recipe LICENSE metadata enters the document only as
+            # original licence evidence; its role is made explicit here
+            # and never rewritten into another role (ADR-0003).
+            _mark_original_licences(pn_pkg)
 
             if pkg in image_install_recipes and pn_pkg.get("bom-ref"):
                 directly_installed_component_refs.add(pn_pkg["bom-ref"])
