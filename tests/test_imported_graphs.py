@@ -90,3 +90,29 @@ def test_one_imported_instance_reconciles_across_contributed_graphs():
     # Both consuming recipes still reach the shared instance.
     assert dep_entry(sbom, "ref-r")["dependsOn"] == [shared]
     assert dep_entry(sbom, "ref-o")["dependsOn"] == [shared]
+
+
+def test_missing_imported_root_produces_a_finding_not_truncated_output():
+    # The contributed edges name a tree root that no component carries:
+    # the imported document was malformed (e.g. its metadata.component
+    # root was dropped). The graph still gets the attach edge — published
+    # dangling and reported — instead of silently losing the attachment.
+    child = {"bom-ref": "cargo://child", "type": "library", "name": "dep",
+             "version": "1", "purl": "pkg:cargo/dep@1"}
+    facts = default_facts(config=profile_config(), fragments={
+        "rust-app": fragment(
+            pkgs=[pkg("rust-app", "1", "ref-r")],
+            **contributed([child],
+                          [{"ref": "cargo://child",
+                            "dependsOn": ["cargo://missing-root"]}],
+                          ["cargo://missing-root"])),
+    })
+    docs, _logs = render_all(facts)
+    sbom = docs["sbom"]
+
+    assert dep_entry(sbom, "ref-r")["dependsOn"] == ["cargo://missing-root"]
+    assert dep_entry(sbom, "cargo://child")["dependsOn"] == \
+        ["cargo://missing-root"]
+    finding = finding_by_id(docs["report"], "REQ-REF-001")
+    assert finding["verdict"] == "unmet"
+    assert "cargo://missing-root" in finding["bomRefs"]

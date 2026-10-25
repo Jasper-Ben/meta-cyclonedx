@@ -1201,8 +1201,16 @@ def render(facts):
             sbom["dependencies"].append(owner_entry)
         for root_ref in extra_roots:
             root_ref = contributed_ref_remap.get(root_ref, root_ref)
-            if root_ref in extra_ref_components and \
-                    root_ref not in owner_entry["dependsOn"]:
+            if root_ref not in extra_ref_components:
+                # A root no component carries: the imported document is
+                # malformed. The attach edge is published anyway and goes
+                # out as a dangling reference finding, never silently
+                # detached from the owner (ADR-0004).
+                _log(log, "warn", f"CYCLONEDX_EXTRA_BOM_FILES: {pkg}: "
+                                  f"contributed root {root_ref} names no "
+                                  f"component; the imported graph is "
+                                  f"malformed")
+            if root_ref not in owner_entry["dependsOn"]:
                 owner_entry["dependsOn"].append(root_ref)
 
     # Fold in complete SBOMs of the included embedded images. Components
