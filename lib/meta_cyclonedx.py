@@ -82,19 +82,32 @@ debug_sources         recipe -> delivered file -> debug-source paths recorded
 file_inventory         recipe -> ordered delivered-file artifact facts,
                       collected only while an alignment profile is
                       selected and covering only mandatory files
-                      (executables and archives); each entry:
-    path                        delivered path inside the root filesystem
-    sha512                      SHA-512 of the delivered bytes (absent on
-                                defective entries)
+                      (executables and archives, plus the deployable
+                      artifact and selected payloads below); entries
+                      under the recipe-less key "" are deploy-directory
+                      evidence owned by the primary component (ticket
+                      #10); each entry:
+    path                        delivered path inside the root
+                                filesystem, or - for recipe-less
+                                entries - deploy-directory-relative
+                                path (stable names, no build stamps)
+    sha512                      SHA-512 of the delivered bytes (absent
+                                on defective entries)
     executable / archive /
       structured                taxonomy values (absent on defective
                                 entries)
     error                       "missing", "unreadable" or
                                 "ambiguous-classification" (defective
                                 entries stay reported, never vanish)
-                      The adapter skips symlinks and other non-regular
-                      entries: their content identity belongs to the
-                      regular file they resolve to.
+    source                      "deployable" for the primary
+                                deployable artifact and "selected" for
+                                explicitly selected additional files;
+                                absent for root-filesystem package
+                                evidence
+                      The adapter skips root-filesystem symlinks and
+                      other non-regular entries: their content
+                      identity belongs to the regular file they
+                      resolve to.
 included_images       ordered embedded-image documents:
     name                          recipe name of the included image
     sbom                          its completed SBOM document, or None when
@@ -107,6 +120,7 @@ included_images       ordered embedded-image documents:
 
 import bz2
 import copy
+import fnmatch
 import importlib
 import importlib.util
 import json
@@ -479,6 +493,94 @@ def classify_delivered_file(path, mode, data):
             "archive": "archive" if kind else "no archive",
             "structured": structured,
             **({"error": error} if error else {})}
+
+
+
+def plan_deploy_file_selection(patterns, deploy_files,
+                               primary_candidates=()):
+    """Plan the deploy-directory file selection (ticket #10).
+
+    Pure grammar and dedup logic for the BitBake adapter, which
+    enumerates the image deploy directory and hashes what this plans.
+    The renderer consumes the resulting entries through the
+    file_inventory facts key; this function itself never touches the
+    filesystem, keeping the selection semantics deterministic and
+    testable.
+
+    patterns: whitespace-separated tokens. Each token is a shell-style
+    glob (fnmatch; `*` crosses directory boundaries) matched against
+    deploy-directory-relative paths; a token beginning with "/" is
+    anchored at the deploy directory, and the recorded path is always
+    the relative one.
+    deploy_files: mapping of deploy-directory-relative path to
+    {"kind": "file"|"symlink", "target": the resolved relative target
+    path, or None when unresolvable}.
+    primary_candidates: ordered relative paths naming the image's own
+    deployable artifacts (the stable link names of the declared
+    IMAGE_FSTYPES); these are mandatory inventory (TR-03183-2 v2.1.0
+    §5.2.2) even when no pattern selects them.
+
+    Returns the ordered artifact plan: primary candidates first
+    (source "deployable"), then every other selection match ordered by
+    path (source "selected"), then a "missing" entry per pattern that
+    matched nothing - explicit evidence instead of silence (ADR-0004).
+    A symlink records the artifact under its (stable) link name; a
+    regular file equal to the target of an already planned or selected
+    symlink is the same artifact instance and is skipped. Broken
+    symlinks are "unreadable" evidence.
+    """
+    def normalize(token):
+        token = token.lstrip("/")
+        while token.startswith("./"):
+            token = token[2:]
+        return token
+
+    def planned(path):
+        entry = {"path": path, "source": "deployable"}
+        kind = (deploy_files.get(path) or {}).get("kind")
+        if kind is None:
+            entry["error"] = "missing"
+        elif kind == "symlink" and \
+                (deploy_files[path].get("target") is None):
+            entry["error"] = "unreadable"
+        return entry
+
+    def claimed_target(path):
+        return (deploy_files.get(path) or {}).get("target")
+
+    plan = [planned(candidate) for candidate in primary_candidates]
+    claimed = set(primary_candidates)
+    claimed.update(claimed_target(candidate)
+                   for candidate in primary_candidates
+                   if claimed_target(candidate))
+
+    tokens = [normalize(token) for token in patterns.split() if token]
+    matched_any = set()
+    for token in tokens:
+        for path in deploy_files:
+            if fnmatch.fnmatchcase(path, token):
+                matched_any.add(token)
+
+    matched = {path for path in deploy_files
+               if any(fnmatch.fnmatchcase(path, token) for token in tokens)}
+    for path in matched:
+        info = deploy_files[path]
+        if info.get("kind") == "symlink" and info.get("target"):
+            # The stable link name records the instance; claim the
+            # (possibly timestamped) target so it is never selected as
+            # a second name for the same bytes.
+            claimed.add(info["target"])
+    for path in sorted(matched - claimed):
+        entry = {"path": path, "source": "selected"}
+        if deploy_files[path].get("kind") == "symlink" and \
+                not deploy_files[path].get("target"):
+            entry["error"] = "unreadable"
+        plan.append(entry)
+
+    for token in sorted(set(tokens) - matched_any):
+        plan.append({"path": token, "source": "selected",
+                     "error": "missing"})
+    return plan
 
 
 # The dependency graph crosses the scope of delivery exactly once per
@@ -1545,7 +1647,11 @@ def render(facts):
     # SBOM (ADR-0005), and the renderer never inspects files itself -
     # classification and hashing stay artifact facts (ADR-0002). Entries
     # the adapter could not classify carry an error kind and stay
-    # reported, never silently dropped (ADR-0004).
+    # reported, never silently dropped (ADR-0004). Deploy-directory
+    # evidence (the primary deployable artifact and explicitly selected
+    # product payloads, ticket #10) arrives under the recipe-less owner
+    # key "": the primary component owns and delivers those artifacts,
+    # which no root-filesystem package manifest names.
     file_inventory = facts.get("file_inventory") or {}
     file_facts = []
     for recipe in sorted(file_inventory):
@@ -1557,16 +1663,31 @@ def render(facts):
             _log(log, "warn", f"File inventory: {artifact['recipe']}: "
                               f"mandatory delivered file "
                               f"{artifact['path']} is {artifact['error']}")
+    primary_owned_file_refs = []
+    composed_refs = set()
     if profile:
         for artifact in file_facts:
             if artifact.get("error"):
                 continue
+            if artifact["ref"] in composed_refs:
+                # One artifact instance discovered through several
+                # evidences (package manifest, deployable, embedded
+                # image or explicit selection) is one file component:
+                # the artifact ref - recipe namespace plus delivered
+                # path - is the dedup key. The evidence entries all
+                # stay in the report context; the document does not
+                # duplicate.
+                continue
             recipe = artifact["recipe"]
-            owner_refs = recipe_refs.get(recipe) or []
-            version = next((component.get("version")
-                            for component in
-                            (fragments.get(recipe) or {}).get("pkgs", ())
-                            if component.get("version")), "unknown")
+            if recipe == "":
+                owner_refs = [metadata_component_ref]
+                version = image_version
+            else:
+                owner_refs = recipe_refs.get(recipe) or []
+                version = next((component.get("version")
+                                for component in
+                                (fragments.get(recipe) or {}).get("pkgs", ())
+                                if component.get("version")), "unknown")
             name = posixpath.basename(artifact["path"])
             sbom["components"].append({
                 "type": "file",
@@ -1585,8 +1706,14 @@ def render(facts):
                      "value": artifact["structured"]},
                 ],
             })
+            composed_refs.add(artifact["ref"])
             owner_ref = owner_refs[0] if owner_refs else None
-            if owner_ref:
+            if owner_ref == metadata_component_ref:
+                # The graph root entry is inserted below; collect the
+                # artifact reference instead of minting a second entry
+                # for the same ref.
+                primary_owned_file_refs.append(artifact["ref"])
+            elif owner_ref:
                 owner_entry = next((dep for dep in sbom["dependencies"]
                                     if dep["ref"] == owner_ref), None)
                 if owner_entry is None:
@@ -1619,10 +1746,16 @@ def render(facts):
     # Add a root dependency node as the first entry.
     # It references metadata.component and points to all directly installed
     # components; the dependency-target sort below fixes the array order.
+    # Deploy-directory file components (ticket #10) have no delivering
+    # recipe: the primary component delivers them, so their references
+    # join the root's dependency list.
     root_dep_entry = {
         "ref": metadata_component_ref,
         "dependsOn": list(directly_installed_component_refs)
     }
+    for artifact_ref in primary_owned_file_refs:
+        if artifact_ref not in root_dep_entry["dependsOn"]:
+            root_dep_entry["dependsOn"].append(artifact_ref)
     sbom["dependencies"].insert(0, root_dep_entry)
 
     # CycloneDX dependency lists are sets; the array order is presentation.
@@ -1686,7 +1819,7 @@ def render(facts):
     if file_facts:
         graph["fileInventory"] = {"entries": [
             {key: artifact.get(key)
-             for key in ("recipe", "path", "ref", "error")}
+             for key in ("recipe", "path", "ref", "error", "source")}
             for artifact in file_facts]}
 
     # Replace SBOM serial placeholder in VEX vulnerabilities

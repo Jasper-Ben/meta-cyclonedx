@@ -137,6 +137,62 @@ def _check_file_artifact_inspection(context):
             "artifact-inspection")
 
 
+# Deploy-directory evidence (ticket #10): the primary deployable
+# artifact is mandatory inventory under the profile even though no
+# package manifest names it, and the product integration can explicitly
+# select additional delivered payloads. A selection or artifact that
+# resolves to nothing stays an affected-file finding (ADR-0004).
+def _deploy_evidence_entries(context, source):
+    return [entry for entry in _file_inventory_entries(context)
+            if entry.get("source") == source]
+
+
+def _applies_deployable_inventory(context):
+    if _deploy_evidence_entries(context, "deployable"):
+        return True, None
+    return False, ("this export recorded no primary deployable artifact "
+                   "evidence; there is no deploy-directory delivery to "
+                   "represent")
+
+
+def _check_deployable_coverage(context):
+    entries = _deploy_evidence_entries(context, "deployable")
+    defective = [entry for entry in entries if entry.get("error")]
+    if not defective:
+        return "verified", ("the primary deployable artifact is "
+                            "represented as an exact file component of "
+                            "the delivery")
+    return ("unmet",
+            "the primary deployable artifact lacks a verifiable artifact "
+            "identity: "
+            + ", ".join(f"{entry['path']} ({entry['error']})"
+                        for entry in defective),
+            [entry["ref"] for entry in defective],
+            "artifact-inspection")
+
+
+def _applies_selected_files(context):
+    if _deploy_evidence_entries(context, "selected"):
+        return True, None
+    return False, ("the product integration selected no additional "
+                   "deployed files; the selection requirement does not "
+                   "apply")
+
+
+def _check_selected_files(context):
+    entries = _deploy_evidence_entries(context, "selected")
+    defective = [entry for entry in entries if entry.get("error")]
+    if not defective:
+        return "verified", ("every explicitly selected additional file "
+                            "is represented as an exact file component")
+    return ("unmet",
+            "selected additional files are not inventoried: "
+            + ", ".join(f"{entry['path']} ({entry['error']})"
+                        for entry in defective),
+            [entry["ref"] for entry in defective],
+            "artifact-inspection")
+
+
 def _check_file_component_graph(context):
     refs = [component["bom-ref"]
             for component in _file_components(context)]
@@ -830,6 +886,29 @@ TR03183_2_REQUIREMENTS = [
         "check": _check_file_component_graph,
     },
     {
+        "id": "REQ-FILE-004",
+        "source": ("BSI TR-03183-2 v2.1.0 §3.2.1 (file components) and "
+                   "§5.2.2 (mandatory primary deployable artifact)"),
+        "representation": ("one type:file component with artifact "
+                           "identity per deployed primary artifact, owned "
+                           "by the primary component"),
+        "origin": "generated-document",
+        "applies": _applies_deployable_inventory,
+        "check": _check_deployable_coverage,
+    },
+    {
+        "id": "REQ-FILE-005",
+        "source": ("BSI TR-03183-2 v2.1.0 §4 (scope of delivery) and "
+                   "§5.2.2 (explicitly selected additional delivered "
+                   "files)"),
+        "representation": ("one file component per explicitly selected "
+                           "additional file; a selection that resolves to "
+                           "nothing stays an affected-file finding"),
+        "origin": "generated-document",
+        "applies": _applies_selected_files,
+        "check": _check_selected_files,
+    },
+    {
         "id": "REQ-URI-001",
         "source": "BSI TR-03183-2 v2.1.0 §5.2.3 (SBOM-URI, conditional)",
         "representation": "declared canonical URI of the SBOM document",
@@ -944,7 +1023,7 @@ PROFILES = {
         "guideline": "BSI TR-03183-2",
         "guidelineVersion": "2.1.0",
         "propertyTaxonomyVersion": "0.1.2",
-        "requirementsMatrixVersion": "2.1.0-r6",
+        "requirementsMatrixVersion": "2.1.0-r7",
         "specVersions": ["1.6", "1.7"],
         "requirements": TR03183_2_REQUIREMENTS,
     },
