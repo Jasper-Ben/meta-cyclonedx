@@ -60,17 +60,19 @@ def test_dependency_token_resolves_to_the_recipes_single_logical_component():
     assert entry["dependsOn"] == ["ref-app"]
 
 
-def test_dependency_on_a_recipe_outside_the_image_is_pruned():
+def test_dependency_on_a_recipe_outside_the_image_identifies_the_boundary():
+    # The known path continues through the first component outside the
+    # scope of delivery; it is never pruned from the evidence (ADR-0004).
     facts = default_facts(fragments={
         "app": fragment(pkgs=[pkg("app", "1", "ref-app")],
                         dependencies=[dep("ref-app", ["busybox", "ghost"])]),
         "busybox": fragment(pkgs=[pkg("busybox", "1.36", "ref-b")]),
     })
-    sbom, _vex, logs = render_docs(facts)
+    sbom, _vex, _logs = render_docs(facts)
 
     entry = next(e for e in sbom["dependencies"] if e["ref"] == "ref-app")
-    assert entry["dependsOn"] == ["ref-b"]
-    assert any("ghost" in message for _level, message in logs)
+    ghost = next(c for c in sbom["components"] if c["name"] == "ghost")
+    assert entry["dependsOn"] == ["ref-b", ghost["bom-ref"]]
 
 
 def test_self_dependency_edge_is_dropped_from_the_component_entry():

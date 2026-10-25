@@ -179,6 +179,32 @@ ALIAS_VERSION_PROPERTY = "yocto:cve:version"
 ALIAS_CPE_PROPERTY = "yocto:cve:cpe"
 
 
+# The dependency graph crosses the scope of delivery exactly once per
+# known path: the first external component is represented as identified —
+# creator-unverified name and identifier plus a delivery-scope marker that
+# keeps it distinct from delivered component instances — and resolution
+# stops there unless deeper evidence exists (ADR-0004, never a silent drop).
+DELIVERY_SCOPE_PROPERTY = "yocto:delivery:scope"
+
+
+def _identified_component(recipe_name, add_scope):
+    """The minimal CycloneDX representation of an external dependency."""
+    component = {
+        "type": "library",
+        "name": recipe_name,
+        "version": "unknown",
+        "purl": f"pkg:yocto/{recipe_name}",
+        "bom-ref": str(uuid.uuid4()),
+    }
+    if add_scope:
+        component["scope"] = "excluded"
+    component["properties"] = [{
+        "name": DELIVERY_SCOPE_PROPERTY,
+        "value": "external",
+    }]
+    return component
+
+
 def _short_version(version):
     """Short upstream version of a Yocto version string (drops +git suffixes)."""
     return (version or "").split("+git")[0].strip()
@@ -616,6 +642,7 @@ def render(facts):
     # per-package RDEPENDS and generated shlib dependencies, which the recipe
     # metadata alone misses. They are empty when the caller resolved
     # dependencies by configuration instead.
+    boundary_components = {}
     for pkg in sorted(fragments):
         pn_list = fragments[pkg]
 
@@ -638,7 +665,20 @@ def render(facts):
 
             for depends in list(dep_entry["dependsOn"]) + extra_depends:
                 if depends not in image_recipe_names:
-                    _log(log, 2, f"Skipping dependency {depends} - not in this image")
+                    # A known dependency recipe outside the delivery item:
+                    # follow the path to it, represent it as identified and
+                    # stop — deeper resolution is not claimed without
+                    # evidence, and the edge is never dropped either.
+                    boundary = boundary_components.get(depends)
+                    if boundary is None:
+                        boundary = _identified_component(depends, add_scopes)
+                        boundary_components[depends] = boundary
+                        sbom["components"].append(boundary)
+                        _log(log, 2, f"Dependency {depends} is outside the "
+                                     f"scope of delivery; represented as "
+                                     f"identified")
+                    if boundary["bom-ref"] not in resolved_depends:
+                        resolved_depends.append(boundary["bom-ref"])
                     continue
 
                 resolved_refs = _resolve_dependency_refs(depends, recipe_refs,
