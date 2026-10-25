@@ -36,11 +36,19 @@ target: core-image-minimal
 # no other run's signatures move. Container mode delivers it through
 # the wrapper's --runtime-args channel, direct mode (KAS_CONTAINER_ENGINE
 # =none, e.g. on a CI runner) through the process environment.
+# CYCLONEDX_PROFILE, CYCLONEDX_PROFILE_ENFORCEMENT and
+# CYCLONEDX_PRIMARY_COMPONENT_CREATOR carry the alignment-profile
+# acceptance scenario (tests/integration/test_alignment_profile.py): the
+# public profile configuration rides that same channel, and stays unset
+# for every other run, so no other run's signatures move.
 env:
   DL_DIR:
   SSTATE_DIR:
   SSTATE_MIRRORS:
   CORE_IMAGE_EXTRA_INSTALL:
+  CYCLONEDX_PROFILE:
+  CYCLONEDX_PROFILE_ENFORCEMENT:
+  CYCLONEDX_PRIMARY_COMPONENT_CREATOR:
 
 # Release coordinates: the `branch:` entries name the series and the
 # `commit:` pins make runs reproducible; refresh both together when
