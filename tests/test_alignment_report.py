@@ -30,7 +30,7 @@ def test_report_records_exact_profile_baseline():
         "guidelineVersion": "2.1.0",
         "propertyTaxonomyVersion": "0.1.2",
         "cyclonedxSchemaVersion": "1.7",
-        "requirementsMatrixVersion": "2.1.0-r3",
+        "requirementsMatrixVersion": "2.1.0-r4",
     }
 
 
@@ -79,7 +79,8 @@ def test_missing_assertion_is_unmet_never_verified():
 def test_assertion_evidence_alone_never_produces_verified():
     docs, _logs = render_all(default_facts(config=profile_config()))
     for finding in docs["report"]["findings"]:
-        if finding["evidenceOrigin"] == "caller-assertion":
+        if (finding["evidenceOrigin"] == "caller-assertion"
+                and finding["applicability"] == "applicable"):
             assert finding["verdict"] in ("asserted", "unmet")
 
 def test_report_records_unverifiable_requirements_without_blocking_output():

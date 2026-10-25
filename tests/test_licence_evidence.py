@@ -103,3 +103,75 @@ def test_invalid_distribution_expression_is_omitted_with_a_warning():
     ))
     assert "licenses" not in sbom["components"][0]
     assert any("MIT AND" in message for _level, message in logs)
+
+
+def distribution_finding(docs):
+    return finding_by_id(docs["report"], "REQ-COMP-011")
+
+
+def test_explicit_distribution_licence_is_asserted_never_verified():
+    facts = default_facts(
+        config=profile_config(),
+        fragments={"busybox": fragment(
+            distribution_licence="MIT",
+            pkgs=[pkg("busybox", "1.36", "ref-busybox",
+                      licenses=[{"license": {"id": "MIT"}}])])},
+        primary={"type": "firmware", "name": "core-image", "version": "1.0",
+                 "distribution_licence": "MIT",
+                 "licenses": [{"expression": "MIT",
+                               "acknowledgement": "declared"}]},
+    )
+    docs, _logs = render_all(facts)
+    finding = distribution_finding(docs)
+    assert finding["verdict"] == "asserted"
+    assert finding["evidenceOrigin"] == "caller-assertion"
+
+
+def test_missing_distribution_licence_is_unmet_never_relabelled():
+    facts = default_facts(
+        config=profile_config(),
+        fragments={"busybox": fragment(pkgs=[pkg(
+            "busybox", "1.36", "ref-busybox",
+            licenses=[{"license": {"id": "MIT"}}])])},
+        primary={"type": "firmware", "name": "core-image", "version": "1.0",
+                 "licenses": [{"expression": "MIT",
+                               "acknowledgement": "declared"}]},
+    )
+    docs, _logs = render_all(facts)
+    finding = distribution_finding(docs)
+    assert finding["verdict"] == "unmet"
+    assert finding["bomRefs"] == ["ref-busybox"]
+    assert finding["evidenceOrigin"] == "caller-assertion"
+    concluded = [entry for entry in
+                 docs["sbom"]["components"][0].get("licenses") or []
+                 if entry.get("acknowledgement") == "concluded"]
+    assert concluded == []
+
+
+def test_effective_licence_property_rides_only_explicit_supply():
+    facts = default_facts(
+        config=profile_config(),
+        fragments={"busybox": fragment(
+            effective_licence="MIT",
+            pkgs=[pkg("busybox", "1.36", "ref-busybox")])},
+        primary={"type": "firmware", "name": "core-image", "version": "1.0"},
+    )
+    docs, _logs = render_all(facts)
+    component = docs["sbom"]["components"][0]
+    properties = [p for p in component["properties"]
+                  if p["name"] == meta_cyclonedx.EFFECTIVE_LICENCE_PROPERTY]
+    assert properties == [{"name": "bsi:component:effectiveLicence",
+                           "value": "MIT"}]
+    finding = finding_by_id(docs["report"], "REQ-COMP-014")
+    assert finding["verdict"] == "asserted"
+    assert finding["evidenceOrigin"] == "caller-assertion"
+
+
+def test_effective_licence_is_omitted_and_not_applicable_by_default():
+    docs, _logs = render_all(default_facts(config=profile_config()))
+    finding = finding_by_id(docs["report"], "REQ-COMP-014")
+    assert finding["applicability"] == "not-applicable"
+    for holder in [docs["sbom"]["metadata"]["component"],
+                   *docs["sbom"]["components"]]:
+        assert not [p for p in holder.get("properties") or []
+                    if p["name"] == meta_cyclonedx.EFFECTIVE_LICENCE_PROPERTY]
