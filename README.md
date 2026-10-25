@@ -4,6 +4,9 @@
 > you are on the correct branch for your Yocto release, as the feature set and
 > default configurations may vary!**
 
+The branch support policy for the BSI TR-03183-2 alignment capability is in
+[docs/release-branches.md](docs/release-branches.md).
+
 `meta-cyclonedx` is a [Yocto](https://www.yoctoproject.org/) meta-layer which
 produces [CycloneDX](https://cyclonedx.org/) Software Bill of Materials
 (aka [SBOMs](https://www.ntia.gov/SBOM)) from your target root filesystem.
@@ -25,6 +28,9 @@ This layer generates **CycloneDX** compliant SBOMs with the following features:
 - Include component licenses.
 - Added option to reduce the SBOM size by limiting SBOM collection to run-time
   packages ([which might potentially come at some expense](#potentially-missing-packages-after-runtime-filtering))
+- Optional BSI TR-03183-2 alignment profile with `report` and `strict`
+  enforcement, publishing a machine-readable alignment report beside the SBOM
+  and VEX ([guide](docs/alignment-profile.md)).
 
 This repository was originally forked from the
 [BG Networks repository](https://github.com/bgnetworks/meta-dependencytrack).
@@ -54,6 +60,13 @@ BBLAYERS += "${BSPDIR}/sources/meta-cyclonedx"
 > **:warning: Breaking change when upgrading to Wrynose or later:**
 > Starting with Wrynose the `CYCLONEDX_INCLUDE_UNPATCHED_VULNS` option requires
 > the `sbom-cve-check` class, see [sbom-cve-check Results](#sbom-cve-check-results).
+
+> **:warning: Breaking change in the release carrying TR-03183-2 alignment
+> support:** components are now named and versioned by creator-assigned
+> logical identity instead of CVE aliases, and CPE-equality deduplication is
+> removed; component names, versions, counts and references change in every
+> generated SBOM, with no compatibility mode. See the
+> [migration guidance](docs/migration/tr-03183-alignment.md).
 
 To enable and configure the layer simply inherit the `cyclonedx-export` class
 in your `local.conf` file:
@@ -615,6 +628,11 @@ next to the SBOM and the separate VEX document. The alignment capability is
 manufacturer conformant with TR-03183-2 or the CRA. The **conformance
 determination** remains the manufacturer's own conclusion and requires
 completeness evidence that meta-cyclonedx cannot see.
+
+The full usage, integration and interpretation guide is
+[docs/alignment-profile.md](docs/alignment-profile.md); what to expect when
+upgrading across this release is in
+[docs/migration/tr-03183-alignment.md](docs/migration/tr-03183-alignment.md).
 
 ```sh
 # Versioned alignment profile; empty disables alignment output (default).

@@ -1,9 +1,10 @@
 # Breaking change: logical component identity cutover
 
 Audience: consumers diffing SBOMs across this upgrade and recipe authors.
-This fragment collects the observable identity changes for the final
-migration guidance (ticket #13 reuses it). Development branch only; not
-backported to Wrynose or Scarthgap.
+This fragment collects the observable identity changes; the
+[consolidated migration guidance](tr-03183-alignment.md) links the
+fragments for consumers. Development branch only; not backported to
+Wrynose or Scarthgap.
 
 ## What changed
 
