@@ -155,11 +155,30 @@ def _check_dependency_completeness_declaration(context):
     sbom = context["sbom"]
     if "dependencies" not in sbom:
         return "unmet", "the SBOM carries no dependency graph"
-    if not sbom.get("composition"):
-        return "unmet", ("the SBOM does not declare dependency completeness "
-                         "through CycloneDX composition data")
-    return "verified", ("the dependency graph is present and declares its "
-                        "completeness")
+    counts = {"complete": 0, "incomplete": 0, "unknown": 0}
+    declared = set()
+    undeclared = []
+    for composition in sbom.get("compositions") or []:
+        aggregate = composition.get("aggregate")
+        assemblies = composition.get("assemblies") or []
+        if aggregate not in counts:
+            undeclared.extend(assemblies)
+            continue
+        counts[aggregate] += len(assemblies)
+        declared.update(assemblies)
+    missing = sorted({component["bom-ref"]
+                      for component in sbom.get("components") or []
+                      if component.get("bom-ref")
+                      and component["bom-ref"] not in declared}
+                     | set(undeclared))
+    if missing:
+        return "unmet", ("dependency completeness is undeclared, or declared "
+                         "with an aggregate outside complete/incomplete/"
+                         "unknown, for these components"), missing
+    summary = ", ".join(f"{counts[aggregate]} {aggregate}"
+                        for aggregate in ("complete", "incomplete", "unknown"))
+    return "verified", ("the dependency graph declares its completeness "
+                        f"through CycloneDX composition data ({summary})")
 
 
 def _check_component_creators(context):
@@ -206,6 +225,89 @@ def _check_logical_identity_collisions(context):
                             "vulnerability evidence")
     return "verified", ("no component instance shares a CPE correlation "
                         "identifier with another")
+
+
+def _check_graph_root(context):
+    sbom = context["sbom"]
+    root_ref = ((sbom.get("metadata") or {}).get("component") or {}) \
+        .get("bom-ref")
+    entry_refs = [entry.get("ref")
+                  for entry in sbom.get("dependencies") or []]
+    if (root_ref and entry_refs and entry_refs[0] == root_ref
+            and entry_refs.count(root_ref) == 1):
+        return "verified", ("the delivered primary component is the unique "
+                            "root of the dependency graph")
+    return "unmet", ("the dependency graph does not declare the primary "
+                     "component as its unique root"), \
+        ([root_ref] if root_ref else [])
+
+
+def _check_dependency_entries(context):
+    components = context["sbom"].get("components") or []
+    counts = {}
+    for entry in context["sbom"].get("dependencies") or []:
+        ref = entry.get("ref")
+        if ref:
+            counts[ref] = counts.get(ref, 0) + 1
+    without_ref = [component for component in components
+                   if not component.get("bom-ref")]
+    without_entry = sorted({component["bom-ref"] for component in components
+                            if component.get("bom-ref")
+                            and counts.get(component["bom-ref"]) != 1})
+    if without_ref or without_entry:
+        message = ("components lack a bom-ref or a unique dependency entry; "
+                   "leaves carry an empty dependency list, so a missing "
+                   "entry is a defect, not a leaf")
+        if without_ref:
+            message += (f" ({len(without_ref)} component(s) carry no "
+                        "bom-ref)")
+        return "unmet", message, without_entry
+    return "verified", ("every component bom-ref appears exactly once in the "
+                        "dependency graph")
+
+
+def _check_scope_of_delivery_resolution(context):
+    graph = context.get("graph") or {}
+    boundary = (graph.get("boundaryRefs") or []) + \
+        ((graph.get("integrity") or {}).get("dangling") or [])
+    if boundary:
+        return "unverifiable", ("dependency paths cross into components "
+                                "outside the scope of delivery or reference "
+                                "missing nodes; resolution beyond that point "
+                                "is unknown and is not claimed"), \
+            sorted(set(boundary))
+    return "verified", ("every known dependency path resolved to a "
+                        "represented component")
+
+
+def _check_static_link_coverage(context):
+    unknown = (context.get("graph") or {}).get("staticUnknownRefs") or []
+    if unknown:
+        return "unverifiable", ("debug-source records are missing or "
+                                "inhibited for these components, so static "
+                                "linking is unknown coverage, never an "
+                                "absence-of-dependencies claim"), unknown
+    return "verified", ("every delivered recipe's pkgdata debug-source "
+                        "records were consumed for static-link attribution")
+
+
+def _check_reference_integrity(context):
+    integrity = (context.get("graph") or {}).get("integrity") or {}
+    problems = []
+    if integrity.get("duplicates"):
+        problems.append("duplicate bom-ref values")
+    if integrity.get("dangling"):
+        problems.append("dangling dependency references")
+    if integrity.get("ambiguous"):
+        problems.append("components unreachable from the primary component "
+                        "leave the dependency-graph root ambiguous")
+    if problems:
+        refs = sorted({ref for group in integrity.values() for ref in group})
+        return "unmet", ("the graph carries " + ", ".join(problems) +
+                         "; references are reported, never silently "
+                         "repaired"), refs
+    return "verified", ("every bom-ref is unique and every dependency "
+                        "reference resolves inside the graph")
 
 
 def _check_primary_component_assertion(context):
@@ -268,6 +370,51 @@ TR03183_2_REQUIREMENTS = [
                            "dynamically loaded component"),
         "origin": "external-evidence",
         "check": _check_dependency_coverage,
+    },
+    {
+        "id": "REQ-DEPS-002",
+        "source": ("BSI TR-03183-2 v2.1.0 §5.2.2 (component-level data "
+                   "fields: dependency graph root)"),
+        "representation": ("dependencies graph rooted at the primary "
+                           "metadata.component bom-ref"),
+        "origin": "generated-document",
+        "check": _check_graph_root,
+    },
+    {
+        "id": "REQ-DEPS-003",
+        "source": ("BSI TR-03183-2 v2.1.0 §5.2.2 (component-level data "
+                   "fields: dependency graph completeness)"),
+        "representation": ("a unique bom-ref and exactly one dependencies "
+                           "entry per component, leaves with an empty list"),
+        "origin": "generated-document",
+        "check": _check_dependency_entries,
+    },
+    {
+        "id": "REQ-DEPS-004",
+        "source": ("BSI TR-03183-2 v2.1.0 §5.2.2 (dependency resolution at "
+                   "the scope-of-delivery boundary)"),
+        "representation": ("identified boundary components and composition "
+                           "completeness instead of dropped dependencies"),
+        "origin": "generated-document",
+        "check": _check_scope_of_delivery_resolution,
+    },
+    {
+        "id": "REQ-DEPS-005",
+        "source": ("BSI TR-03183-2 v2.1.0 §5.2.2 (statically linked "
+                   "dependencies)"),
+        "representation": ("dependency edges derived from pkgdata "
+                           "debug-source records, with evidence origin"),
+        "origin": "generated-document",
+        "check": _check_static_link_coverage,
+    },
+    {
+        "id": "REQ-REF-001",
+        "source": ("BSI TR-03183-2 v2.1.0 §4 (structurally valid document: "
+                   "unique, resolvable references)"),
+        "representation": ("unique bom-refs, resolvable dependency "
+                           "references, unambiguous graph root"),
+        "origin": "generated-document",
+        "check": _check_reference_integrity,
     },
     {
         "id": "REQ-COMP-004",
@@ -407,7 +554,7 @@ PROFILES = {
         "guideline": "BSI TR-03183-2",
         "guidelineVersion": "2.1.0",
         "propertyTaxonomyVersion": "0.1.2",
-        "requirementsMatrixVersion": "2.1.0-r1",
+        "requirementsMatrixVersion": "2.1.0-r2",
         "specVersions": ["1.6", "1.7"],
         "requirements": TR03183_2_REQUIREMENTS,
     },
@@ -419,7 +566,8 @@ PROFILES = {
 ENFORCEMENT_VALUES = ["report", "strict"]
 
 
-def evaluate(profile_id, spec_version, sbom, vex, facts, collisions=None):
+def evaluate(profile_id, spec_version, sbom, vex, facts, collisions=None,
+             graph=None):
     """
     Evaluate the requirements matrix of one alignment profile against the
     rendered documents and their facts.
@@ -438,17 +586,18 @@ def evaluate(profile_id, spec_version, sbom, vex, facts, collisions=None):
         "requirementsMatrixVersion": profile["requirementsMatrixVersion"],
     }
     findings = [_evaluate_requirement(row, spec_version, sbom, vex, facts,
-                                      collisions)
+                                      collisions, graph)
                 for row in profile["requirements"]]
     findings.sort(key=lambda finding: finding["requirementId"])
     return baseline, findings
 
 
 def _evaluate_requirement(row, spec_version, sbom, vex, facts,
-                          collisions=None):
+                          collisions=None, graph=None):
     """Turn one requirements-matrix row into one alignment report finding."""
     context = {"spec_version": spec_version, "sbom": sbom, "vex": vex,
-               "facts": facts, "collisions": collisions or []}
+               "facts": facts, "collisions": collisions or [],
+               "graph": graph or {}}
     applicability = "applicable"
     if row.get("applies"):
         applies, reason = row["applies"](context)
@@ -469,6 +618,8 @@ def _evaluate_requirement(row, spec_version, sbom, vex, facts,
         "evidenceOrigin": row["origin"],
         "diagnosticMessage": message,
     }
-    if len(result) > 2 and result[2]:
-        finding["bomRefs"] = sorted(result[2])
+    declared_refs = result[2] if len(result) > 2 else None
+    bom_refs = sorted(ref for ref in declared_refs or () if ref)
+    if bom_refs:
+        finding["bomRefs"] = bom_refs
     return finding

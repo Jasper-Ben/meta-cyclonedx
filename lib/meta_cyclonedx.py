@@ -541,6 +541,10 @@ def render(facts):
     at least one machine-detectable violation the renderer returns no
     documents but {"failure": ...}. Everything depends only on the facts;
     diagnostics are reported through the facts["log"] callback.
+
+    Optional fact keys: "debug_sources" maps each recipe to its delivered
+    files and the debug-source paths pkgdata records for them, from where
+    the renderer derives statically linked dependency edges.
     """
     timestamp = facts.get("timestamp")
     log = facts.get("log")
@@ -661,7 +665,7 @@ def render(facts):
             if add_scopes:
                 pn_pkg["scope"] = "required" if pkg in runtime_recipes else "excluded"
 
-            if pkg in image_install_recipes:
+            if pkg in image_install_recipes and pn_pkg.get("bom-ref"):
                 directly_installed_component_refs.add(pn_pkg["bom-ref"])
 
             sbom["components"].append(pn_pkg)
@@ -695,10 +699,9 @@ def render(facts):
         for dep_entry in deps:
             component_ref = dep_entry["ref"]
 
-            # Skip if component doesn't exist in SBOM
-            if not any(comp["bom-ref"] == component_ref for comp in sbom["components"]):
-                continue
-
+            # A ref that names no component is a dangling reference; the
+            # entry is preserved for the reference-integrity finding and
+            # never silently discarded (ADR-0004).
             resolved_depends = []
 
             for depends in list(dep_entry["dependsOn"]) + extra_depends:
@@ -725,10 +728,6 @@ def render(facts):
                 for resolved_ref in resolved_refs:
 
                     if resolved_ref == component_ref:
-                        continue
-
-                    # Skip references to components absent from the SBOM
-                    if not any(comp["bom-ref"] == resolved_ref for comp in sbom["components"]):
                         continue
 
                     if resolved_ref not in resolved_depends:
@@ -902,6 +901,9 @@ def render(facts):
             }]
         sbom["compositions"].append(composition)
 
+    graph = _graph_evidence(sbom, metadata_component_ref, ref_recipes,
+                            debug_evidence_recipes, log)
+
     # Replace SBOM serial placeholder in VEX vulnerabilities
     # This must be done after all vulnerabilities are collected to ensure each image
     # gets its own SBOM serial number in multi-output builds (e.g., rootfs + initramfs)
@@ -967,7 +969,8 @@ def render(facts):
         return {"sbom": sbom, "vex": vex}
 
     baseline, findings = _alignment_profile().evaluate(
-        profile, spec_version, sbom, vex, facts, collisions=collisions)
+        profile, spec_version, sbom, vex, facts, collisions=collisions,
+        graph=graph)
     report = {
         "alignmentProfile": profile,
         "alignmentEnforcement": enforcement,
@@ -1191,20 +1194,18 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
         # Add dependency edges from the included SBOM, remapping shared bom-refs.
         # Merge into an existing dep entry when the ref is already present in the parent.
         for dep_entry in img_sbom_data.get("dependencies") or []:
+            # Edges of the embedded graph ride along as they are; refs that
+            # resolve to nothing after remapping become reference-integrity
+            # findings and are never dropped to tidy the merged graph.
             r_ref = remap_ref(dep_entry.get("ref", ""))
-            if not r_ref or not any(c.get("bom-ref") == r_ref for c in sbom["components"]):
+            if not r_ref:
                 continue
             r_depends = []
             for dr in dep_entry.get("dependsOn") or []:
                 rdr = remap_ref(dr)
-                if rdr == r_ref:
+                if rdr == r_ref or rdr in r_depends:
                     continue
-                if not any(c.get("bom-ref") == rdr for c in sbom["components"]):
-                    continue
-                if rdr not in r_depends:
-                    r_depends.append(rdr)
-            if not r_depends:
-                continue
+                r_depends.append(rdr)
             existing_entry = next((x for x in sbom["dependencies"] if x["ref"] == r_ref), None)
             if existing_entry:
                 for rdr in r_depends:
@@ -1346,6 +1347,85 @@ def _resolve_dependency_refs(depends, recipe_refs, component_recipes, ref_recipe
         return []
 
     return list(recipe_refs[recipe])
+
+
+def _graph_integrity(sbom, root_ref):
+    """
+    Reference integrity of the finished dependency graph: unique bom-refs,
+    resolvable references, and an unambiguous root. Detection only — the
+    graph is never repaired by dropping nodes or edges (ADR-0004).
+    """
+    entries = sbom.get("dependencies") or []
+    node_refs = set()
+    duplicates = []
+    for component in sbom.get("components") or []:
+        ref = component.get("bom-ref")
+        if not ref:
+            continue
+        if ref in node_refs or ref == root_ref:
+            duplicates.append(ref)
+        node_refs.add(ref)
+    if root_ref in node_refs:
+        duplicates.append(root_ref)
+
+    dangling = []
+    entry_counts = {}
+    targets_of = {}
+    for entry in entries:
+        ref = entry.get("ref")
+        targets = list(entry.get("dependsOn") or [])
+        if ref:
+            entry_counts[ref] = entry_counts.get(ref, 0) + 1
+            targets_of.setdefault(ref, []).extend(targets)
+            if ref not in node_refs and ref != root_ref:
+                dangling.append(ref)
+        for target in targets:
+            if target not in node_refs and target != root_ref:
+                dangling.append(target)
+
+    ambiguous = []
+    if any(root_ref in (entry.get("dependsOn") or []) for entry in entries):
+        ambiguous.append(root_ref)
+    ambiguous.extend(ref for ref, count in entry_counts.items() if count > 1)
+    reachable = {root_ref}
+    frontier = [root_ref]
+    while frontier:
+        for target in targets_of.get(frontier.pop(), []):
+            if target in node_refs and target not in reachable:
+                reachable.add(target)
+                frontier.append(target)
+    ambiguous.extend(ref for ref in node_refs if ref not in reachable)
+    return {"duplicates": sorted(set(duplicates)),
+            "dangling": sorted(set(dangling)),
+            "ambiguous": sorted(set(ambiguous))}
+
+
+def _graph_evidence(sbom, root_ref, ref_recipes, debug_evidence_recipes, log):
+    """
+    Summarize the graph facts the requirements matrix evaluates: reference
+    integrity (logged even without a profile, so defects are never silent),
+    the bom-refs of components outside the scope of delivery, and the bom-
+    refs of delivered recipes whose debug-source evidence is unavailable.
+    """
+    integrity = _graph_integrity(sbom, root_ref)
+    for label, refs in (("duplicate bom-ref value", integrity["duplicates"]),
+                        ("dangling dependency reference", integrity["dangling"]),
+                        ("ambiguous dependency-graph root", integrity["ambiguous"])):
+        if refs:
+            _log(log, "warn", f"Graph integrity: {label}: {', '.join(refs)}")
+    boundary_refs = sorted({
+        component["bom-ref"] for component in sbom.get("components") or []
+        if component.get("bom-ref") and any(
+            property.get("name") == DELIVERY_SCOPE_PROPERTY
+            for property in component.get("properties") or [])})
+    static_unknown_refs = sorted({
+        component["bom-ref"] for component in sbom.get("components") or []
+        if component.get("bom-ref")
+        and ref_recipes.get(component["bom-ref"]) is not None
+        and ref_recipes.get(component["bom-ref"]) not in debug_evidence_recipes})
+    return {"rootRef": root_ref, "integrity": integrity,
+            "boundaryRefs": boundary_refs,
+            "staticUnknownRefs": static_unknown_refs}
 
 
 def _highest_priority_scope(*scopes):

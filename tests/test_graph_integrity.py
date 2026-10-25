@@ -155,3 +155,138 @@ def test_compositions_mirror_the_dependency_entry_of_every_component():
     # The external component's own composition is honest about what the
     # build cannot see: unknown, never complete.
     assert composition_for(sbom, ghost["bom-ref"])["aggregate"] == "unknown"
+
+
+# --- Alignment profile findings over the dependency graph -----------------
+
+def test_graph_root_row_verifies_the_primary_component_as_unique_root():
+    docs, _logs = render_all(default_facts(config=profile_config()))
+    finding = finding_by_id(docs["report"], "REQ-DEPS-002")
+    assert finding["verdict"] == "verified"
+    assert finding["evidenceOrigin"] == "generated-document"
+
+
+def test_dependency_entry_row_verifies_every_component_has_exactly_one_entry():
+    docs, _logs = render_all(default_facts(config=profile_config()))
+    finding = finding_by_id(docs["report"], "REQ-DEPS-003")
+    assert finding["verdict"] == "verified"
+
+
+def test_dependency_entry_row_names_components_without_bom_ref():
+    facts = default_facts(config=profile_config(), fragments={
+        "busybox": fragment(pkgs=[pkg("busybox", "1.36", "ref-b"),
+                                  pkg("sidepiece", "1", None)]),
+    })
+    docs, _logs = render_all(facts)
+    finding = finding_by_id(docs["report"], "REQ-DEPS-003")
+    assert finding["verdict"] == "unmet"
+    assert "bom-ref" in finding["diagnosticMessage"]
+
+
+def test_composition_row_verifies_the_declared_aggregates():
+    docs, _logs = render_all(default_facts(config=profile_config()))
+    finding = finding_by_id(docs["report"], "REQ-COMP-009")
+    assert finding["verdict"] == "verified"
+    assert "unknown" in finding["diagnosticMessage"]
+
+
+def test_boundary_crossings_report_unresolved_depth_as_unknown():
+    facts = default_facts(config=profile_config(), fragments={
+        "app": fragment(pkgs=[pkg("app", "1", "ref-app")],
+                        dependencies=[dep("ref-app", ["ghost"])]),
+        "busybox": fragment(pkgs=[pkg("busybox", "1.36", "ref-b")]),
+    })
+    docs, _logs = render_all(facts)
+    finding = finding_by_id(docs["report"], "REQ-DEPS-004")
+    assert finding["verdict"] == "unverifiable"
+    assert finding["bomRefs"] == [ref_of(docs["sbom"], "ghost")]
+
+
+def test_scope_resolution_row_verifies_without_boundary_edges():
+    docs, _logs = render_all(default_facts(config=profile_config()))
+    finding = finding_by_id(docs["report"], "REQ-DEPS-004")
+    assert finding["verdict"] == "verified"
+
+
+def test_missing_debug_info_yields_unknown_static_coverage_not_absence():
+    docs, _logs = render_all(default_facts(config=profile_config()))
+    finding = finding_by_id(docs["report"], "REQ-DEPS-005")
+    assert finding["verdict"] == "unverifiable"
+    assert finding["bomRefs"] == ["ref-busybox"]
+    assert "unknown" in finding["diagnosticMessage"].lower()
+    assert "never an absence" in finding["diagnosticMessage"]
+
+
+def test_debug_source_evidence_verifies_static_coverage():
+    facts = default_facts(config=profile_config(), debug_sources={
+        "busybox": {"/bin/busybox": ["/usr/src/debug/busybox/1.36/main.c"]},
+    })
+    docs, _logs = render_all(facts)
+    finding = finding_by_id(docs["report"], "REQ-DEPS-005")
+    assert finding["verdict"] == "verified"
+
+
+def test_duplicate_bom_refs_are_reported_never_repaired():
+    facts = default_facts(config=profile_config(), fragments={
+        "a": fragment(pkgs=[pkg("comp-a", "1", "ref-dup")]),
+        "b": fragment(pkgs=[pkg("comp-b", "1", "ref-dup")]),
+    }, image_install_recipes=["a", "b"])
+    docs, _logs = render_all(facts)
+
+    # Report enforcement publishes both components; nothing is deduplicated
+    # or dropped to make the document internally consistent.
+    assert [c["name"] for c in docs["sbom"]["components"]][0] == "comp-a"
+    assert len(docs["sbom"]["components"]) == 2
+    finding = finding_by_id(docs["report"], "REQ-REF-001")
+    assert finding["verdict"] == "unmet"
+    assert finding["bomRefs"] == ["ref-dup"]
+
+
+def test_dangling_references_stay_published_and_are_reported():
+    # A dependency entry whose own ref names no component used to be
+    # silently discarded during assembly. The edge evidence is preserved
+    # and surfaces as a reference-integrity finding instead (ADR-0004).
+    facts = default_facts(config=profile_config(), fragments={
+        "busybox": fragment(pkgs=[pkg("busybox", "1.36", "ref-b")],
+                            dependencies=[dep("ref-gone", ["busybox"])]),
+    })
+    docs, _logs = render_all(facts)
+
+    entry = dep_entry(docs["sbom"], "ref-gone")
+    assert entry["dependsOn"] == ["ref-b"]
+    finding = finding_by_id(docs["report"], "REQ-REF-001")
+    assert finding["verdict"] == "unmet"
+    assert "ref-gone" in finding["bomRefs"]
+
+
+def test_unreachable_components_make_the_root_ambiguous():
+    facts = default_facts(config=profile_config(), fragments={
+        "widget-a": fragment(pkgs=[pkg("widget-a", "1.0", "ref-a")]),
+        "widget-b": fragment(pkgs=[pkg("widget-b", "1.0", "ref-b")]),
+    }, image_install_recipes=[])
+    docs, _logs = render_all(facts)
+    finding = finding_by_id(docs["report"], "REQ-REF-001")
+    assert finding["verdict"] == "unmet"
+    assert finding["bomRefs"] == ["ref-a", "ref-b"]
+    assert "root" in finding["diagnosticMessage"].lower()
+
+
+def test_reference_integrity_verifies_on_a_consistent_graph():
+    docs, _logs = render_all(default_facts(config=profile_config()))
+    finding = finding_by_id(docs["report"], "REQ-REF-001")
+    assert finding["verdict"] == "verified"
+    assert "bomRefs" not in finding
+
+
+def test_strict_enforcement_fails_on_graph_reference_violations():
+    facts = default_facts(config=profile_config(enforcement="strict"),
+                          fragments={
+        "a": fragment(pkgs=[pkg("comp-a", "1", "ref-dup")]),
+        "b": fragment(pkgs=[pkg("comp-b", "1", "ref-dup")]),
+    }, image_install_recipes=["a", "b"])
+    docs, _logs = render_all(facts)
+
+    assert "failure" in docs
+    assert "REQ-REF-001" in docs["failure"]["unmetRequirementIds"]
+    # Unknown static coverage is an honest gap, not a detectable violation.
+    assert "REQ-DEPS-005" not in docs["failure"]["unmetRequirementIds"]
