@@ -39,3 +39,33 @@ def test_recipe_licence_never_surfaces_as_distribution_or_effective_licence():
     for holder in [sbom["metadata"]["component"], *sbom["components"]]:
         assert not [p for p in holder.get("properties") or []
                     if p["name"] == meta_cyclonedx.EFFECTIVE_LICENCE_PROPERTY]
+
+
+def test_original_licence_evidence_is_verified_from_recipe_metadata():
+    facts = default_facts(
+        config=profile_config(),
+        fragments={"busybox": fragment(pkgs=[pkg(
+            "busybox", "1.36", "ref-busybox",
+            licenses=[{"license": {"id": "MIT"}}])])},
+        primary={"type": "firmware", "name": "core-image", "version": "1.0",
+                 "licenses": [{"expression": "MIT",
+                               "acknowledgement": "declared"}]},
+    )
+    docs, _logs = render_all(facts)
+    finding = finding_by_id(docs["report"], "REQ-COMP-013")
+    assert finding["verdict"] == "verified"
+    assert finding["evidenceOrigin"] == "recipe-metadata"
+
+
+def test_missing_original_licence_evidence_is_unmet_not_relabelled():
+    facts = default_facts(
+        config=profile_config(),
+        primary={"type": "firmware", "name": "core-image", "version": "1.0",
+                 "licenses": [{"expression": "MIT",
+                               "acknowledgement": "declared"}]},
+    )
+    docs, _logs = render_all(facts)
+    finding = finding_by_id(docs["report"], "REQ-COMP-013")
+    assert finding["verdict"] == "unmet"
+    assert finding["bomRefs"] == ["ref-busybox"]
+    assert finding["evidenceOrigin"] == "recipe-metadata"

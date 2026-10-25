@@ -307,6 +307,57 @@ def _check_component_creators(context):
              "upstream identity metadata"), None, "upstream-metadata")
 
 
+# Components the licence-role requirements evaluate: the delivered
+# logical components and the primary component. Identified boundary
+# components outside the scope of delivery only carry creator, name,
+# version and identifiers (TR-03183-2 v2.1.0 §3.2.4), never licence
+# claims the SBOM creator could substantiate. The primary component is
+# evaluated too, but its bom-ref is generated per document and never
+# named in findings.
+DELIVERY_SCOPE_MARKER = "yocto:delivery:scope"
+
+
+def _licence_components(context):
+    return [(component.get("bom-ref"), component)
+            for component in context["sbom"].get("components") or []
+            if not any(p.get("name") == DELIVERY_SCOPE_MARKER
+                       for p in component.get("properties") or [])]
+
+
+def _primary_component(context):
+    return (context["sbom"].get("metadata") or {}).get("component") or {}
+
+
+def _licences_with_acknowledgement(component, acknowledgement):
+    def has_acknowledgement(entry):
+        if entry.get("acknowledgement") == acknowledgement:
+            return True
+        license_field = entry.get("license")
+        return (isinstance(license_field, dict)
+                and license_field.get("acknowledgement") == acknowledgement)
+
+    return any(has_acknowledgement(entry)
+               for entry in component.get("licenses") or [])
+
+
+def _check_original_licences(context):
+    missing = [ref for ref, component in _licence_components(context)
+               if not _licences_with_acknowledgement(component, "declared")]
+    primary_gap = not _licences_with_acknowledgement(
+        _primary_component(context), "declared")
+    if not missing and not primary_gap:
+        return ("verified", "every delivered component and the primary "
+                            "component carry creator-assigned (declared) "
+                            "original licence evidence")
+    message = ("components lack original licence evidence: no "
+               "creator-assigned (declared) licence entry from recipe "
+               "metadata")
+    if primary_gap:
+        message += ", including the primary component"
+    return "unmet", message, missing
+
+
+
 def _check_distribution_licences(context):
     return "unmet", ("recipe-declared licences are original licence evidence "
                      "only; no authoritative distribution licence source is "
@@ -649,6 +700,16 @@ TR03183_2_REQUIREMENTS = [
                            "expressions"),
         "origin": "generated-document",
         "check": _check_distribution_licences,
+    },
+    {
+        "id": "REQ-COMP-013",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.4 (original licences), "
+                   "\u00a73.2.8 and \u00a78.1.13 (licence information)"),
+        "representation": ("components[].licenses entries with CycloneDX "
+                           "acknowledgement \"declared\"; recipe LICENSE is "
+                           "original licence evidence only"),
+        "origin": "recipe-metadata",
+        "check": _check_original_licences,
     },
     {
         "id": "REQ-IDEN-001",

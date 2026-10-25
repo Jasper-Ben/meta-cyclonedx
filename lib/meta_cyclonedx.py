@@ -771,6 +771,9 @@ def render(facts):
         sbom_metadata["component"]["externalReferences"] = primary["external_references"]
     _apply_creator_identity(
         sbom_metadata["component"], _parse_contacts(primary.get("creator"), log))
+    if primary.get("licenses"):
+        sbom_metadata["component"]["licenses"] = copy.deepcopy(
+            primary["licenses"])
     for reference_key, reference_type in (("source_uri", "vcs"),
                                           ("deployable_uri", "distribution")):
         if primary.get(reference_key):
