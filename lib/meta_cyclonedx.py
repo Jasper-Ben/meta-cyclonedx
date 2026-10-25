@@ -818,6 +818,22 @@ def _upstream_creator_entities(component):
     return [{"name": owner, "url": [f"https://{host}/{owner}/{project}"]}]
 
 
+def _compatible_component_records(existing, candidate):
+    """
+    True when a candidate component carries no evidence contradicting the
+    component already in the graph under the same bom-ref: every field
+    present in both (bom-ref aside) agrees. Only then may the candidate
+    merge onto the existing record without losing an independently
+    assessable component instance.
+    """
+    for key, value in candidate.items():
+        if key == "bom-ref":
+            continue
+        if key in existing and existing[key] != value:
+            return False
+    return True
+
+
 def render(facts):
     """
     Render the SBOM and VEX documents from normalized build facts.
@@ -1078,16 +1094,26 @@ def render(facts):
     # edges, so they are appended verbatim: the recipe-name dependency
     # remapping above applies to components derived from Yocto packages and
     # would corrupt an externally resolved tree.
-    extra_seen_refs = {c["bom-ref"] for c in sbom["components"] if c.get("bom-ref")}
+    extra_ref_components = {}
+    for component in sbom["components"]:
+        if component.get("bom-ref"):
+            extra_ref_components.setdefault(component["bom-ref"], component)
     for pkg in sorted(fragments):
         pn_list = fragments[pkg]
         for component in pn_list.get("extra_components", []):
-            ref = component.get("bom-ref") or component.get("purl")
-            if ref:
-                if ref in extra_seen_refs:
-                    continue
-                extra_seen_refs.add(ref)
+            ref = component.get("bom-ref")
+            if ref and ref in extra_ref_components and \
+                    _compatible_component_records(extra_ref_components[ref],
+                                                  component):
+                # The very same record is already in the graph; merging
+                # onto it loses no evidence. Contradicting evidence under
+                # the same bom-ref keeps both instances and surfaces as a
+                # reference-integrity finding, never a silent drop (the
+                # purl alone never merges instances either, ADR-0006).
+                continue
             sbom["components"].append(component)
+            if ref:
+                extra_ref_components.setdefault(ref, component)
         for dep_entry in pn_list.get("extra_dependencies", []):
             if dep_entry not in sbom["dependencies"]:
                 sbom["dependencies"].append(dep_entry)
@@ -1109,7 +1135,8 @@ def render(facts):
             owner_entry = {"ref": owner_ref, "dependsOn": []}
             sbom["dependencies"].append(owner_entry)
         for root_ref in extra_roots:
-            if root_ref in extra_seen_refs and root_ref not in owner_entry["dependsOn"]:
+            if root_ref in extra_ref_components and \
+                    root_ref not in owner_entry["dependsOn"]:
                 owner_entry["dependsOn"].append(root_ref)
 
     # Fold in complete SBOMs of the included embedded images. Components
