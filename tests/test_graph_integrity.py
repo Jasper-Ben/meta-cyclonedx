@@ -290,3 +290,41 @@ def test_strict_enforcement_fails_on_graph_reference_violations():
     assert "REQ-REF-001" in docs["failure"]["unmetRequirementIds"]
     # Unknown static coverage is an honest gap, not a detectable violation.
     assert "REQ-DEPS-005" not in docs["failure"]["unmetRequirementIds"]
+
+
+def test_component_order_survives_a_different_discovery_order():
+    # A task rerun can present the same graph in a different fragment
+    # order, minting boundary components at different points. Component
+    # declaration order is the anchor for every positional field in the
+    # document, so the same graph must render the same order regardless
+    # of which delivered recipe first discovered a boundary component.
+    def facts(swapped):
+        order = (["aadeep", "zzdep"] if not swapped
+                 else ["zzdep", "aadeep"])
+        return default_facts(fragments={
+            "app": fragment(
+                pkgs=[pkg("app", "1", "ref-app")],
+                dependencies=[dep("ref-app", order)]),
+            "busybox": fragment(
+                pkgs=[pkg("busybox", "1.36", "ref-b")]),
+        })
+
+    def declaration(sbom):
+        return [(c["name"], c["version"]) for c in sbom["components"]]
+
+    def edges(sbom):
+        name_of = {c["bom-ref"]: c["name"] for c in sbom["components"]}
+        name_of[sbom["metadata"]["component"]["bom-ref"]] = "ROOT"
+        return sorted(
+            (name_of[e["ref"]], sorted(name_of.get(t, "?") for t in e["dependsOn"]))
+            for e in sbom["dependencies"])
+
+    first, _vex, _logs = render_docs(facts(False))
+    second, _vex, _logs = render_docs(facts(True))
+
+    assert declaration(first) == declaration(second)
+    assert declaration(first) == sorted(declaration(first))
+    assert declaration(first) == [
+        ("aadeep", "unknown"), ("app", "1"), ("busybox", "1.36"),
+        ("zzdep", "unknown")]
+    assert edges(first) == edges(second)

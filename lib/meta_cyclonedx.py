@@ -934,9 +934,6 @@ def render(facts):
             vex["vulnerabilities"].append(pn_cve)
 
 
-    # Sort components by name for a stable, human-readable order.
-    # The recipe set is unordered, so insertion order above is non-deterministic.
-    sbom["components"].sort(key=lambda c: (c["name"], c["version"]))
 
     # Add dependencies.
     # Runtime edges observed from the installed packages cover RRECOMMENDS,
@@ -1081,6 +1078,16 @@ def render(facts):
                         owner_entry["dependsOn"].append(target_ref)
                     _add_dependency_evidence(components_by_ref[owner_ref],
                                              "debugsrc")
+
+    # The component declaration order is fixed here, after EVERY append:
+    # the recipe set above is unordered, boundary, contributed and
+    # embedded components are appended in discovery order, which moves
+    # between task reruns, and everything positional downstream - leaf
+    # entries, dependency-target ranks, compositions - derives from this
+    # one deterministic order.
+    sbom["components"].sort(key=lambda c: (c.get("name") or "",
+                                           c.get("version") or "",
+                                           c.get("bom-ref") or ""))
 
     # Every represented component participates in the dependency graph.
     # A leaf gets a dependency entry with an empty list, so a machine can
