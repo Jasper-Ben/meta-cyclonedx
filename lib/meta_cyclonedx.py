@@ -37,8 +37,7 @@ primary               the delivered product:
 fragments             per-recipe normalized facts, keyed by recipe name, in
                       the on-disk partial-SBOM format written by
                       do_populate_cyclonedx: "pkgs", "cves", "dependencies",
-                      "bom_ref_dedup_map", "extra_components",
-                      "extra_dependencies", "extra_roots"
+                      "extra_components", "extra_dependencies", "extra_roots"
 runtime_recipes       recipe names whose components are "required"
 image_install_recipes recipe names installed by image author intent; their
                       components hang directly off the graph root
@@ -165,47 +164,202 @@ def serialize_report(report):
     return json.dumps(report, indent=2, sort_keys=True) + "\n"
 
 
-def component_identity(products_names, version, purl, external_references=None):
+# A creator-assigned identity override is authoritative verbatim. The
+# semantically valid BPN/PV defaults must look like a name and like a
+# version: single identifier-like tokens, the version carrying at least
+# one digit; degenerate defaults never enter documents as identity.
+VALID_LOGICAL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+_~+-]*")
+VALID_LOGICAL_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~+-]*")
+
+# Vulnerability correlation aliases survive in component properties so
+# every CVE_PRODUCT / CVE_VERSION token keeps reaching the VEX and CVE
+# matching inputs without ever becoming component identity (ADR-0006).
+ALIAS_PRODUCT_PROPERTY = "yocto:cve:product"
+ALIAS_VERSION_PROPERTY = "yocto:cve:version"
+ALIAS_CPE_PROPERTY = "yocto:cve:cpe"
+
+
+def _short_version(version):
+    """Short upstream version of a Yocto version string (drops +git suffixes)."""
+    return (version or "").split("+git")[0].strip()
+
+
+def default_logical_version(pv):
     """
-    Build one component identity record per vulnerability-correlation
-    product name of a recipe. Names carrying a "vendor:" qualifier gain a
-    group and a vendor-qualified CPE; the purl records the Yocto/package
-    identity shared by all names of the recipe.
+    The logical version a PV implies: the short version when it is
+    semantically valid (identifier-shaped and carrying at least one
+    digit), otherwise the "unknown" placeholder.
     """
-    packages = []
+    short = _short_version(pv)
+    if VALID_LOGICAL_VERSION.fullmatch(short) and any(c.isdigit() for c in short):
+        return short
+    return "unknown"
 
-    # keep only the short version which can be matched against vulnerabilities databases
-    version = version.split("+git")[0]
 
-    # Ensure version is never empty (required by some SBOM profiles)
-    if not version or version.strip() == "":
-        version = "unknown"
+def logical_identity(bpn, pv, name_override=None, version_override=None):
+    """
+    Resolve the logical component identity of a recipe: the creator-
+    assigned name and version of its component instance (ADR-0006).
 
-    # some packages have alternative names, so we split CVE_PRODUCT
-    # deduplicate, and iterate in a stable order: the fragment's component
-    # array rides task signatures and document assembly alike.
-    for product in sorted(set(products_names.split())):
-        # CVE_PRODUCT in recipes may include vendor information for CPE identifiers. If not,
-        # use wildcard for vendor.
-        if ":" in product:
-            vendor, product = product.split(":", 1)
-        else:
-            vendor = ""
+    Explicit CycloneDX identity overrides (CYCLONEDX_COMPONENT_NAME and
+    CYCLONEDX_COMPONENT_VERSION) take precedence verbatim. The defaults
+    are BPN and the short PV, used only when semantically valid; an
+    invalid default degrades to the "unknown" placeholder.
+    """
+    default_name = (bpn or "").strip()
+    if not VALID_LOGICAL_NAME.fullmatch(default_name):
+        default_name = "unknown"
+    name = name_override.strip() if name_override else default_name
+    version = (version_override.strip() if version_override
+               else default_logical_version(pv))
+    return name, version
 
-        pkg = {
-            "name": product,
-            "version": version,
-            "type": "library",
-            "cpe": 'cpe:2.3:*:{}:{}:{}:*:*:*:*:*:*:*'.format(vendor or "*", product, version),
-            "purl": purl,
-            "bom-ref": str(uuid.uuid4())
-        }
-        if vendor != "":
-            pkg["group"] = vendor
-        if external_references:
-            pkg["externalReferences"] = external_references
-        packages.append(pkg)
-    return packages
+
+def component_identity(bpn, pv, purl, cve_products=None, cve_versions=None,
+                       name_override=None, version_override=None,
+                       external_references=None):
+    """
+    Build the single logical component identity record of a recipe.
+
+    One recipe is one independently assessable logical component (ADR-0006,
+    ADR-0009): its name and version are creator-assigned — explicit
+    overrides over semantically valid BPN and PV defaults. CVE_PRODUCT and
+    CVE_VERSION are vulnerability-correlation aliases only: they never
+    create or rename the component, they carry a "vendor:" qualifier into
+    the CPE, and every token stays available through yocto:cve:product,
+    yocto:cve:version and yocto:cve:cpe properties for the VEX and CVE
+    matching inputs. The purl records the Yocto/package identity of the
+    build (pkg:yocto, OpenEmbedded's purl prefix) alongside, never
+    instead of, the logical identity.
+    """
+    name, version = logical_identity(bpn, pv, name_override, version_override)
+
+    # BitBake defaults CVE_PRODUCT to BPN and CVE_VERSION to PV; mirror
+    # that so the function's own defaults carry complete correlation data.
+    products = sorted({token for token in (cve_products or "").split() if token}) \
+        or [token for token in [(bpn or "").strip()] if token]
+    versions = sorted({_short_version(token)
+                       for token in (cve_versions or "").split()} - {""}) \
+        or [default_logical_version(pv)]
+
+    cpes = []
+    for token in products:
+        vendor, _, product = token.partition(":")
+        if not product:
+            vendor, product = "", token
+        for short in versions:
+            cpes.append("cpe:2.3:*:{}:{}:{}:*:*:*:*:*:*:*".format(
+                vendor or "*", product, short))
+
+    pkg = {
+        "name": name,
+        "version": version,
+        "type": "library",
+        "purl": purl,
+        "bom-ref": str(uuid.uuid4()),
+    }
+    if cpes:
+        pkg["cpe"] = cpes[0]
+    pkg["properties"] = (
+        [{"name": ALIAS_PRODUCT_PROPERTY, "value": token} for token in products]
+        + [{"name": ALIAS_VERSION_PROPERTY, "value": short} for short in versions]
+        + [{"name": ALIAS_CPE_PROPERTY, "value": cpe} for cpe in cpes])
+    if external_references:
+        pkg["externalReferences"] = external_references
+    return pkg
+
+
+def component_correlation_cpes(component):
+    """Every correlation CPE of a component: its own plus alias CPEs."""
+    cpes = set()
+    if component.get("cpe"):
+        cpes.add(component["cpe"])
+    for prop in component.get("properties") or []:
+        if prop.get("name") == ALIAS_CPE_PROPERTY and prop.get("value"):
+            cpes.add(prop["value"])
+    return cpes
+
+
+def identity_collisions(sbom, vex=None):
+    """
+    Group the components whose CPE correlation identifiers collide.
+
+    Components sharing at least one CPE (transitively) form one collision
+    group. A group is explained when every member carries observable
+    evidence that distinguishes it from all others — package purl, licence
+    set, dependency targets or VEX status — which is exactly the case for
+    genuinely independent instances. Any two members indistinguishable on
+    all these axes are an unresolved identity collision. Returns a list
+    of dicts with keys bomRefs and correlationCpes (both sorted) and bool
+    explained, ordered by the first bomRef.
+    """
+    components_by_ref = {}
+    for component in sbom.get("components") or []:
+        ref = component.get("bom-ref")
+        if ref:
+            components_by_ref[ref] = component
+
+    dep_targets = {}
+    for entry in sbom.get("dependencies") or []:
+        ref = entry.get("ref")
+        if ref:
+            dep_targets[ref] = sorted(set(entry.get("dependsOn") or []))
+
+    vex_status = {}
+    for vuln in (vex or {}).get("vulnerabilities") or []:
+        state = (vuln.get("analysis") or {}).get("state")
+        for affect in vuln.get("affects") or []:
+            _prefix, _sep, ref = (affect.get("ref") or "").rpartition("#")
+            if ref:
+                vex_status.setdefault(ref, []).append((vuln["id"], state))
+
+    def distinguishable_evidence(component):
+        ref = component.get("bom-ref")
+        return (
+            component.get("purl"),
+            json.dumps(component.get("licenses"), sort_keys=True),
+            tuple(dep_targets.get(ref, [])),
+            tuple(sorted(vex_status.get(ref, []))))
+
+    # union-find over the shared-CPE relation
+    parents = {ref: ref for ref in components_by_ref}
+
+    def find(ref):
+        while parents[ref] != ref:
+            ref = parents[ref]
+        return ref
+
+    cpe_owner = {}
+    for ref in sorted(components_by_ref):
+        for cpe in sorted(component_correlation_cpes(components_by_ref[ref])):
+            owner = cpe_owner.get(cpe)
+            if owner is None:
+                cpe_owner[cpe] = ref
+                continue
+            root_owner, root_ref = find(owner), find(ref)
+            if root_owner != root_ref:
+                parents[root_ref] = root_owner
+
+    groups = {}
+    for ref in sorted(components_by_ref):
+        groups.setdefault(find(ref), []).append(ref)
+
+    collisions = []
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        cpes = set()
+        for ref in group:
+            cpes |= component_correlation_cpes(components_by_ref[ref])
+        evidence = [distinguishable_evidence(components_by_ref[ref])
+                    for ref in group]
+        collisions.append({
+            "bomRefs": sorted(group),
+            "correlationCpes": sorted(cpes),
+            "explained": len(set(evidence)) == len(evidence),
+        })
+    collisions.sort(key=lambda collision: collision["bomRefs"][0])
+    return collisions
 
 
 def normalize_cve_id(cve_id):
@@ -410,27 +564,21 @@ def render(facts):
     recipe_refs = {}
     component_recipes = {}
     ref_recipes = {}
-    # Global deduplication map that tracks all duplicate bom-refs across all recipes
-    global_bom_ref_dedup_map = {}
 
     image_recipe_names = set(fragments)
 
     # Track direct-install components without persisting debug properties in output.
     directly_installed_component_refs = set()
 
-    # first loop to fill the dictionary
-    # Iterate in a stable order: the recipe names arrive unordered, and the
-    # loops below resolve collisions on a first-one-wins basis.
+    # First loop to fill the dictionary. Iterate in a stable order: the
+    # recipe names arrive unordered and component declaration order feeds
+    # the dependency-target ordering.
     for pkg in sorted(fragments):
         pn_list = fragments[pkg]
 
-        # Merge recipe-level deduplication map into global map
-        if "bom_ref_dedup_map" in pn_list:
-            global_bom_ref_dedup_map.update(pn_list["bom_ref_dedup_map"])
-
         for pn_pkg in pn_list["pkgs"]:
-            # A recipe contributes one component per CVE_PRODUCT name; index them
-            # all so a dependency on the recipe reaches every alias component.
+            # A recipe contributes its one logical component; index it so a
+            # dependency on the recipe or its logical name reaches it.
             recipe_refs.setdefault(pkg, []).append(pn_pkg["bom-ref"])
             component_recipes.setdefault(pn_pkg["name"], pkg)
             ref_recipes[pn_pkg["bom-ref"]] = pkg
@@ -439,18 +587,10 @@ def render(facts):
         pn_list = fragments[pkg]
 
         for pn_pkg in pn_list["pkgs"]:
-            # Avoid multiple pkgs referencing the same cpe
-            existing_component = next((sbom_pkg for sbom_pkg in sbom["components"]
-                                       if sbom_pkg["cpe"] == pn_pkg["cpe"]), None)
-            if existing_component:
-                if pkg in image_install_recipes:
-                    existing_ref = existing_component.get("bom-ref")
-                    if existing_ref:
-                        directly_installed_component_refs.add(existing_ref)
-                # Redirect references to the component that was dropped as a duplicate.
-                if existing_component.get("bom-ref"):
-                    global_bom_ref_dedup_map[pn_pkg["bom-ref"]] = existing_component["bom-ref"]
-                continue
+            # Every fragment component is an independently assessable
+            # instance and enters the inventory as-is: CPE equality never
+            # merges component instances (ADR-0006). Collisions with other
+            # instances are reported downstream, never deduplicated here.
 
             # Add scope field to indicate runtime vs build-time component
             # Can be disabled for certain SBOM profiles or tool compatibility
@@ -489,8 +629,6 @@ def render(facts):
 
         for dep_entry in deps:
             component_ref = dep_entry["ref"]
-            if component_ref in global_bom_ref_dedup_map:
-                component_ref = global_bom_ref_dedup_map[component_ref]
 
             # Skip if component doesn't exist in SBOM
             if not any(comp["bom-ref"] == component_ref for comp in sbom["components"]):
@@ -507,14 +645,11 @@ def render(facts):
                                                         component_recipes, ref_recipes)
 
                 for resolved_ref in resolved_refs:
-                    if resolved_ref in global_bom_ref_dedup_map:
-                        resolved_ref = global_bom_ref_dedup_map[resolved_ref]
 
                     if resolved_ref == component_ref:
                         continue
 
-                    # Verify that the component exists in the SBOM
-                    # If it was filtered out by CPE deduplication, skip this dependency entry
+                    # Skip references to components absent from the SBOM
                     if not any(comp["bom-ref"] == resolved_ref for comp in sbom["components"]):
                         continue
 
@@ -522,8 +657,8 @@ def render(facts):
                         resolved_depends.append(resolved_ref)
 
             if resolved_depends:
-                # Recipes sharing a CPE collapse onto one component, so merge
-                # instead of emitting a second node for the same bom-ref.
+                # CycloneDX graph nodes are unique per bom-ref, so merge
+                # repeated declarations of the same component ref.
                 existing_entry = next((entry for entry in sbom["dependencies"]
                                        if entry["ref"] == component_ref), None)
                 if existing_entry:
@@ -542,9 +677,9 @@ def render(facts):
     # merged into the image BOM here.
     #
     # These entries already carry their own bom-refs, purls and dependency
-    # edges, so they are appended verbatim: the CPE deduplication and the
-    # recipe-name dependency remapping above apply to components derived from
-    # Yocto packages and would corrupt an externally resolved tree.
+    # edges, so they are appended verbatim: the recipe-name dependency
+    # remapping above applies to components derived from Yocto packages and
+    # would corrupt an externally resolved tree.
     extra_seen_refs = {c["bom-ref"] for c in sbom["components"] if c.get("bom-ref")}
     for pkg in sorted(fragments):
         pn_list = fragments[pkg]
@@ -567,8 +702,6 @@ def render(facts):
             continue
         owner_refs = recipe_refs.get(pkg) or []
         owner_ref = owner_refs[0] if owner_refs else None
-        if owner_ref in global_bom_ref_dedup_map:
-            owner_ref = global_bom_ref_dedup_map[owner_ref]
         if not owner_ref or not any(c.get("bom-ref") == owner_ref for c in sbom["components"]):
             _log(log, 1, f"CYCLONEDX_EXTRA_BOM_FILES: {pkg}: no component to attach "
                          f"{len(extra_roots)} contributed tree(s) to")
@@ -581,9 +714,10 @@ def render(facts):
             if root_ref in extra_seen_refs and root_ref not in owner_entry["dependsOn"]:
                 owner_entry["dependsOn"].append(root_ref)
 
-    # Fold in complete SBOMs of the included embedded images.
-    # Components shared by CPE are deduplicated (parent wins); unique
-    # components are added with scope "required".
+    # Fold in complete SBOMs of the included embedded images. Components
+    # carrying the same logical identity and package purl are the same
+    # instance and merge onto the parent's bom-ref; unique components are
+    # added with scope "required". A shared CPE alone never merges.
     _merge_included_images(sbom, vex, copy.deepcopy(facts.get("included_images")) or (),
                            config, spec_version, sbom_serial_number,
                            add_scopes, directly_installed_component_refs, log)
@@ -628,8 +762,7 @@ def render(facts):
                 continue
 
             prefix, _, bom_ref = affect["ref"].rpartition("#")
-            bom_ref = global_bom_ref_dedup_map.get(bom_ref, bom_ref)
-            # A component dropped by CPE deduplication is covered by its duplicate.
+            # References to components absent from the SBOM are dangling.
             if bom_ref not in sbom_refs:
                 continue
 
@@ -642,7 +775,8 @@ def render(facts):
         if not affects:
             continue
 
-        # Recipes sharing a CPE report the same CVE, so keep only the first statement.
+        # Statements that add no component reference beyond earlier ones
+        # are redundant; the first statement of the CVE wins.
         refs = {affect["ref"] for affect in affects if "ref" in affect}
         if refs and refs.issubset(covered_refs.get(vuln["id"], set())):
             continue
@@ -655,11 +789,30 @@ def render(facts):
     # Sort vulnerabilities by CVE id for a stable, human-readable order.
     vex["vulnerabilities"].sort(key=lambda v: v["id"])
 
+    # CPE equality never authorizes deduplication; ambiguous identity
+    # collisions are reported instead. Explainable groups (distinct
+    # artifact, build, dependency, licence or vulnerability evidence) are
+    # deliberately separate instances; indistinguishable duplicates are
+    # an unresolved collision.
+    collisions = identity_collisions(sbom, vex)
+    for collision in collisions:
+        refs = ", ".join(collision["bomRefs"])
+        cpes = ", ".join(collision["correlationCpes"])
+        if collision["explained"]:
+            _log(log, 2, f"Component instances {refs} share CPE(s) {cpes} "
+                         f"with distinct evidence; kept separate")
+        else:
+            _log(log, "warn", f"Unexplained component identity collision: "
+                              f"{refs} share CPE(s) {cpes} with identical "
+                              f"artifact, build, dependency, licence and "
+                              f"vulnerability evidence; kept separate, never "
+                              f"deduplicated")
+
     if not profile:
         return {"sbom": sbom, "vex": vex}
 
     baseline, findings = _alignment_profile().evaluate(
-        profile, spec_version, sbom, vex, facts)
+        profile, spec_version, sbom, vex, facts, collisions=collisions)
     report = {
         "alignmentProfile": profile,
         "alignmentEnforcement": enforcement,
@@ -690,7 +843,8 @@ def merge_sbom_cve_check(sbom, vex, report, config, log=None):
     Map a completed sbom-cve-check report onto the VEX document.
 
     Issues are attached to the logical components they match in the SBOM
-    (by CPE first, falling back to the recipe purl), duplicate statements
+    (by any correlation CPE — the component's own or a CVE alias — first,
+    falling back to the recipe purl), duplicate statements
     already covered by the VEX are skipped, and every remaining issue
     becomes one statement per analysis (id, detail, state). The VEX is
     modified in place; returns the number of added statements.
@@ -699,8 +853,8 @@ def merge_sbom_cve_check(sbom, vex, report, config, log=None):
     refs_by_cpe = {}
     refs_by_pn = {}
     for component in sbom.get("components", []):
-        if component.get("cpe"):
-            refs_by_cpe.setdefault(component["cpe"], []).append(component["bom-ref"])
+        for cpe in sorted(component_correlation_cpes(component)):
+            refs_by_cpe.setdefault(cpe, []).append(component["bom-ref"])
         purl = component.get("purl", "")
         if purl.startswith("pkg:yocto/"):
             refs_by_pn.setdefault(purl.split("/")[-1].split("@")[0], []).append(component["bom-ref"])
@@ -778,15 +932,35 @@ def _sbom_cve_check_analysis(issue, include_unpatched, unpatched_state):
     return analysis
 
 
+def _instance_key(component):
+    """
+    Instance key used to recognize one and the same component instance in
+    different documents: the same logical name and version delivered by
+    the same package build (purl). Components without a name and purl are
+    never identified through a key; a CPE is correlation data only and
+    never part of instance identity (ADR-0006).
+    """
+    name = component.get("name")
+    if name is None or not component.get("purl"):
+        return None
+    return (name, component.get("version"), component["purl"])
+
+
 def _merge_included_images(sbom, vex, included_images, config, spec_version,
                            sbom_serial_number, add_scopes,
                            directly_installed_component_refs, log):
     """
     Merge the completed SBOM and VEX of each embedded image into the parent
-    documents, remapping bom-refs of components that share a CPE with the
-    parent and the VEX references to the parent SBOM serial number.
+    documents, remapping bom-refs of components that are the same instance
+    as one of the parent's (same logical identity from the same package
+    build) and the VEX references to the parent SBOM serial number.
     """
     extra_seen_image_refs = {c["bom-ref"] for c in sbom["components"] if c.get("bom-ref")}
+    identity_index = {}
+    for component in sbom["components"]:
+        key = _instance_key(component)
+        if key and key not in identity_index:
+            identity_index[key] = component
     for img in included_images:
         img_name = img["name"]
         img_sbom_data = img["sbom"]
@@ -801,16 +975,17 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
         # The UUID portion of the included SBOM's serialNumber appears verbatim in its VEX affects refs.
         included_serial = (img_sbom_data.get("serialNumber") or "").removeprefix("urn:uuid:")
 
-        # Map included bom-refs to parent bom-refs for components that share the same CPE.
+        # Map included bom-refs to parent bom-refs for components that are
+        # the same instance: the same logical identity delivered by the
+        # same package build (name, version and package purl). A CPE is
+        # vulnerability-correlation data and never merges instances.
         included_bom_ref_remap = {}
         for inc_comp in img_sbom_data.get("components") or []:
-            inc_cpe = inc_comp.get("cpe")
             inc_ref = inc_comp.get("bom-ref")
-            if not inc_ref or not inc_cpe:
+            key = _instance_key(inc_comp)
+            if not inc_ref or not key:
                 continue
-            existing = next(
-                (c for c in sbom["components"] if c.get("cpe") == inc_cpe), None
-            )
+            existing = identity_index.get(key)
             if existing:
                 included_bom_ref_remap[inc_ref] = existing["bom-ref"]
                 if add_scopes:
@@ -818,9 +993,10 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
                     if merged_scope:
                         existing["scope"] = merged_scope
 
-        # Add components unique to the included image (no CPE match in the parent SBOM).
+        # Add components unique to the included image (no instance match in the parent SBOM).
         for inc_comp in img_sbom_data.get("components") or []:
             inc_ref = inc_comp.get("bom-ref")
+            key = _instance_key(inc_comp)
             if inc_ref and inc_ref in included_bom_ref_remap:
                 continue
             if inc_ref and inc_ref in extra_seen_image_refs:
@@ -831,6 +1007,8 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
             sbom["components"].append(inc_comp)
             if inc_ref:
                 extra_seen_image_refs.add(inc_ref)
+            if key and key not in identity_index:
+                identity_index[key] = inc_comp
 
         # Represent the included image itself as a firmware component in the parent SBOM.
         inc_metadata_comp = (img_sbom_data.get("metadata") or {}).get("component") or {}
@@ -995,9 +1173,9 @@ def _add_document_extensions(config, spec_version, doc, log=None):
 
 def _resolve_dependency_refs(depends, recipe_refs, component_recipes, ref_recipes):
     """
-    Replace a dependency token by the bom-refs of every component its recipe
-    contributes. A recipe with several CVE_PRODUCT names yields one component
-    per name and the dependency applies to all of them.
+    Replace a dependency token by the bom-refs of the components its recipe
+    contributes. A recipe contributes its one logical component, so a
+    well-formed fragment resolves to exactly one component.
     """
 
     # Recipe name

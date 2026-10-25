@@ -187,6 +187,27 @@ def _check_no_vulnerability_data_in_sbom(context):
                         "in the separate VEX document")
 
 
+def _check_logical_identity_collisions(context):
+    collisions = context.get("collisions") or []
+    unexplained = [collision for collision in collisions
+                   if not collision["explained"]]
+    if unexplained:
+        refs = sorted({ref for collision in unexplained
+                       for ref in collision["bomRefs"]})
+        return "unmet", ("component instances share CPE correlation "
+                         "identifiers with identical artifact, build, "
+                         "dependency, licence and vulnerability evidence; "
+                         "CPE equality never deduplicates components, so "
+                         "each collision must be resolved"), refs
+    if collisions:
+        return "verified", (f"{len(collisions)} CPE collision group(s) are "
+                            "distinct component instances on differing "
+                            "artifact, build, dependency, licence or "
+                            "vulnerability evidence")
+    return "verified", ("no component instance shares a CPE correlation "
+                        "identifier with another")
+
+
 def _check_primary_component_assertion(context):
     primary = context["facts"].get("primary") or {}
     if primary.get("name") and primary.get("version") and primary.get("type"):
@@ -358,6 +379,16 @@ TR03183_2_REQUIREMENTS = [
         "check": _check_distribution_licences,
     },
     {
+        "id": "REQ-IDEN-001",
+        "source": ("BSI TR-03183-2 v2.1.0 §5.2.2 (component-level data "
+                   "fields: distinct component instances and identifiers)"),
+        "representation": ("one bom-ref per independently assessable "
+                           "component instance; CPE collisions reported, "
+                           "never silently deduplicated"),
+        "origin": "generated-document",
+        "check": _check_logical_identity_collisions,
+    },
+    {
         "id": "REQ-VULN-001",
         "source": "BSI TR-03183-2 v2.1.0 \u00a73.1 (no vulnerability data in the SBOM)",
         "representation": ("vulnerability status in the separate VEX document "
@@ -388,14 +419,15 @@ PROFILES = {
 ENFORCEMENT_VALUES = ["report", "strict"]
 
 
-def evaluate(profile_id, spec_version, sbom, vex, facts):
+def evaluate(profile_id, spec_version, sbom, vex, facts, collisions=None):
     """
     Evaluate the requirements matrix of one alignment profile against the
     rendered documents and their facts.
 
     Returns (profile baseline, findings): the exact guideline, property
     taxonomy, CycloneDX schema and matrix versions used, and one finding
-    per matrix row, ordered by requirement identifier.
+    per matrix row, ordered by requirement identifier. collisions carries
+    the renderer-computed component identity collision groups.
     """
     profile = PROFILES[profile_id]
     baseline = {
@@ -405,16 +437,18 @@ def evaluate(profile_id, spec_version, sbom, vex, facts):
         "cyclonedxSchemaVersion": spec_version,
         "requirementsMatrixVersion": profile["requirementsMatrixVersion"],
     }
-    findings = [_evaluate_requirement(row, spec_version, sbom, vex, facts)
+    findings = [_evaluate_requirement(row, spec_version, sbom, vex, facts,
+                                      collisions)
                 for row in profile["requirements"]]
     findings.sort(key=lambda finding: finding["requirementId"])
     return baseline, findings
 
 
-def _evaluate_requirement(row, spec_version, sbom, vex, facts):
+def _evaluate_requirement(row, spec_version, sbom, vex, facts,
+                          collisions=None):
     """Turn one requirements-matrix row into one alignment report finding."""
     context = {"spec_version": spec_version, "sbom": sbom, "vex": vex,
-               "facts": facts}
+               "facts": facts, "collisions": collisions or []}
     applicability = "applicable"
     if row.get("applies"):
         applies, reason = row["applies"](context)

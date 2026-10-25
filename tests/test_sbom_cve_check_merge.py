@@ -40,6 +40,27 @@ def test_ignored_issue_attaches_to_cpe_matched_component():
     assert statement["affects"] == [{"ref": prefix + "ref-o"}]
 
 
+def test_issues_match_secondary_correlation_alias_cpes():
+    # CVE_PRODUCT aliases stay reachable: a report naming the recipe's
+    # secondary correlation CPE still attaches to the logical component.
+    secondary = "cpe:2.3:*:*:libopenssl:3.2:*:*:*:*:*:*:*"
+    sbom = sbom_with([pkg("openssl", "3.2", "ref-o", cpe=CPE_A,
+                          purl="pkg:yocto/meta/openssl3@3.2",
+                          properties=[{"name": "yocto:cve:cpe",
+                                       "value": secondary}])])
+    vex = {"vulnerabilities": []}
+    added = meta_cyclonedx.merge_sbom_cve_check(
+        sbom, vex,
+        report([{"name": "openssl", "cpes": [secondary],
+                 "issue": [{"id": "CVE-2024-3", "status": "Patched",
+                            "detail": "fixed"}]}]),
+        base_config())
+
+    assert added == 1
+    assert vex["vulnerabilities"][0]["affects"] == [
+        {"ref": f"urn:cdx:{sbom['serialNumber'].split(':')[-1]}/1#ref-o"}]
+
+
 def test_issues_fall_back_to_the_recipe_purl_without_cpe_match():
     sbom = sbom_with([pkg("openssl", "3.2", "ref-o",
                           cpe="cpe:2.3:*:*:other:9:*:*:*:*:*:*:*",
