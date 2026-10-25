@@ -671,6 +671,12 @@ every other finding:
   properties at most once (`REQ-TAX-003`). Drift away from the pinned
   registry is an `unmet` finding in report mode and a
   strict-enforcement rejection.
+- **Identifier syntax.** Emitted identifiers stay parseable downstream:
+  every purl parses as a Package URL (`REQ-IDEN-002`), every CPE -
+  component field or correlation alias - is a formatted CPE 2.3 string
+  (`REQ-IDEN-003`), and every SHA-512 is lowercase hex of 512 bits
+  riding `components[].hashes[]` under the `SHA-512` algorithm
+  (`REQ-IDEN-004`).
 - **Report enforcement publishes documents with findings** - that
   includes a schema-invalid document: it is published with loud
   `unmet` findings naming the violated schema locations, and the

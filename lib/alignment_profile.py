@@ -23,6 +23,104 @@ SBOM, product or manufacturer conformant with TR-03183-2 or the CRA.
 import importlib
 import importlib.util
 import os
+import re
+import sys
+import urllib.parse
+
+# Identifier syntax rules, generous per ecosystem but strict about the
+# envelopes downstream vulnerability tooling parses:
+# - Package URL: pkg:<type>/[<namespace>/]<name>[@<version>][?<quals>][#<subpath>]
+#   with percent-encoded segments (purl-spec).
+_PURL = re.compile(
+    r"^pkg:[A-Za-z][A-Za-z0-9.+-]*"
+    r"(?:/(?:[A-Za-z0-9._~+-]|%[0-9A-Fa-f]{2})+)+"
+    r"(?:@[^/?#]*)?(?:\?[^#]*)?(?:#.*)?$")
+# - CPE 2.3 formatted binding: cpe:2.3: followed by exactly eleven
+#   colon-separated fields, escapes allowed, no whitespace.
+_CPE_23 = re.compile(r"^cpe:2\.3(?::[^:\s]*){11}$")
+# - SHA-512: 512 bits of lowercase hexadecimal.
+_SHA512_HEX = re.compile(r"^[0-9a-f]{128}$")
+ALIAS_CPE_PROPERTY = "yocto:cve:cpe"
+SHA512_ALGORITHM = "SHA-512"
+
+
+def _hash_occurrences(sbom):
+    """(holder ref or None, hash dict, misplaced) for every hash object
+    naming SHA-512; misplaced means outside component/properties-holding
+    components, i.e. not riding components[].hashes[]."""
+    holders = {id(component): ref
+               for ref, component in _taxonomy_property_holders(sbom)}
+    occurrences = []
+
+    def walk(node, holder_ref):
+        if isinstance(node, dict):
+            own_ref = holders.get(id(node))
+            if own_ref is not None:
+                holder_ref = own_ref
+            if node.get("alg") == SHA512_ALGORITHM:
+                occurrences.append((holder_ref, node, holder_ref is None))
+            for value in node.values():
+                walk(value, holder_ref)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, holder_ref)
+
+    walk(sbom, None)
+    return occurrences
+
+
+def _check_purl_syntax(context):
+    invalid = sorted({
+        ref for ref, component in _taxonomy_property_holders(
+            context["sbom"])
+        if component.get("purl")
+        and not _PURL.match(str(component["purl"]))})
+    if invalid:
+        return ("unmet", "component purls are not valid Package URLs "
+                         "(pkg:<type>/[<namespace>/]<name>[@<version>])",
+                invalid)
+    return ("verified", "every emitted purl parses as a Package URL")
+
+
+def _check_cpe_syntax(context):
+    invalid = set()
+    for ref, component in _taxonomy_property_holders(context["sbom"]):
+        cpe = component.get("cpe")
+        if cpe and not _CPE_23.match(str(cpe)):
+            invalid.add(ref)
+        for prop in component.get("properties") or []:
+            if (prop.get("name") == ALIAS_CPE_PROPERTY
+                    and not _CPE_23.match(str(prop.get("value") or ""))):
+                invalid.add(ref)
+    named = sorted(ref for ref in invalid if ref)
+    if invalid:
+        return ("unmet", "CPE identifiers are not formatted CPE 2.3 "
+                         "strings (cpe:2.3: with eleven fields)", named)
+    return ("verified", "every emitted CPE is a formatted CPE 2.3 string")
+
+
+def _check_sha512_syntax(context):
+    misplaced = set()
+    malformed = set()
+    for ref, entry, is_misplaced in _hash_occurrences(context["sbom"]):
+        if is_misplaced:
+            misplaced.add(ref)
+        elif not _SHA512_HEX.match(str(entry.get("content") or "")):
+            malformed.add(ref)
+    if misplaced or malformed:
+        message = ("SHA-512 artifacts are not lowercase hex of 512 bits "
+                   "riding components[].hashes[] under the SHA-512 "
+                   "algorithm")
+        if misplaced:
+            message += ("; some occur outside components[]/hashes[] where "
+                        "the TR places them")
+        refs = sorted({ref for ref in (misplaced | malformed) if ref})
+        return "unmet", message, refs
+    return ("verified", "every SHA-512 is lowercase hex of 512 bits in "
+                        "components[].hashes[] under the SHA-512 "
+                        "algorithm")
+import importlib.util
+import os
 import sys
 import urllib.parse
 
@@ -1281,6 +1379,36 @@ TR03183_2_REQUIREMENTS = [
                            "never silently deduplicated"),
         "origin": "generated-document",
         "check": _check_logical_identity_collisions,
+    },
+    {
+        "id": "REQ-IDEN-002",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.2 (component-level "
+                   "data fields: Package URL)"),
+        "representation": ("every emitted purl parses as a Package URL "
+                           "(pkg:<type>/[<namespace>/]<name>[@<version>]"
+                           "[?<qualifiers>][#<subpath>])"),
+        "origin": "generated-document",
+        "check": _check_purl_syntax,
+    },
+    {
+        "id": "REQ-IDEN-003",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.2 (component-level "
+                   "data fields: CPE) and \u00a73.2.1 (CPE 2.3)"),
+        "representation": ("every emitted CPE - component field or "
+                           "correlation alias - is a formatted CPE 2.3 "
+                           "string"),
+        "origin": "generated-document",
+        "check": _check_cpe_syntax,
+    },
+    {
+        "id": "REQ-IDEN-004",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.2 (hash of the "
+                   "deployable artifact) and \u00a73.2.1 (SHA-512)"),
+        "representation": ("every SHA-512 digest is lowercase hex of 512 "
+                           "bits riding components[].hashes[] under the "
+                           "SHA-512 algorithm"),
+        "origin": "generated-document",
+        "check": _check_sha512_syntax,
     },
     {
         "id": "REQ-VULN-001",
