@@ -127,6 +127,17 @@ _applies_source_uris, _check_source_uris = _uri_field({"vcs", "source-distributi
 _applies_deployable_uris, _check_deployable_uris = _uri_field({"distribution"}, "deployable form")
 
 
+def _check_primary_component_creator(context):
+    primary = (context["sbom"].get("metadata") or {}).get("component") or {}
+    if primary.get("author") or primary.get("contact"):
+        return "asserted", ("the product integration asserts the primary "
+                            "component creator; meta-cyclonedx cannot "
+                            "independently verify the manufacturer's "
+                            "identity")
+    return "unmet", ("the product integration did not assert a creator for "
+                     "the primary component")
+
+
 def _check_component_names(context):
     missing = [component["bom-ref"]
                for component in context["sbom"].get("components") or []
@@ -364,6 +375,15 @@ TR03183_2_REQUIREMENTS = [
                            "identifying the delivered product"),
         "origin": "caller-assertion",
         "check": _check_primary_component_assertion,
+    },
+    {
+        "id": "REQ-COMP-012",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.2 (component-level data "
+                   "fields: primary component creator)"),
+        "representation": ("metadata.component author or contact with an "
+                           "email address or URL"),
+        "origin": "caller-assertion",
+        "check": _check_primary_component_creator,
     },
     {
         "id": "REQ-DEPS-001",

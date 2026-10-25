@@ -697,6 +697,8 @@ def render(facts):
     }
     if "external_references" in primary:
         sbom_metadata["component"]["externalReferences"] = primary["external_references"]
+    _apply_creator_identity(
+        sbom_metadata["component"], _parse_contacts(primary.get("creator"), log))
 
     sbom = {
         "bomFormat": "CycloneDX",

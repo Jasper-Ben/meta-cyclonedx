@@ -14,6 +14,30 @@ from helpers import (default_facts, finding_by_id, fragment, pkg,
                      profile_config, render_all)
 
 
+def test_explicit_primary_component_creator_names_the_product_manufacturer():
+    facts = default_facts(
+        config=profile_config(),
+        primary={"type": "firmware", "name": "core-image", "version": "1.0",
+                 "creator": "Acme GmbH <product@acme.example>"},
+    )
+    docs, _logs = render_all(facts)
+    component = docs["sbom"]["metadata"]["component"]
+    assert component["author"] == "Acme GmbH"
+    assert component["contact"] == ["product@acme.example"]
+    finding = finding_by_id(docs["report"], "REQ-COMP-012")
+    assert finding["verdict"] == "asserted"
+    assert finding["evidenceOrigin"] == "caller-assertion"
+
+
+def test_missing_primary_component_creator_is_unmet_not_fabricated():
+    docs, _logs = render_all(default_facts(config=profile_config()))
+    component = docs["sbom"]["metadata"]["component"]
+    assert "author" not in component
+    assert "contact" not in component
+    finding = finding_by_id(docs["report"], "REQ-COMP-012")
+    assert finding["verdict"] == "unmet"
+
+
 def test_sbom_creator_grammar_becomes_metadata_authors():
     facts = default_facts(
         config=profile_config(),
