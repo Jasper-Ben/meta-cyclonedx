@@ -165,47 +165,109 @@ def serialize_report(report):
     return json.dumps(report, indent=2, sort_keys=True) + "\n"
 
 
-def component_identity(products_names, version, purl, external_references=None):
+# A creator-assigned identity override is authoritative verbatim. The
+# semantically valid BPN/PV defaults must look like a name and like a
+# version: single identifier-like tokens, the version carrying at least
+# one digit; degenerate defaults never enter documents as identity.
+VALID_LOGICAL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+_~+-]*")
+VALID_LOGICAL_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~+-]*")
+
+# Vulnerability correlation aliases survive in component properties so
+# every CVE_PRODUCT / CVE_VERSION token keeps reaching the VEX and CVE
+# matching inputs without ever becoming component identity (ADR-0006).
+ALIAS_PRODUCT_PROPERTY = "yocto:cve:product"
+ALIAS_VERSION_PROPERTY = "yocto:cve:version"
+ALIAS_CPE_PROPERTY = "yocto:cve:cpe"
+
+
+def _short_version(version):
+    """Short upstream version of a Yocto version string (drops +git suffixes)."""
+    return (version or "").split("+git")[0].strip()
+
+
+def default_logical_version(pv):
     """
-    Build one component identity record per vulnerability-correlation
-    product name of a recipe. Names carrying a "vendor:" qualifier gain a
-    group and a vendor-qualified CPE; the purl records the Yocto/package
-    identity shared by all names of the recipe.
+    The logical version a PV implies: the short version when it is
+    semantically valid (identifier-shaped and carrying at least one
+    digit), otherwise the "unknown" placeholder.
     """
-    packages = []
+    short = _short_version(pv)
+    if VALID_LOGICAL_VERSION.fullmatch(short) and any(c.isdigit() for c in short):
+        return short
+    return "unknown"
 
-    # keep only the short version which can be matched against vulnerabilities databases
-    version = version.split("+git")[0]
 
-    # Ensure version is never empty (required by some SBOM profiles)
-    if not version or version.strip() == "":
-        version = "unknown"
+def logical_identity(bpn, pv, name_override=None, version_override=None):
+    """
+    Resolve the logical component identity of a recipe: the creator-
+    assigned name and version of its component instance (ADR-0006).
 
-    # some packages have alternative names, so we split CVE_PRODUCT
-    # deduplicate, and iterate in a stable order: the fragment's component
-    # array rides task signatures and document assembly alike.
-    for product in sorted(set(products_names.split())):
-        # CVE_PRODUCT in recipes may include vendor information for CPE identifiers. If not,
-        # use wildcard for vendor.
-        if ":" in product:
-            vendor, product = product.split(":", 1)
-        else:
-            vendor = ""
+    Explicit CycloneDX identity overrides (CYCLONEDX_COMPONENT_NAME and
+    CYCLONEDX_COMPONENT_VERSION) take precedence verbatim. The defaults
+    are BPN and the short PV, used only when semantically valid; an
+    invalid default degrades to the "unknown" placeholder.
+    """
+    default_name = (bpn or "").strip()
+    if not VALID_LOGICAL_NAME.fullmatch(default_name):
+        default_name = "unknown"
+    name = name_override.strip() if name_override else default_name
+    version = (version_override.strip() if version_override
+               else default_logical_version(pv))
+    return name, version
 
-        pkg = {
-            "name": product,
-            "version": version,
-            "type": "library",
-            "cpe": 'cpe:2.3:*:{}:{}:{}:*:*:*:*:*:*:*'.format(vendor or "*", product, version),
-            "purl": purl,
-            "bom-ref": str(uuid.uuid4())
-        }
-        if vendor != "":
-            pkg["group"] = vendor
-        if external_references:
-            pkg["externalReferences"] = external_references
-        packages.append(pkg)
-    return packages
+
+def component_identity(bpn, pv, purl, cve_products=None, cve_versions=None,
+                       name_override=None, version_override=None,
+                       external_references=None):
+    """
+    Build the single logical component identity record of a recipe.
+
+    One recipe is one independently assessable logical component (ADR-0006,
+    ADR-0009): its name and version are creator-assigned — explicit
+    overrides over semantically valid BPN and PV defaults. CVE_PRODUCT and
+    CVE_VERSION are vulnerability-correlation aliases only: they never
+    create or rename the component, they carry a "vendor:" qualifier into
+    the CPE, and every token stays available through yocto:cve:product,
+    yocto:cve:version and yocto:cve:cpe properties for the VEX and CVE
+    matching inputs. The purl records the Yocto/package identity of the
+    build (pkg:yocto, OpenEmbedded's purl prefix) alongside, never
+    instead of, the logical identity.
+    """
+    name, version = logical_identity(bpn, pv, name_override, version_override)
+
+    # BitBake defaults CVE_PRODUCT to BPN and CVE_VERSION to PV; mirror
+    # that so the function's own defaults carry complete correlation data.
+    products = sorted({token for token in (cve_products or "").split() if token}) \
+        or [token for token in [(bpn or "").strip()] if token]
+    versions = sorted({_short_version(token)
+                       for token in (cve_versions or "").split()} - {""}) \
+        or [default_logical_version(pv)]
+
+    cpes = []
+    for token in products:
+        vendor, _, product = token.partition(":")
+        if not product:
+            vendor, product = "", token
+        for short in versions:
+            cpes.append("cpe:2.3:*:{}:{}:{}:*:*:*:*:*:*:*".format(
+                vendor or "*", product, short))
+
+    pkg = {
+        "name": name,
+        "version": version,
+        "type": "library",
+        "purl": purl,
+        "bom-ref": str(uuid.uuid4()),
+    }
+    if cpes:
+        pkg["cpe"] = cpes[0]
+    pkg["properties"] = (
+        [{"name": ALIAS_PRODUCT_PROPERTY, "value": token} for token in products]
+        + [{"name": ALIAS_VERSION_PROPERTY, "value": short} for short in versions]
+        + [{"name": ALIAS_CPE_PROPERTY, "value": cpe} for cpe in cpes])
+    if external_references:
+        pkg["externalReferences"] = external_references
+    return pkg
 
 
 def normalize_cve_id(cve_id):

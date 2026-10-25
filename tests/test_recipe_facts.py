@@ -9,35 +9,85 @@ import meta_cyclonedx
 from helpers import PLACEHOLDER
 
 
-def test_one_identity_per_cve_product_alias():
-    pkgs = meta_cyclonedx.component_identity("libfoo foo", "1.2", "pkg:yocto/foo@1.2")
+def test_aliases_collapse_into_one_logical_component():
+    pkg = meta_cyclonedx.component_identity(
+        "foo", "1.2", "pkg:yocto/foo@1.2", cve_products="libfoo foo")
 
-    assert {p["name"] for p in pkgs} == {"libfoo", "foo"}
-    assert {p["version"] for p in pkgs} == {"1.2"}
-    assert len({p["bom-ref"] for p in pkgs}) == 2
-    assert all(p["purl"] == "pkg:yocto/foo@1.2" for p in pkgs)
-
-
-def test_vendor_qualifier_becomes_group_and_cpe_vendor():
-    pkgs = meta_cyclonedx.component_identity("vendor:libfoo", "1.2", "pkg:yocto/x")
-
-    assert pkgs[0]["name"] == "libfoo"
-    assert pkgs[0]["group"] == "vendor"
-    assert pkgs[0]["cpe"] == "cpe:2.3:*:vendor:libfoo:1.2:*:*:*:*:*:*:*"
+    assert pkg["name"] == "foo"
+    assert pkg["version"] == "1.2"
+    assert pkg["purl"] == "pkg:yocto/foo@1.2"
+    products = [p["value"] for p in pkg["properties"]
+                if p["name"] == "yocto:cve:product"]
+    assert products == ["foo", "libfoo"]
+    assert pkg["cpe"] == "cpe:2.3:*:*:foo:1.2:*:*:*:*:*:*:*"
 
 
-def test_git_suffixes_and_empty_versions_stay_matchable():
-    [pkg] = meta_cyclonedx.component_identity("app", "6.6+gitAUTOINC+abcdef", "p")
+def test_identity_overrides_take_precedence():
+    pkg = meta_cyclonedx.component_identity(
+        "yocto-recipe", "9.9-r0", "pkg:yocto/x@9.9", cve_products="foo",
+        name_override="libfoo-upstream", version_override="2.4.1")
+
+    assert pkg["name"] == "libfoo-upstream"
+    assert pkg["version"] == "2.4.1"
+    # CVE_VERSION defaults to PV: the correlation CPEs stay on the recipe
+    # version, never on the overridden logical version.
+    assert ":foo:9.9-r0:" in pkg["cpe"]
+
+
+def test_semantically_valid_bpn_and_pv_are_the_identity_defaults():
+    pkg = meta_cyclonedx.component_identity("libfoo", "1.2.3-r0", "p")
+    assert pkg["name"] == "libfoo"
+    assert pkg["version"] == "1.2.3-r0"
+
+
+def test_degenerate_pv_falls_back_to_the_unknown_placeholder():
+    pkg = meta_cyclonedx.component_identity("app", "6.6+gitAUTOINC+abcdef", "p")
     assert pkg["version"] == "6.6"
 
-    [pkg] = meta_cyclonedx.component_identity("app", "  ", "p")
+    pkg = meta_cyclonedx.component_identity("app", "  ", "p")
     assert pkg["version"] == "unknown"
     assert ":unknown:" in pkg["cpe"]
+
+    # A PV without any version signal (no digit) is not semantically valid.
+    pkg = meta_cyclonedx.component_identity("app", "git+${SRCPV}", "p")
+    assert pkg["version"] == "unknown"
+
+
+def test_overrides_are_authoritative_verbatim():
+    pkg = meta_cyclonedx.component_identity(
+        "app", "1.0", "p", name_override="upstream name",
+        version_override="nightly-2026")
+    assert pkg["name"] == "upstream name"
+    assert pkg["version"] == "nightly-2026"
+
+
+def test_vendor_qualifier_qualifies_only_correlation_data():
+    pkg = meta_cyclonedx.component_identity(
+        "libfoo", "1.2", "pkg:yocto/x", cve_products="vendor:libfoo")
+
+    assert pkg["name"] == "libfoo"
+    assert "group" not in pkg
+    assert pkg["cpe"] == "cpe:2.3:*:vendor:libfoo:1.2:*:*:*:*:*:*:*"
+    products = [p["value"] for p in pkg["properties"]
+                if p["name"] == "yocto:cve:product"]
+    assert products == ["vendor:libfoo"]
+
+
+def test_every_alias_version_reaches_the_correlation_cpe_set():
+    pkg = meta_cyclonedx.component_identity(
+        "foo", "1.3", "p", cve_products="foo", cve_versions="1.2 1.3")
+
+    assert pkg["version"] == "1.3"
+    assert pkg["cpe"] == "cpe:2.3:*:*:foo:1.2:*:*:*:*:*:*:*"
+    cpes = [p["value"] for p in pkg["properties"] if p["name"] == "yocto:cve:cpe"]
+    assert cpes == ["cpe:2.3:*:*:foo:1.2:*:*:*:*:*:*:*",
+                    "cpe:2.3:*:*:foo:1.3:*:*:*:*:*:*:*"]
 
 
 def test_external_references_are_attached_when_supplied():
     refs = [{"type": "vcs", "url": "https://example.org/src.git@deadbeef"}]
-    [pkg] = meta_cyclonedx.component_identity("app", "1", "p", external_references=refs)
+    pkg = meta_cyclonedx.component_identity("app", "1", "p",
+                                            external_references=refs)
     assert pkg["externalReferences"] == refs
 
 
