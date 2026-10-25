@@ -1480,6 +1480,7 @@ def collect_deploy_files(d):
     """
     import hashlib
     import os
+    import re
     import stat
 
     renderer = _cyclonedx_renderer(d)
@@ -1527,11 +1528,10 @@ def collect_deploy_files(d):
     link_name = d.getVar("IMAGE_LINK_NAME") or ""
     if not link_name:
         # No stable link name: derive one from IMAGE_NAME by stripping
-        # the build stamp, the same name lineage as the export basename.
-        link_name = d.getVar("IMAGE_NAME") or ""
-        stamp = d.getVar("DATETIME") or ""
-        if stamp and link_name.endswith("-" + stamp):
-            link_name = link_name[:-len(stamp) - 1]
+        # the trailing build stamp, the same name lineage as the export
+        # basename. Matching the 14-digit stamp shape keeps DATETIME out
+        # of this function's signature dependencies.
+        link_name = re.sub(r"-[0-9]{14}$", "", d.getVar("IMAGE_NAME") or "")
     candidates = []
     for fstype in (d.getVar("IMAGE_FSTYPES") or "").split():
         for sub in (fstype, *(d.getVarFlag("IMAGE_TYPEDEP", fstype)
@@ -1835,6 +1835,10 @@ export_cyclonedx[vardeps] += "CYCLONEDX_EXPORT_SBOM CYCLONEDX_EXPORT_VEX \
     CYCLONEDX_PROFILE CYCLONEDX_PROFILE_ENFORCEMENT"
 export_cyclonedx[vardeps] += "CYCLONEDX_ADDITIONAL_FILES"
 export_cyclonedx[vardepsexclude] += "DATETIME IMAGE_NAME"
+# collect_deploy_files reads IMAGE_NAME only to derive the stable link
+# name; its value carries the DATETIME stamp, so exclude it here too -
+# vardepsexclude is per-function and does not inherit export_cyclonedx's.
+collect_deploy_files[vardepsexclude] += "IMAGE_NAME"
 export_cyclonedx[vardeps] += "CYCLONEDX_SBOM_CREATOR"
 export_cyclonedx[vardeps] += "CYCLONEDX_PRIMARY_COMPONENT_CREATOR \
     CYCLONEDX_PRIMARY_COMPONENT_SOURCE_URI \
