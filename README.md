@@ -683,6 +683,13 @@ every other finding:
   assertion resolves to a logical, non-file component of the product:
   files are delivery detail, never vulnerability subjects
   (`REQ-VULN-002`).
+- **Enforcement equivalence.** A defect that yields an `unmet` finding
+  in report mode rejects the same input under `strict` enforcement -
+  there is one requirements matrix and one verdict path. The structured
+  strict failure lists every machine-detectable violation at once
+  (`violations`, ordered by requirement identifier, each with its
+  diagnostic message and affected bom-refs), so one build reports the
+  complete repair list.
 - **Report enforcement publishes documents with findings** - that
   includes a schema-invalid document: it is published with loud
   `unmet` findings naming the violated schema locations, and the

@@ -1852,13 +1852,25 @@ def render(facts):
         "findings": findings,
     }
     if enforcement == "strict":
-        unmet = sorted(finding["requirementId"] for finding in findings
-                       if finding["verdict"] == "unmet"
-                       and finding["applicability"] == "applicable")
+        # The gate reports EVERY machine-detectable violation, not just
+        # the first: the same findings a report-mode build publishes,
+        # aggregated deterministically by requirement identifier.
+        violations = sorted(
+            (dict(
+                {"requirementId": finding["requirementId"],
+                 "diagnosticMessage": finding["diagnosticMessage"]},
+                **({"bomRefs": finding["bomRefs"]}
+                   if finding.get("bomRefs") else {}))
+             for finding in findings
+             if finding["verdict"] == "unmet"
+             and finding["applicability"] == "applicable"),
+            key=lambda violation: violation["requirementId"])
+        unmet = [violation["requirementId"] for violation in violations]
         if unmet:
             return {"failure": {
                 "alignmentEnforcement": "strict",
                 "unmetRequirementIds": unmet,
+                "violations": violations,
                 "diagnosticMessage": (
                     f"Alignment profile {profile} with strict enforcement "
                     f"rejects the output over {len(unmet)} unmet requirement(s): "

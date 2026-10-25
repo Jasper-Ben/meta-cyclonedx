@@ -1767,7 +1767,13 @@ def export_cyclonedx(d, deploy_phase=False):
         "included_images": included_images,
     })
     if "failure" in docs:
-        bb.fatal(docs["failure"]["diagnosticMessage"])
+        failure = docs["failure"]
+        for violation in failure.get("violations", ()):
+            bb.error("alignment violation %s: %s%s" % (
+                violation["requirementId"], violation["diagnosticMessage"],
+                " (components: %s)" % ", ".join(violation["bomRefs"])
+                if violation.get("bomRefs") else ""))
+        bb.fatal(failure["diagnosticMessage"])
     sbom = docs["sbom"]
     vex = docs["vex"]
     report = docs.get("report")
