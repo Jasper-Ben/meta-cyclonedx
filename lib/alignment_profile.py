@@ -307,10 +307,109 @@ def _check_component_creators(context):
              "upstream identity metadata"), None, "upstream-metadata")
 
 
+# Components the licence-role requirements evaluate: the delivered
+# logical components and the primary component. Identified boundary
+# components outside the scope of delivery only carry creator, name,
+# version and identifiers (TR-03183-2 v2.1.0 §3.2.4), never licence
+# claims the SBOM creator could substantiate. The primary component is
+# evaluated too, but its bom-ref is generated per document and never
+# named in findings.
+DELIVERY_SCOPE_MARKER = "yocto:delivery:scope"
+
+
+def _licence_components(context):
+    return [(component.get("bom-ref"), component)
+            for component in context["sbom"].get("components") or []
+            if not any(p.get("name") == DELIVERY_SCOPE_MARKER
+                       for p in component.get("properties") or [])]
+
+
+def _primary_component(context):
+    return (context["sbom"].get("metadata") or {}).get("component") or {}
+
+
+def _licences_with_acknowledgement(component, acknowledgement):
+    def has_acknowledgement(entry):
+        if entry.get("acknowledgement") == acknowledgement:
+            return True
+        license_field = entry.get("license")
+        return (isinstance(license_field, dict)
+                and license_field.get("acknowledgement") == acknowledgement)
+
+    return any(has_acknowledgement(entry)
+               for entry in component.get("licenses") or [])
+
+
+def _check_original_licences(context):
+    missing = [ref for ref, component in _licence_components(context)
+               if not _licences_with_acknowledgement(component, "declared")]
+    primary_gap = not _licences_with_acknowledgement(
+        _primary_component(context), "declared")
+    if not missing and not primary_gap:
+        return ("verified", "every delivered component and the primary "
+                            "component carry creator-assigned (declared) "
+                            "original licence evidence")
+    message = ("components lack original licence evidence: no "
+               "creator-assigned (declared) licence entry from recipe "
+               "metadata")
+    if primary_gap:
+        message += ", including the primary component"
+    return "unmet", message, missing
+
+
+
+# The effective licence property name from the pinned property taxonomy
+# v0.1.2 (registry spelling; the TR-03183-2 v2.1.0 PDF carries a
+# "License" spelling variant of the same property).
+EFFECTIVE_LICENCE_PROPERTY = "bsi:component:effectiveLicence"
+
+
 def _check_distribution_licences(context):
-    return "unmet", ("recipe-declared licences are original licence evidence "
-                     "only; no authoritative distribution licence source is "
-                     "represented in the SBOM")
+    missing = [ref for ref, component in _licence_components(context)
+               if not _licences_with_acknowledgement(component, "concluded")]
+    primary_gap = not _licences_with_acknowledgement(
+        _primary_component(context), "concluded")
+    if not missing and not primary_gap:
+        return ("asserted", "every delivered component carries an explicitly "
+                            "supplied distribution licence; caller "
+                            "assertions are never upgraded to verified")
+    message = ("no semantically authoritative distribution licence source "
+               "supplied; recipe LICENSE is original licence evidence only "
+               "and is never relabelled as a distribution licence")
+    if primary_gap:
+        message += ", including the primary component"
+    return "unmet", message, missing
+
+
+def _effective_licence_matches(component):
+    return [p for p in component.get("properties") or []
+            if p.get("name") == EFFECTIVE_LICENCE_PROPERTY]
+
+
+def _applies_effective_licences(context):
+    supplied = any(_effective_licence_matches(component)
+                   for _ref, component in _licence_components(context))
+    supplied = supplied or _effective_licence_matches(
+        _primary_component(context))
+    if supplied:
+        return True, ""
+    return False, ("the optional effective-licence field was not supplied "
+                   "by the product integration; the generator infers none")
+
+
+def _check_effective_licences(context):
+    violations = []
+    for ref, component in _licence_components(context):
+        matches = _effective_licence_matches(component)
+        if len(matches) > 1 or (matches
+                                and not all(p.get("value") for p in matches)):
+            violations.append(ref)
+    if violations:
+        return ("unmet", "the effective licence must occur exactly once per "
+                         "component with a licence expression", violations)
+    return ("asserted", "the effective licences recorded on the components "
+                        "were explicitly supplied by the SBOM creator; "
+                        "caller assertions are never upgraded to verified")
 
 
 def _check_no_vulnerability_data_in_sbom(context):
@@ -643,12 +742,36 @@ TR03183_2_REQUIREMENTS = [
     },
     {
         "id": "REQ-COMP-011",
-        "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.2 (distribution licences) "
-                   "and \u00a76.1 (SPDX licence identifiers)"),
-        "representation": ("distribution licence with SPDX identifiers or "
-                           "expressions"),
-        "origin": "generated-document",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.2 (distribution "
+                   "licences), \u00a76.1 and \u00a78.1.13 (licence "
+                   "identifiers and their CycloneDX mapping)"),
+        "representation": ('components[].licenses entries with CycloneDX '
+                           'acknowledgement "concluded"; only an explicitly '
+                           'identified authoritative source supplies them'),
+        "origin": "caller-assertion",
         "check": _check_distribution_licences,
+    },
+    {
+        "id": "REQ-COMP-013",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.4 (original licences), "
+                   "\u00a73.2.8 and \u00a78.1.13 (licence information)"),
+        "representation": ("components[].licenses entries with CycloneDX "
+                           "acknowledgement \"declared\"; recipe LICENSE is "
+                           "original licence evidence only"),
+        "origin": "recipe-metadata",
+        "check": _check_original_licences,
+    },
+    {
+        "id": "REQ-COMP-014",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.5 (effective licence, "
+                   "optional) and \u00a76.1; property taxonomy v0.1.2 "
+                   "bsi:component:effectiveLicence"),
+        "representation": ("bsi:component:effectiveLicence property "
+                           "explicitly supplied by the SBOM creator, never "
+                           "inferred and at most once per component"),
+        "origin": "caller-assertion",
+        "applies": _applies_effective_licences,
+        "check": _check_effective_licences,
     },
     {
         "id": "REQ-IDEN-001",
@@ -679,7 +802,7 @@ PROFILES = {
         "guideline": "BSI TR-03183-2",
         "guidelineVersion": "2.1.0",
         "propertyTaxonomyVersion": "0.1.2",
-        "requirementsMatrixVersion": "2.1.0-r3",
+        "requirementsMatrixVersion": "2.1.0-r4",
         "specVersions": ["1.6", "1.7"],
         "requirements": TR03183_2_REQUIREMENTS,
     },

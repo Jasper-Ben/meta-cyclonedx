@@ -45,6 +45,18 @@ CYCLONEDX_COMPONENT_DEPLOYABLE_URI ??= ""
 CYCLONEDX_PRIMARY_COMPONENT_SOURCE_URI ??= ""
 CYCLONEDX_PRIMARY_COMPONENT_DEPLOYABLE_URI ??= ""
 
+# Licence role evidence. Recipe LICENSE metadata is original licence
+# evidence only (creator-assigned). A distribution licence - the licence
+# under which recipients may use a component - has a semantically
+# authoritative source: CYCLONEDX_DISTRIBUTION_LICENCE. The effective
+# licence - the licence under which the creator of the SBOM uses a
+# component - is optional and only rides CYCLONEDX_EFFECTIVE_LICENCE.
+# Both are SPDX licence expressions, honoured in recipe scope (for the
+# components built here) and in image scope (for the delivered product);
+# no licence role is ever inferred from another.
+CYCLONEDX_DISTRIBUTION_LICENCE ??= ""
+CYCLONEDX_EFFECTIVE_LICENCE ??= ""
+
 # Defines SBOM_CVE_CHECK_DEPLOY_DB_DIR, used by the kernel CVE filtering below
 # to find the cvelist database deployed by sbom-cve-check-update-cvelist-native.
 require conf/sbom-cve-check-config.inc
@@ -418,6 +430,17 @@ python do_populate_cyclonedx() {
         if value:
             pn_list[fact_key] = value
 
+    # Licence-role evidence: the distribution and effective licence
+    # variables are the explicitly identified authoritative sources; an
+    # expression that is not SPDX-authoritative is dropped with a
+    # warning and its absence surfaces as an alignment finding instead.
+    for fact_key, variable in (
+            ("distribution_licence", "CYCLONEDX_DISTRIBUTION_LICENCE"),
+            ("effective_licence", "CYCLONEDX_EFFECTIVE_LICENCE")):
+        expression = validated_licence_expression(d, variable)
+        if expression:
+            pn_list[fact_key] = expression
+
     # Add "not_affected" VEX entries for kernel CVEs whose affected files were
     # never compiled, based on the sources actually compiled for this kernel
     # (only applies to whichever recipe provides virtual/kernel).
@@ -513,6 +536,7 @@ do_populate_cyclonedx[vardeps] += "CVE_PRODUCT CVE_VERSION"
 do_populate_cyclonedx[vardeps] += "CYCLONEDX_COMPONENT_NAME CYCLONEDX_COMPONENT_VERSION"
 do_populate_cyclonedx[vardeps] += "CYCLONEDX_COMPONENT_CREATOR"
 do_populate_cyclonedx[vardeps] += "CYCLONEDX_COMPONENT_SOURCE_URI CYCLONEDX_COMPONENT_DEPLOYABLE_URI"
+do_populate_cyclonedx[vardeps] += "CYCLONEDX_DISTRIBUTION_LICENCE CYCLONEDX_EFFECTIVE_LICENCE"
 SSTATETASKS += "do_populate_cyclonedx"
 do_populate_cyclonedx[sstate-inputdirs] = "${CYCLONEDX_PNDATA_WORKDIR}"
 do_populate_cyclonedx[sstate-outputdirs] = "${CYCLONEDX_PNDATA}/${SSTATE_PKGARCH}"
@@ -660,6 +684,43 @@ def extract_license_details(d, expression):
         details.append(detail)
 
     return details if details else None
+
+def validated_licence_expression(d, variable):
+    """
+    Validate a licence-role variable's value as a semantically
+    authoritative SPDX licence expression. OE-style '&'/'|' spellings are
+    normalized to SPDX operators and every identifier token must already
+    be a known SPDX licence identifier or a LicenseRef-* invention;
+    SPDXLICENSEMAP rewriting or composition is never applied: an
+    authoritative source must state the normative vocabulary. An invalid
+    value is dropped with a warning, and the missing licence evidence
+    surfaces as an alignment finding instead.
+    """
+    value = (d.getVar(variable) or "").strip()
+    if not value:
+        return None
+    spec_version = d.getVar("CYCLONEDX_SPEC_VERSION")
+    layerdir = d.getVar("CYCLONEDX_LAYERDIR")
+    licenses_file_path = (
+        f"{layerdir}/meta/files/spdx-license-list-data/"
+        f"licenses-{spec_version}.json")
+    spdx_license_ids = {entry["licenseId"]
+                        for entry in read_json(licenses_file_path)["licenses"]}
+    tokens = re.findall(
+        r"\(|\)|\S+",
+        value.replace("(", " ( ").replace(")", " ) ")
+             .replace("&", " & ").replace("|", " | "))
+    for token in tokens:
+        if token in ("(", ")", "&", "|", "AND", "OR", "WITH"):
+            continue
+        if token in spdx_license_ids or token.startswith("LicenseRef-"):
+            continue
+        bb.warn(f"{variable}: '{token}' is not a known SPDX licence "
+                f"identifier; ignoring the expression as licence-role "
+                f"evidence")
+        return None
+    return " ".join(tokens)
+
 
 def resolve_license_data(d):
     """
@@ -1405,6 +1466,20 @@ def export_cyclonedx(d):
         value = d.getVar(variable)
         if value:
             primary[fact_key] = value
+
+    # Licence roles of the delivered product: the image recipe LICENSE is
+    # original licence evidence only, and distribution or effective
+    # licences come from the product integration explicitly.
+    if d.getVar("LICENSE"):
+        original_licences = resolve_license_data(d)
+        if original_licences:
+            primary["licenses"] = original_licences
+    for variable, fact_key in (
+            ("CYCLONEDX_DISTRIBUTION_LICENCE", "distribution_licence"),
+            ("CYCLONEDX_EFFECTIVE_LICENCE", "effective_licence")):
+        expression = validated_licence_expression(d, variable)
+        if expression:
+            primary[fact_key] = expression
     if d.getVar("CYCLONEDX_ADD_LAYER_REFERENCES") == "1":
         primary["external_references"] = generate_layer_references(d)
 
