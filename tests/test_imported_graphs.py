@@ -116,3 +116,36 @@ def test_missing_imported_root_produces_a_finding_not_truncated_output():
     finding = finding_by_id(docs["report"], "REQ-REF-001")
     assert finding["verdict"] == "unmet"
     assert "cargo://missing-root" in finding["bomRefs"]
+
+
+def broken_bom_fragment():
+    # What the adapter hands over when CYCLONEDX_EXTRA_BOM_FILES points at
+    # a document that cannot be read in report enforcement: the evidence
+    # is lost upstream, so the defect must not vanish downstream.
+    return fragment(
+        pkgs=[pkg("rust-app", "1", "ref-r")],
+        extra_bom_errors=[{"file": "/build/cargo.bom.json",
+                           "error": "Expecting value: line 1 column 1"}])
+
+
+def test_unusable_imported_bom_reports_an_unmet_composition_finding():
+    facts = default_facts(config=profile_config(),
+                          fragments={"rust-app": broken_bom_fragment()})
+    docs, logs = render_all(facts)
+
+    assert any(level == "warn" and "unusable" in message
+               for level, message in logs)
+    finding = finding_by_id(docs["report"], "REQ-MERGE-001")
+    assert finding["verdict"] == "unmet"
+    assert "/build/cargo.bom.json" in finding["diagnosticMessage"]
+    # Everything else still renders; report enforcement publishes.
+    assert docs["sbom"]["components"]
+
+
+def test_strict_enforcement_fails_on_the_unusable_imported_bom():
+    facts = default_facts(config=profile_config(enforcement="strict"),
+                          fragments={"rust-app": broken_bom_fragment()})
+    docs, _logs = render_all(facts)
+
+    assert "failure" in docs
+    assert "REQ-MERGE-001" in docs["failure"]["unmetRequirementIds"]

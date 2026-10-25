@@ -1110,10 +1110,25 @@ def render(facts):
     # its fragment under "extra_components" / "extra_dependencies", and it is
     # merged into the image BOM here.
     #
-    # These entries already carry their own bom-refs, purls and dependency
-    # edges, so they are appended verbatim: the recipe-name dependency
-    # remapping above applies to components derived from Yocto packages and
-    # would corrupt an externally resolved tree.
+    # These entries carry their own bom-refs, purls and dependency edges,
+    # so the recipe-name dependency remapping above does not apply: it
+    # addresses Yocto-derived components and would corrupt an externally
+    # resolved tree. Components are reconciled by instance identity
+    # (logical name, version and purl), edges are merged, and everything
+    # that stays unusable is published as a composition finding.
+    merge_defects = []
+    for pkg in sorted(fragments):
+        for failure in fragments[pkg].get("extra_bom_errors") or []:
+            _log(log, "warn", f"CYCLONEDX_EXTRA_BOM_FILES: {pkg}: imported "
+                              f"BOM {failure.get('file')} is unusable: "
+                              f"{failure.get('error')}")
+            merge_defects.append({
+                "kind": "imported-bom-unusable",
+                "source": f"{pkg} ({failure.get('file')})",
+                "message": f"imported BOM {failure.get('file')} could not "
+                           f"be read: {failure.get('error')}",
+                "refs": [],
+            })
     extra_ref_components = {}
     extra_identity_index = {}
     for component in sbom["components"]:
@@ -1210,6 +1225,13 @@ def render(facts):
                                   f"contributed root {root_ref} names no "
                                   f"component; the imported graph is "
                                   f"malformed")
+                merge_defects.append({
+                    "kind": "imported-root-missing",
+                    "source": pkg,
+                    "message": f"contributed root {root_ref} names no "
+                               f"component",
+                    "refs": [root_ref],
+                })
             if root_ref not in owner_entry["dependsOn"]:
                 owner_entry["dependsOn"].append(root_ref)
 
@@ -1332,7 +1354,7 @@ def render(facts):
                                      "assemblies": [component_ref]})
 
     graph = _graph_evidence(sbom, metadata_component_ref, ref_recipes,
-                            debug_evidence_recipes, log)
+                            debug_evidence_recipes, merge_defects, log)
 
     # Replace SBOM serial placeholder in VEX vulnerabilities
     # This must be done after all vulnerabilities are collected to ensure each image
@@ -1847,7 +1869,8 @@ def _graph_integrity(sbom, root_ref):
             "ambiguous": sorted(set(ambiguous))}
 
 
-def _graph_evidence(sbom, root_ref, ref_recipes, debug_evidence_recipes, log):
+def _graph_evidence(sbom, root_ref, ref_recipes, debug_evidence_recipes,
+                    merge_defects, log):
     """
     Summarize the graph facts the requirements matrix evaluates: reference
     integrity (logged even without a profile, so defects are never silent),
@@ -1872,7 +1895,8 @@ def _graph_evidence(sbom, root_ref, ref_recipes, debug_evidence_recipes, log):
         and ref_recipes.get(component["bom-ref"]) not in debug_evidence_recipes})
     return {"rootRef": root_ref, "integrity": integrity,
             "boundaryRefs": boundary_refs,
-            "staticUnknownRefs": static_unknown_refs}
+            "staticUnknownRefs": static_unknown_refs,
+            "mergeDefects": merge_defects}
 
 
 def _highest_priority_scope(*scopes):
