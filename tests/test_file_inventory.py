@@ -9,11 +9,55 @@ without ever copying the owning logical component's identity. Ordinary
 and artifact inspection never analyzes binary contents (ADR-0002).
 """
 
+import copy
+
 import helpers
 from helpers import (default_facts, dep_entry, file_components,
                      file_entry, file_component, file_ref, finding_by_id,
                      fragment, pkg, profile_config, ref_of, render_all,
                      render_docs)
+
+
+def test_ordinary_output_omits_the_file_inventory_by_default():
+    # ADR-0005: the mandatory file inventory belongs to the alignment
+    # profile; without a selected profile the document is unchanged.
+    facts = default_facts(
+        file_inventory={"busybox": [file_entry("/bin/sh", sha512="a" * 128)]},
+    )
+    with_inventory, _vex, _logs = render_docs(copy.deepcopy(facts))
+    without, _vex, _logs = render_docs(facts)
+    assert file_components(with_inventory) == []
+    assert with_inventory["components"] == without["components"]
+    assert (
+        [sorted(entry["dependsOn"]) for entry in with_inventory["dependencies"]]
+        == [sorted(entry["dependsOn"]) for entry in without["dependencies"]]
+    )
+
+
+def test_file_components_participate_in_the_dependency_graph_of_their_owner():
+    facts = default_facts(
+        config=profile_config(),
+        file_inventory={"busybox": [
+            file_entry("/bin/sh", sha512="a" * 128),
+            file_entry("/usr/lib/libutil.so.1", sha512="c" * 128),
+        ]},
+    )
+    sbom, _vex, _logs = render_docs(facts)
+
+    owner = dep_entry(sbom, ref_of(sbom, "busybox"))
+    assert owner["dependsOn"] == [file_ref("busybox", "/usr/lib/libutil.so.1"),
+                                  file_ref("busybox", "/bin/sh")]
+    # The product root owns files through the delivering component only.
+    assert file_ref("busybox", "/bin/sh") not in sbom["dependencies"][0]["dependsOn"]
+    # Files are graph leaves: an entry exists with an empty list.
+    for path in ("/bin/sh", "/usr/lib/libutil.so.1"):
+        assert dep_entry(sbom, file_ref("busybox", path))["dependsOn"] == []
+    # A file's own dependency evidence is unknown by design: no binary
+    # analysis is performed (ADR-0002), never a fabricated "complete".
+    compositions = {ref: composition["aggregate"]
+                    for composition in sbom["compositions"]
+                    for ref in composition["assemblies"]}
+    assert compositions[file_ref("busybox", "/bin/sh")] == "unknown"
 
 
 def test_delivered_files_become_file_components_with_artifact_identity():
