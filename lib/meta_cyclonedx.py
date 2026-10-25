@@ -86,10 +86,12 @@ included_images       ordered embedded-image documents:
                                   SBOM itself is unreadable, else absent
 """
 
+import bz2
 import copy
 import importlib
 import importlib.util
 import json
+import lzma
 import os
 import posixpath
 import re
@@ -97,6 +99,7 @@ import stat
 import struct
 import urllib.parse
 import uuid
+import zlib
 from datetime import datetime, timezone
 
 
@@ -247,8 +250,59 @@ def _file_bom_ref(recipe, path):
 # never to infer dependencies, embedded software or debug information.
 ARTIFACT_HEAD_SIZE = 65536
 _ELF_MAGIC = b"\x7fELF"
-_ZIP_MAGIC = b"PK\x03\x04"
+_ZIP_LOCAL_MAGIC = b"PK\x03\x04"
+_ZIP_EMPTY_MAGIC = b"PK\x05\x06"
+_GZIP_MAGIC = b"\x1f\x8b"
+_XZ_MAGIC = b"\xfd7zXZ\x00"
+_BZIP2_MAGIC = b"BZh"
+_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+_7Z_MAGIC = b"7z\xbc\xaf\x27\x1c"
+_RPM_MAGIC = b"\xed\xab\xee\xdb"
+_AR_MAGIC = b"!<arch>\n"
+_CPIO_MAGICS = (b"070701", b"070707")
+_TAR_MAGIC = b"ustar"
 _SHT_SYMTAB = 2
+
+
+def _archive_kind(data):
+    """The container or compressed-stream family a signature reveals."""
+    if data.startswith((_ZIP_LOCAL_MAGIC, _ZIP_EMPTY_MAGIC)):
+        return "zip"
+    if data.startswith(_GZIP_MAGIC):
+        return "gzip"
+    if data.startswith(_XZ_MAGIC):
+        return "xz"
+    if data[0:3] == _BZIP2_MAGIC and data[3:4] in b"123456789":
+        return "bzip2"
+    if data.startswith(_ZSTD_MAGIC):
+        return "zstd"
+    if data.startswith(_7Z_MAGIC):
+        return "7z"
+    if data.startswith(_RPM_MAGIC):
+        return "rpm"
+    if data[:6] in _CPIO_MAGICS:
+        return "cpio"
+    if data[257:262] == _TAR_MAGIC:
+        return "tar"
+    if data.startswith(_AR_MAGIC):
+        return "ar"
+    return None
+
+
+def _decompressed_head(kind, data):
+    """The leading inner bytes of a single-stream compressed container."""
+    try:
+        if kind == "gzip":
+            return zlib.decompressobj(zlib.MAX_WBITS | 31).decompress(
+                data, 4096)
+        if kind == "xz":
+            return lzma.LZMADecompressor().decompress(
+                data[:ARTIFACT_HEAD_SIZE])
+        if kind == "bzip2":
+            return bz2.BZ2Decompressor().decompress(data[:ARTIFACT_HEAD_SIZE])
+    except Exception:
+        return b""
+    return b""
 
 
 def _elf_has_symbol_table(data):
@@ -311,17 +365,28 @@ def classify_delivered_file(path, mode, data):
                 "structured": "unstructured"}
     executable = (bool(mode & 0o111) or data.startswith(b"#!")
                   or data.startswith(_ELF_MAGIC))
-    archive = "no archive"
+    kind = _archive_kind(data)
     structured = "unstructured"
     error = None
+    if kind in ("zip", "tar", "cpio", "ar", "rpm", "7z"):
+        structured = "structured"
+    elif kind in ("gzip", "xz", "bzip2"):
+        inner = _decompressed_head(kind, data)
+        if _archive_kind(inner) in ("zip", "tar", "cpio", "ar", "rpm", "7z",
+                                    "gzip", "xz", "bzip2"):
+            structured = "structured"
     if data.startswith(_ELF_MAGIC):
         if len(data) < 64:
             error = "ambiguous-classification"
         elif _elf_has_symbol_table(data):
             structured = "structured"
-    return {"inventory": True, "mandatory": executable,
+    if data.startswith(_ZIP_LOCAL_MAGIC) and len(data) < 30:
+        error = "ambiguous-classification"
+    return {"inventory": True,
+            "mandatory": executable or kind is not None,
             "executable": "executable" if executable else "non-executable",
-            "archive": archive, "structured": structured,
+            "archive": "archive" if kind else "no archive",
+            "structured": structured,
             **({"error": error} if error else {})}
 
 
