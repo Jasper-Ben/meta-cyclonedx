@@ -39,6 +39,14 @@ primary               the delivered product:
                                   creator of the delivered product
     source_uri / deployable_uri   optional explicit URIs for the primary
                                   component (source and deployable form)
+    licenses                      optional original licence entries for the
+                                  delivered product (its recipe LICENSE)
+    distribution_licence          optional SPDX expression; the explicitly
+                                  identified authoritative distribution
+                                  licence source of the delivered product
+    effective_licence             optional SPDX expression; the effective
+                                  licence the SBOM creator supplies for the
+                                  delivered product
 sbom_creator            creator-contact grammar string naming the entity
                         responsible for compiling this SBOM; entries are
                         separated by ';' and each entry is
@@ -50,7 +58,11 @@ fragments             per-recipe normalized facts, keyed by recipe name, in
                       "extra_components", "extra_dependencies", "extra_roots",
                       plus creator and URI evidence keys "creator",
                       "source_uri" and "deployable_uri" (grammar strings /
-                      URIs; explicit overrides above recorded metadata)
+                      URIs; explicit overrides above recorded metadata),
+                      plus licence-role evidence keys
+                      "distribution_licence" and "effective_licence" (SPDX
+                      expressions; the component "licenses" entries are
+                      original licence evidence only)
 runtime_recipes       recipe names whose components are "required"
 image_install_recipes recipe names installed by image author intent; their
                       components hang directly off the graph root
