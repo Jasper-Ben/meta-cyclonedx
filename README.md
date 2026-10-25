@@ -376,6 +376,40 @@ change the logical component version. See
 `docs/migration/component-identity-cutover.md` for the breaking change
 history.
 
+### Dependency Graph
+
+The primary component (the delivered product) is the root of the
+dependency graph, and every component in the SBOM carries a `bom-ref`
+and exactly one `dependencies` entry - leaves with an empty list, so a
+machine can tell a known leaf apart from lost edges.
+
+Known dependency recipes outside the scope of delivery are no longer
+pruned: each path is followed to the first component outside the
+delivery item, which joins the document as an identified component
+(recipe name, `pkg:yocto/...` purl, scope `excluded` and a
+`yocto:delivery:scope: external` property that keeps it distinct from
+delivered instances). Resolution stops there; deeper dependencies are
+not claimed without evidence.
+
+Statically linked code is attributed from the debug-source lists
+BitBake's own `do_package` already records in pkgdata: a
+`/usr/src/debug/<BPN>/<PV>/` prefix of another recipe in a file's debug
+sources identifies the recipe whose code was linked in and becomes a
+dependency edge marked with a `yocto:dependency:evidence: debugsrc`
+property. No delivered binary is ever parsed. Missing or inhibited
+debug info (`INHIBIT_PACKAGE_DEBUG_SPLIT`) yields an honest unknown,
+never an absence-of-dependencies claim.
+
+CycloneDX `compositions` data declares the completeness of the
+dependency evidence per component - `complete`, `incomplete` or
+`unknown` - derived from those facts; unknown evidence never becomes a
+`complete` declaration. Inconsistent references (duplicate `bom-ref`s,
+dangling dependency references, ambiguous graph roots) are reported as
+alignment findings with the affected references and are never silently
+repaired: report enforcement publishes the graph as the build evidence
+states it, strict enforcement fails on it. See
+`docs/migration/graph-integrity-cutover.md` for the behavior changes.
+
 ### Component Scopes
 
 When including both runtime and build-time packages, meta-cyclonedx uses
@@ -662,11 +696,14 @@ representation and evaluation rule is project-owned data in
 guideline, taxonomy or schema version.
 
 Note: at this stage the profile's requirements matrix covers the
-TR-03183-2 v2.1.0 data-field baseline; requirements whose generator support
-arrives with later alignment work (file inventory, creator and licence
-evidence, dependency completeness declarations) are reported as `unmet`
-under `report` enforcement, so `strict` enforcement currently fails until
-that work has landed.
+TR-03183-2 v2.1.0 data-field and dependency-graph baseline; requirements
+whose generator support arrives with later alignment work (file inventory,
+creator and licence evidence) are reported as `unmet` under `report`
+enforcement, so `strict` enforcement currently fails until that work has
+landed. Where the build itself cannot establish completeness (component
+discovery, dependency depth beyond the scope of delivery, missing debug
+information), the findings are `unverifiable` - a valid result that never
+blocks the output.
 
 ### Minimal SBOM Configuration
 

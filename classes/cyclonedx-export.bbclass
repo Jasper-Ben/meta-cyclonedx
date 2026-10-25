@@ -1236,6 +1236,41 @@ def write_cyclonedx_image_data(d, sbom, vex):
         "vex": "sbom-cve-check/vex.json" if cyclonedx_sbom_cve_check_enabled(d) else "vex.json",
     })
 
+def collect_debug_sources(d, recipes):
+    """
+    Gather the debug-source paths that BitBake's own do_package recorded in
+    pkgdata for each recipe's delivered files. Extended pkgdata records are
+    keyed by binary package, so each recipe's PACKAGES list resolves them.
+    Recipes with inhibited (INHIBIT_PACKAGE_DEBUG_SPLIT) or absent debug
+    splitting simply do not appear: that is unknown coverage for the
+    renderer, never an absence of dependencies. The pkgdata records arrive
+    with the same sstate/task plumbing as the runtime pkgdata that
+    build_runtime_dependency_edges() already reads, so no extra task
+    dependencies or vardeps are needed.
+    """
+    import oe.packagedata
+
+    sources = {}
+    for pn in recipes:
+        recipe_data = oe.packagedata.read_pkgdata(pn, d)
+        packages = (recipe_data.get("PACKAGES") or pn).split()
+        per_recipe = {}
+        for pkg in sorted(packages):
+            extended = oe.packagedata.read_subpkgdata_extended(pkg, d)
+            if not extended:
+                continue
+            for fpath, info in (extended.get("files_info") or {}).items():
+                debugsrc = info.get("debugsrc")
+                if not debugsrc:
+                    continue
+                if isinstance(debugsrc, str):
+                    debugsrc = debugsrc.split()
+                per_recipe.setdefault(fpath, []).extend(sorted(debugsrc))
+        if per_recipe:
+            sources[pn] = per_recipe
+    return sources
+
+
 def export_cyclonedx(d):
     """
     Collect normalized build facts and artifact facts, hand them to the
@@ -1309,6 +1344,11 @@ def export_cyclonedx(d):
     if not (d.getVar("CYCLONEDX_EXPORT_DEPENDS") or "").split():
         runtime_edges = build_runtime_dependency_edges(d)
 
+    # Statically linked dependency evidence from the debugsrc lists
+    # recorded in pkgdata; the renderer derives the edges and never parses
+    # a delivered binary.
+    debug_sources = collect_debug_sources(d, sorted(fragments))
+
     primary = {
         "type": d.getVar("CYCLONEDX_IMAGE_TYPE") or "firmware",
         "name": d.getVar("CYCLONEDX_IMAGE_NAME") or d.getVar("PN") or "image",
@@ -1366,6 +1406,7 @@ def export_cyclonedx(d):
         "runtime_recipes": sorted(runtime_recipes),
         "image_install_recipes": sorted(image_install_recipes),
         "runtime_edges": {pkg: sorted(deps) for pkg, deps in runtime_edges.items()},
+        "debug_sources": debug_sources,
         "included_images": included_images,
     })
     if "failure" in docs:
