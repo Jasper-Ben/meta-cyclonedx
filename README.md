@@ -731,27 +731,31 @@ result that never blocks the output.
 #### File Inventory
 
 With an alignment profile selected, the build additionally inventories
-the **mandatory delivered files** of the assembled root filesystem and
-represents each as a CycloneDX `type: file` component (ADR-0005): every
-delivered executable and archive owned by a package of the image.
-Without a profile the inventory is fully inactive - no file is read,
-hashed or represented, and the SBOM is byte-comparable to earlier
-logical-component output. This default is intentional: ordinary
-configuration, documentation and data files stay omitted, and no
-configuration option extends the mandatory scope in this release.
+the **mandatory delivered files** and represents each as a CycloneDX
+`type: file` component (ADR-0005): every delivered executable and
+archive owned by a package of the image, the image's **primary
+deployable artifact**, and the **additional files** the product
+integration explicitly selects below. Without a profile the inventory
+is fully inactive - no file is read, hashed or represented, and the
+SBOM is byte-comparable to earlier logical-component output. This
+default is intentional: ordinary configuration, documentation and data
+files stay omitted unless an explicit selection includes them.
 
 Representation per inventoried file:
 
 - `name`: the delivered filename (path basename); the `version` is the
-  creator-assigned version of the delivering recipe's logical component
+  creator-assigned version of the delivering recipe's logical
+  component - or, for deploy-directory artifacts, of the primary
+  component
 - `hashes`: one SHA-512 over the delivered bytes - the artifact
   identity; modes, paths and timestamps never enter the hash
 - `properties`: the pinned taxonomy's `bsi:component:filename`
   (`executable|non-executable`), `bsi:component:archive`
   (`archive|no archive`) and `bsi:component:structured`
   (`structured|unstructured`) values
-- `bom-ref`: the deterministic `yocto-file:<recipe>:<delivered path>`,
-  so reruns and findings reference the same artifact
+- `bom-ref`: the deterministic `yocto-file:<recipe>:<delivered path>`
+  (`yocto-file::<deploy-directory path>` for deploy-directory
+  artifacts), so reruns and findings reference the same artifact
 - graph participation: the delivering logical component's dependency
   entry gains the file reference; the file is a leaf with an empty
   list. File components never copy the logical component's CPE, purl,
@@ -781,8 +785,51 @@ Mandatory artifacts that are missing, unreadable or too truncated to
 classify never vanish from the output: they produce `REQ-FILE-00x`
 alignment findings naming the affected file references (`REQ-FILE-001`
 inventory coverage, `REQ-FILE-002` artifact inspection, `REQ-FILE-003`
-graph participation). `report` enforcement publishes documents and
-findings; `strict` enforcement fails on them.
+graph participation, `REQ-FILE-004` primary deployable artifact,
+`REQ-FILE-005` additional-file selection). `report` enforcement
+publishes documents and findings; `strict` enforcement fails on them.
+
+##### Primary deployable artifact and selected additional files
+
+The delivered image itself belongs to the mandatory inventory even
+though no root-filesystem package manifest names it. Because image
+assembly finishes after `do_rootfs`, the artifact bytes are not final
+during the document generation inside `do_rootfs`; hashing them there
+would chase a moving target. Image recipes with a profile therefore
+generate the final documents once more in `do_deploy_cyclonedx`, which
+now runs after `do_image`: there the primary artifact's content is
+final, its bytes are hashed, and the entry joins the same file-
+inventory facts (`source: deployable`, owned by the primary component
+under the recipe-less facts key). Names come from the stable
+`${IMAGE_LINK_NAME}.<IMAGE_FSTYPES>` lineage (the same lineage the
+export basename follows), never the `DATETIME`-stamped filenames, and
+hashes cover content only - equivalent rebuilds, including
+sstate-restored artifacts under a fresh build stamp, reproduce identical
+inventories.
+
+```python
+# Explicitly selected additional deployed files (default: "").
+# Whitespace-separated shell-style globs (fnmatch; `*` crosses
+# directory boundaries) matched against paths relative to the image
+# deploy directory ${IMGDEPLOYDIR}, the staging directory whose
+# content is deployed to ${DEPLOY_DIR_IMAGE}; a leading "/" anchors
+# there too.
+# A selection that resolves to nothing is a REQ-FILE-005 finding,
+# never silently skipped.
+CYCLONEDX_ADDITIONAL_FILES = "bzImage* *.efi firmware/*.bin initramfs-*.cpio.gz"
+```
+
+Kernel, bootloader, firmware, trusted-execution-environment, initramfs,
+embedded-image and other product payloads selected this way use the
+same deterministic classification, SHA-512 identity, BSI properties and
+graph rules as root-filesystem file components; they carry the primary
+component's version and hang off the graph root. Repeated discovery of
+one artifact instance through package, deployable or selection evidence
+deduplicates by artifact reference (recipe namespace plus delivered
+path): one component, one graph edge, one composition; the same bytes
+delivered at a different path remain distinct artifact instances.
+Deploy-phase cost: one deploy-directory walk plus SHA-512 of each
+deployable and selected file.
 
 ### Minimal SBOM Configuration
 
@@ -908,6 +955,14 @@ CYCLONEDX_EXTRA_RUNTIME_RECIPES = ""
 CYCLONEDX_PROFILE = ""                    # or "tr03183-2.1"
 CYCLONEDX_PROFILE_ENFORCEMENT = "report"  # or "strict"
 CYCLONEDX_EXPORT_ALIGNMENT_REPORT = "${CYCLONEDX_EXPORT_BASENAME}.alignment-report.json"
+
+# Profile-gated: explicitly selected additional deployed files.
+# Whitespace-separated globs relative to the image deploy directory
+# ${IMGDEPLOYDIR} (the content deployed to ${DEPLOY_DIR_IMAGE}); a
+# leading "/" anchors there too (default: ""). The primary deployable
+# artifact is always inventoried under a profile; ordinary data files
+# are not.
+CYCLONEDX_ADDITIONAL_FILES = ""
 ```
 
 ### Use with non-rootfs image recipes
