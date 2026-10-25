@@ -69,3 +69,37 @@ def test_missing_original_licence_evidence_is_unmet_not_relabelled():
     assert finding["verdict"] == "unmet"
     assert finding["bomRefs"] == ["ref-busybox"]
     assert finding["evidenceOrigin"] == "recipe-metadata"
+
+
+def test_distribution_licence_rides_only_the_authoritative_fact_key():
+    sbom, _vex, _logs = render_docs(default_facts(
+        fragments={"zlib": fragment(
+            distribution_licence="Zlib",
+            pkgs=[pkg("zlib", "1.3", "ref-zlib",
+                      licenses=[{"license": {"id": "Zlib"}}])])},
+        runtime_recipes=["zlib"], image_install_recipes=["zlib"],
+    ))
+    assert sbom["components"][0]["licenses"] == [
+        {"license": {"id": "Zlib", "acknowledgement": "declared"}},
+        {"expression": "Zlib", "acknowledgement": "concluded"},
+    ]
+
+
+def test_distribution_licence_applies_to_the_primary_component():
+    sbom, _vex, _logs = render_docs(default_facts(
+        primary={"type": "firmware", "name": "core-image", "version": "1.0",
+                 "distribution_licence": "MIT"},
+    ))
+    assert sbom["metadata"]["component"]["licenses"] == [
+        {"expression": "MIT", "acknowledgement": "concluded"}]
+
+
+def test_invalid_distribution_expression_is_omitted_with_a_warning():
+    sbom, _vex, logs = render_docs(default_facts(
+        fragments={"zlib": fragment(
+            distribution_licence="MIT AND",
+            pkgs=[pkg("zlib", "1.3", "ref-zlib")])},
+        runtime_recipes=["zlib"], image_install_recipes=["zlib"],
+    ))
+    assert "licenses" not in sbom["components"][0]
+    assert any("MIT AND" in message for _level, message in logs)
