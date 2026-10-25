@@ -29,7 +29,15 @@ def build_succeeded(kas_build):
 
 @pytest.fixture(scope="module")
 def warm_rerun(kas_runs, kas_build):
-    """R2: re-invoke unchanged, directly on the recorded cold workspace."""
+    """R2: re-invoke unchanged on the workspace the matrix left behind.
+
+    The byte-identity comparison anchors on the immediately preceding
+    invocation (its same-config neighbour), not the session-start cold
+    run: any config-flipping stage in another matrix module legitimately
+    re-hardlinks the DATETIME-named image artifacts, which no invocation
+    after it can unrotate by name even though every byte it regenerates
+    is served from cache.
+    """
     return kas_runs.invoke("warm-rerun")
 
 
@@ -37,11 +45,12 @@ def warm_rerun(kas_runs, kas_build):
 def graph_isolation(kas_runs, warm_rerun):
     """R4: re-invoke with one trivial unused recipe in the fixture layer.
 
-    Depends on `warm_rerun` so the unchanged run still observes the
-    pristine cold workspace. Teardown reverts the mutation and removes the
-    fixture repository; `revert_fixture_mutations` raises if the layer's
-    tracked tree took any damage, so an incomplete revert surfaces as an
-    error instead of a silently dirty workspace.
+    Depends on `warm_rerun` both to order the stages and to give the
+    byte-identity claim its same-config neighbour. Teardown reverts the
+    mutation and removes the fixture repository;
+    `revert_fixture_mutations` raises if the layer's tracked tree took
+    any damage, so an incomplete revert surfaces as an error instead of
+    a silently dirty workspace.
     """
     kas_env.ensure_fixture_layer()
     kas_env.add_fixture_recipe()
@@ -60,9 +69,9 @@ def test_unchanged_rerun_leaves_deployed_artifacts_byte_identical(
         f"(exit {warm_rerun.returncode}); build-log tail:\n"
         f"{warm_rerun.output_tail}"
     )
-    cold = kas_runs["cold"]
-    assert warm_rerun.checksums == cold.checksums, (
-        deploy_compare.identity_report(warm_rerun, cold)
+    before = kas_runs.prior(warm_rerun)
+    assert warm_rerun.checksums == before.checksums, (
+        deploy_compare.identity_report(warm_rerun, before)
     )
 
 
@@ -128,9 +137,9 @@ def test_graph_isolation_recipe_keeps_deployed_artifacts_byte_identical(
         f"{graph_isolation.build.engine} (exit {graph_isolation.returncode}); "
         f"build-log tail:\n{graph_isolation.output_tail}"
     )
-    cold = kas_runs["cold"]
-    assert graph_isolation.checksums == cold.checksums, (
-        deploy_compare.identity_report(graph_isolation, cold)
+    before = kas_runs.prior(graph_isolation)
+    assert graph_isolation.checksums == before.checksums, (
+        deploy_compare.identity_report(graph_isolation, before)
     )
 
 
