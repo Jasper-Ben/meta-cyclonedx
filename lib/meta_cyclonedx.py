@@ -722,6 +722,17 @@ def render(facts):
                            config, spec_version, sbom_serial_number,
                            add_scopes, directly_installed_component_refs, log)
 
+    # Every represented component participates in the dependency graph.
+    # A leaf gets a dependency entry with an empty list, so a machine can
+    # tell a known leaf apart from a component whose edges were lost.
+    dependency_entry_refs = {entry["ref"] for entry in sbom["dependencies"]}
+    for component in sbom["components"]:
+        component_ref = component.get("bom-ref")
+        if component_ref and component_ref not in dependency_entry_refs:
+            sbom["dependencies"].append({"ref": component_ref,
+                                         "dependsOn": []})
+            dependency_entry_refs.add(component_ref)
+
     # Add a root dependency node as the first entry.
     # It references metadata.component and points to all directly installed
     # components; the dependency-target sort below fixes the array order.
