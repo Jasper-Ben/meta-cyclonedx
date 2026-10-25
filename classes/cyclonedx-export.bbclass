@@ -383,11 +383,13 @@ python do_populate_cyclonedx() {
     extra_components = []
     extra_dependencies = []
     extra_roots = []
+    extra_bom_errors = []
     for bom_path in (d.getVar("CYCLONEDX_EXTRA_BOM_FILES") or "").split():
         if not os.path.exists(bom_path):
             if d.getVar("CYCLONEDX_EXTRA_BOM_FILES_FAIL_ON_BROKEN_BOM_FILES") == "0":
                 bb.warn(f"CYCLONEDX_EXTRA_BOM_FILES: {pn}: no such file, skipping: {bom_path}")
-                continue
+                extra_bom_errors.append({"file": bom_path,
+                                         "error": "no such file"})
             else:
                 bb.fatal(f"CYCLONEDX_EXTRA_BOM_FILES: {pn}: no such file: {bom_path}")
         try:
@@ -395,7 +397,7 @@ python do_populate_cyclonedx() {
         except Exception as e:
             if d.getVar("CYCLONEDX_EXTRA_BOM_FILES_FAIL_ON_BROKEN_BOM_FILES") == "0":
                 bb.warn(f"CYCLONEDX_EXTRA_BOM_FILES: {pn}: cannot parse {bom_path}, skipping: {e}")
-                continue
+                extra_bom_errors.append({"file": bom_path, "error": str(e)})
             else:
                 bb.fatal(f"CYCLONEDX_EXTRA_BOM_FILES: {pn}: cannot parse {bom_path}: {e}")
         components = extra_bom.get("components") or []
@@ -408,6 +410,13 @@ python do_populate_cyclonedx() {
         if root.get("bom-ref"):
             components = components + [root]
             extra_roots.append(root["bom-ref"])
+        elif components:
+            # Parseable but rootless: the tree merges, the renderer's
+            # composition findings make the missing attachment visible.
+            extra_bom_errors.append({
+                "file": bom_path,
+                "error": "no metadata.component with a bom-ref; the "
+                         "imported graph cannot be attached as a tree"})
         extra_components.extend(components)
         extra_dependencies.extend(extra_bom.get("dependencies") or [])
         bb.debug(1, f"CYCLONEDX_EXTRA_BOM_FILES: {pn}: merged {len(components)} "
@@ -418,6 +427,8 @@ python do_populate_cyclonedx() {
         pn_list["extra_dependencies"] = extra_dependencies
     if extra_roots:
         pn_list["extra_roots"] = extra_roots
+    if extra_bom_errors:
+        pn_list["extra_bom_errors"] = extra_bom_errors
 
     # Creator and URI evidence overrides: the renderer owns the
     # precedence (explicit override above recorded metadata) and the
@@ -1489,11 +1500,17 @@ def export_cyclonedx(d):
     for img_name, img_sbom_path, img_vex_path in resolve_extra_image_sbom_paths(d):
         if not os.path.exists(img_sbom_path):
             bb.warn(f"CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES: SBOM not found for {img_name}: {img_sbom_path}")
+            included_images.append({"name": img_name, "sbom": None,
+                                    "vex": None, "vex_error": None,
+                                    "sbom_error": f"SBOM not found: {img_sbom_path}"})
             continue
         try:
             img_sbom_data = read_json(img_sbom_path)
         except Exception as e:
             bb.warn(f"CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES: cannot parse SBOM for {img_name}: {e}")
+            included_images.append({"name": img_name, "sbom": None,
+                                    "vex": None, "vex_error": None,
+                                    "sbom_error": str(e)})
             continue
         img_vex_data = None
         img_vex_error = None

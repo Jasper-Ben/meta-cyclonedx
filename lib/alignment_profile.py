@@ -524,6 +524,21 @@ def _check_reference_integrity(context):
                         "reference resolves inside the graph")
 
 
+def _check_imported_embedded_composition(context):
+    defects = (context.get("graph") or {}).get("mergeDefects") or []
+    if defects:
+        detail = "; ".join(f"{d['source']}: {d['message']}" for d in defects)
+        refs = sorted({ref for d in defects for ref in d.get("refs") or ()})
+        return "unmet", ("imported or embedded BOM composition hit "
+                         "defective input: " + detail +
+                         "; all usable evidence was composed and the "
+                         "defect is reported, never silently "
+                         "truncated"), refs
+    return "verified", ("imported ecosystem BOMs and embedded image BOMs "
+                        "composed their component instances, dependency "
+                        "edges, scopes and VEX references without loss")
+
+
 def _check_primary_component_assertion(context):
     primary = context["facts"].get("primary") or {}
     if primary.get("name") and primary.get("version") and primary.get("type"):
@@ -638,6 +653,17 @@ TR03183_2_REQUIREMENTS = [
                            "references, unambiguous graph root"),
         "origin": "generated-document",
         "check": _check_reference_integrity,
+    },
+    {
+        "id": "REQ-MERGE-001",
+        "source": ("BSI TR-03183-2 v2.1.0 §5.2.2 (dependency evidence "
+                   "from imported ecosystem BOMs and embedded image "
+                   "SBOMs)"),
+        "representation": ("imported and embedded BOM graphs composed "
+                           "losslessly; defective input reported as a "
+                           "finding instead of truncated output"),
+        "origin": "generated-document",
+        "check": _check_imported_embedded_composition,
     },
     {
         "id": "REQ-COMP-004",
@@ -802,7 +828,7 @@ PROFILES = {
         "guideline": "BSI TR-03183-2",
         "guidelineVersion": "2.1.0",
         "propertyTaxonomyVersion": "0.1.2",
-        "requirementsMatrixVersion": "2.1.0-r4",
+        "requirementsMatrixVersion": "2.1.0-r5",
         "specVersions": ["1.6", "1.7"],
         "requirements": TR03183_2_REQUIREMENTS,
     },
