@@ -14,7 +14,8 @@ from helpers import (default_facts, finding_by_id, fragment, pkg,
 
 def _all_licence_entries(sbom):
     holders = [sbom["metadata"]["component"], *sbom["components"]]
-    return [entry for holder in holders for entry in holder.get("licenses") or []]
+    return [entry for holder in holders
+            for entry in holder.get("licenses") or []]
 
 
 def test_recipe_licence_metadata_is_marked_as_original_licence_evidence():
@@ -217,5 +218,23 @@ def test_strict_enforcement_passes_with_complete_licence_evidence():
     )
     docs, _logs = render_all(facts)
     assert "failure" not in docs
-    assert finding_by_id(docs["report"], "REQ-COMP-011")["verdict"] == "asserted"
-    assert finding_by_id(docs["report"], "REQ-COMP-013")["verdict"] == "verified"
+    assert finding_by_id(docs["report"], "REQ-COMP-011")["verdict"] \
+        == "asserted"
+    assert finding_by_id(docs["report"], "REQ-COMP-013")["verdict"] \
+        == "verified"
+
+
+def test_effective_licence_cardinality_is_enforced_per_component():
+    facts = default_facts(
+        config=profile_config(),
+        fragments={"busybox": fragment(pkgs=[pkg(
+            "busybox", "1.36", "ref-busybox",
+            properties=[
+                {"name": "bsi:component:effectiveLicence", "value": "MIT"},
+                {"name": "bsi:component:effectiveLicence", "value": "MIT"},
+            ])])},
+    )
+    docs, _logs = render_all(facts)
+    finding = finding_by_id(docs["report"], "REQ-COMP-014")
+    assert finding["verdict"] == "unmet"
+    assert finding["bomRefs"] == ["ref-busybox"]
