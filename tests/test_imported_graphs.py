@@ -149,3 +149,37 @@ def test_strict_enforcement_fails_on_the_unusable_imported_bom():
 
     assert "failure" in docs
     assert "REQ-MERGE-001" in docs["failure"]["unmetRequirementIds"]
+
+
+# --- Embedded image composition defects -----------------------------------
+
+def test_unusable_included_image_sbom_is_found_not_dropped():
+    # An embedded image whose completed SBOM the adapter could not read
+    # used to vanish between adapter and renderer. The image stays a
+    # component of the delivery item and the loss is a finding.
+    from test_included_images import parent_facts
+    entry = {"name": "initramfs", "sbom": None, "vex": None,
+             "vex_error": None,
+             "sbom_error": "Expecting value: line 1 column 1 (char 0)"}
+    facts = parent_facts(config=profile_config(), included_images=[entry])
+    docs, logs = render_all(facts)
+
+    assert any(level == "warn" and "initramfs" in message
+               for level, message in logs)
+    assert component_by_name(docs["sbom"], "initramfs")["version"] == \
+        "unknown"
+    finding = finding_by_id(docs["report"], "REQ-MERGE-001")
+    assert finding["verdict"] == "unmet"
+    assert "initramfs" in finding["diagnosticMessage"]
+
+
+def test_strict_enforcement_fails_on_the_unusable_included_image():
+    from test_included_images import parent_facts
+    entry = {"name": "initramfs", "sbom": None, "vex": None,
+             "vex_error": None, "sbom_error": "not json"}
+    facts = parent_facts(config=profile_config(enforcement="strict"),
+                         included_images=[entry])
+    docs, _logs = render_all(facts)
+
+    assert "failure" in docs
+    assert "REQ-MERGE-001" in docs["failure"]["unmetRequirementIds"]

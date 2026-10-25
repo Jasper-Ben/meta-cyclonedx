@@ -1241,7 +1241,8 @@ def render(facts):
     # added with scope "required". A shared CPE alone never merges.
     _merge_included_images(sbom, vex, copy.deepcopy(facts.get("included_images")) or (),
                            config, spec_version, sbom_serial_number,
-                           add_scopes, directly_installed_component_refs, log)
+                           add_scopes, directly_installed_component_refs, log,
+                           merge_defects)
 
     # Statically linked edges observed from pkgdata debug-source records:
     # another recipe's debug-source prefix in this recipe's file list proves
@@ -1575,13 +1576,20 @@ def _instance_key(component):
 
 def _merge_included_images(sbom, vex, included_images, config, spec_version,
                            sbom_serial_number, add_scopes,
-                           directly_installed_component_refs, log):
+                           directly_installed_component_refs, log,
+                           merge_defects=None):
     """
     Merge the completed SBOM and VEX of each embedded image into the parent
     documents, remapping bom-refs of components that are the same instance
     as one of the parent's (same logical identity from the same package
     build) and the VEX references to the parent SBOM serial number.
+
+    Defective input is recorded in merge_defects and reported; the graph
+    is never repaired by dropping nodes, edges, scopes or VEX statements
+    (ADR-0004).
     """
+    if merge_defects is None:
+        merge_defects = []
     extra_seen_image_refs = {c["bom-ref"] for c in sbom["components"] if c.get("bom-ref")}
     identity_index = {}
     for component in sbom["components"]:
@@ -1593,6 +1601,34 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
         img_sbom_data = img["sbom"]
         img_vex_data = img.get("vex")
         img_vex_error = img.get("vex_error")
+        img_sbom_error = img.get("sbom_error")
+
+        if img_sbom_data is None:
+            # The adapter could not read the embedded document at all.
+            # The delivered payload stays represented - as a firmware
+            # component of unknown version, hung off the graph root -
+            # and the unreadable evidence becomes a composition finding,
+            # never a silently missing delivery-item part (ADR-0004).
+            _log(log, "warn", f"CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES: "
+                              f"cannot read SBOM for {img_name}: "
+                              f"{img_sbom_error or 'no document'}")
+            merge_defects.append({
+                "kind": "embedded-sbom-unusable",
+                "source": img_name,
+                "message": f"embedded image SBOM could not be read: "
+                           f"{img_sbom_error or 'no document'}",
+                "refs": [],
+            })
+            orphan_ref = str(uuid.uuid4())
+            orphan_comp = {"type": "firmware", "name": img_name,
+                           "version": "unknown", "bom-ref": orphan_ref}
+            if add_scopes:
+                orphan_comp["scope"] = "required"
+            sbom["components"].append(orphan_comp)
+            extra_seen_image_refs.add(orphan_ref)
+            directly_installed_component_refs.add(orphan_ref)
+            continue
+
 
         img_spec = img_sbom_data.get("specVersion")
         if img_spec and img_spec != spec_version:
