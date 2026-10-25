@@ -36,6 +36,14 @@ tools/kas`), and the wrapper's container-image version stays in
   is missing, e.g. `sudo apt-get install python3-jsonschema` or
   `python3 -m pip install jsonschema`.
 
+Additionally, `tests/integration/test_sbomqs_differential.py` is a
+maintainer-only differential check: when the external `sbomqs`
+validator binary is on PATH it compares sbomqs' structural verdict
+against the requirements matrix on representative documents; without
+the binary the tests skip. Disagreement fails only those
+differential-marked tests - the matrix owns our verdicts; a failure
+prompts review of the affected rows, never a silent verdict change.
+
 ## Invocation modes
 
 **Container mode** (the default, and what the probe always selects when
