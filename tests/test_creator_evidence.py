@@ -23,7 +23,8 @@ def test_explicit_primary_component_creator_names_the_product_manufacturer():
     docs, _logs = render_all(facts)
     component = docs["sbom"]["metadata"]["component"]
     assert component["author"] == "Acme GmbH"
-    assert component["contact"] == ["product@acme.example"]
+    assert component["authors"] == [
+        {"name": "Acme GmbH", "email": "product@acme.example"}]
     finding = finding_by_id(docs["report"], "REQ-COMP-012")
     assert finding["verdict"] == "asserted"
     assert finding["evidenceOrigin"] == "caller-assertion"
@@ -33,7 +34,7 @@ def test_missing_primary_component_creator_is_unmet_not_fabricated():
     docs, _logs = render_all(default_facts(config=profile_config()))
     component = docs["sbom"]["metadata"]["component"]
     assert "author" not in component
-    assert "contact" not in component
+    assert "authors" not in component
     finding = finding_by_id(docs["report"], "REQ-COMP-012")
     assert finding["verdict"] == "unmet"
 
@@ -50,7 +51,8 @@ def test_explicit_component_creator_override_wins_over_upstream_metadata():
     docs, _logs = render_all(facts)
     zlib = docs["sbom"]["components"][0]
     assert zlib["author"] == "Zlib upstream team"
-    assert zlib["contact"] == ["devel@zlib.example"]
+    assert zlib["authors"] == [
+        {"name": "Zlib upstream team", "email": "devel@zlib.example"}]
     finding = finding_by_id(docs["report"], "REQ-COMP-010")
     assert finding["verdict"] == "asserted"
     assert finding["evidenceOrigin"] == "caller-assertion"
@@ -67,7 +69,8 @@ def test_trustworthy_upstream_purl_records_the_creator_as_verified():
     docs, _logs = render_all(facts)
     openssl = docs["sbom"]["components"][0]
     assert openssl["author"] == "openssl"
-    assert openssl["contact"] == ["https://github.com/openssl/openssl"]
+    assert openssl["authors"] == [
+        {"name": "openssl", "url": "https://github.com/openssl/openssl"}]
     finding = finding_by_id(docs["report"], "REQ-COMP-010")
     assert finding["verdict"] == "verified"
     assert finding["evidenceOrigin"] == "upstream-metadata"
@@ -86,7 +89,8 @@ def test_trustworthy_vcs_reference_records_the_upstream_creator():
     docs, _logs = render_all(facts)
     gnutls = docs["sbom"]["components"][0]
     assert gnutls["author"] == "gnutls"
-    assert gnutls["contact"] == ["https://gitlab.com/gnutls/gnutls"]
+    assert gnutls["authors"] == [
+        {"name": "gnutls", "url": "https://gitlab.com/gnutls/gnutls"}]
 
 
 def test_unresolved_third_party_creator_is_unverifiable_not_manufacturer():
@@ -99,7 +103,7 @@ def test_unresolved_third_party_creator_is_unverifiable_not_manufacturer():
     docs, _logs = render_all(facts)
     busybox = docs["sbom"]["components"][0]
     assert "author" not in busybox
-    assert "contact" not in busybox
+    assert "authors" not in busybox
     finding = finding_by_id(docs["report"], "REQ-COMP-010")
     assert finding["verdict"] == "unverifiable"
     assert finding["bomRefs"] == ["ref-busybox"]
@@ -234,7 +238,7 @@ def test_equivalent_evidence_order_produces_identical_documents_and_report():
         meta_cyclonedx.serialize_report(second["report"])
     def creators(docs):
         return {component["name"]:
-                (component.get("author"), component.get("contact"))
+                (component.get("author"), component.get("authors"))
                 for component in docs["sbom"]["components"]}
     assert creators(first) == creators(second)
 
@@ -267,8 +271,8 @@ def test_sbom_creator_grammar_becomes_metadata_authors():
     )
     docs, _logs = render_all(facts)
     assert docs["sbom"]["metadata"]["authors"] == [
-        {"url": ["https://acme.example"]},
-        {"name": "Acme SBOM Team", "email": ["sbom@acme.example"]},
+        {"url": "https://acme.example"},
+        {"name": "Acme SBOM Team", "email": "sbom@acme.example"},
     ]
 
 

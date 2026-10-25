@@ -103,14 +103,17 @@ SKIP_HINT = (
 )
 
 
-#: CycloneDX schema validation uses the `jsonschema` library — an
-#: integration-layer-only dependency the unit suite never imports; the
-#: schema itself is vendored under tests/integration/vendor/cyclonedx.
+#: CycloneDX schema validation is feature-detected: the renderer degrades
+#: to `unverifiable` findings without the `jsonschema` library, which the
+#: unit suite never requires; the deployed-document oracle asserts real
+#: verdicts and skips with this hint when validation cannot run. The
+#: official schemas are vendored under lib/data/cyclonedx.
 JSONSCHEMA_HINT = (
     "the `jsonschema` Python package is not installed: install it for the "
-    "integration layer, e.g. `sudo apt-get install python3-jsonschema` or "
-    "`python3 -m pip install jsonschema` (integration-only dependency, "
-    "documented in docs/testing.md; unit runs never import it)"
+    "deployed-document validation tier, e.g. "
+    "`sudo apt-get install python3-jsonschema` or "
+    "`python3 -m pip install jsonschema` (optional dependency, documented "
+    "in docs/testing.md; unit runs never require it)"
 )
 
 #: The engine-override value selecting direct mode: the kas tool installed
