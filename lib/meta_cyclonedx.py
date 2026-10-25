@@ -860,6 +860,48 @@ def render(facts):
             dep_entry["dependsOn"] = sorted(
                 targets, key=lambda ref: (dep_rank.get(ref, len(dep_rank)), ref))
 
+    # CycloneDX composition data declares how complete the dependency
+    # evidence behind each component's graph entry is. Yocto facts decide
+    # the aggregate: usable debug-source records with nothing unresolved
+    # say complete, missing or inhibited debug information says unknown,
+    # and a reference that goes nowhere says incomplete. Unknown facts
+    # never become a complete declaration (ADR-0004).
+    debug_evidence_recipes = set()
+    for recipe, files in (facts.get("debug_sources") or {}).items():
+        for paths in (files or {}).values():
+            if isinstance(paths, str):
+                paths = paths.split()
+            if paths:
+                debug_evidence_recipes.add(recipe)
+                break
+    graph_node_refs = {comp.get("bom-ref") for comp in sbom["components"]}
+    graph_node_refs.add(metadata_component_ref)
+    entries_by_ref = {}
+    for dep_entry in sbom["dependencies"]:
+        entries_by_ref.setdefault(dep_entry.get("ref"), dep_entry)
+    declared_refs = set()
+    sbom["compositions"] = []
+    for component in sbom["components"]:
+        component_ref = component.get("bom-ref")
+        if not component_ref or component_ref in declared_refs:
+            continue
+        declared_refs.add(component_ref)
+        entry = entries_by_ref.get(component_ref)
+        targets = (entry or {}).get("dependsOn") or []
+        if any(target not in graph_node_refs for target in targets):
+            aggregate = "incomplete"
+        elif ref_recipes.get(component_ref) in debug_evidence_recipes:
+            aggregate = "complete"
+        else:
+            aggregate = "unknown"
+        composition = {"aggregate": aggregate, "assemblies": [component_ref]}
+        if entry is not None:
+            composition["dependencies"] = [{
+                "ref": entry["ref"],
+                "dependsOn": list(entry.get("dependsOn") or []),
+            }]
+        sbom["compositions"].append(composition)
+
     # Replace SBOM serial placeholder in VEX vulnerabilities
     # This must be done after all vulnerabilities are collected to ensure each image
     # gets its own SBOM serial number in multi-output builds (e.g., rootfs + initramfs)

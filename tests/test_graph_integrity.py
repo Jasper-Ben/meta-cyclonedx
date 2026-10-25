@@ -96,3 +96,62 @@ def test_own_and_unrepresented_debug_prefixes_add_no_edges_or_evidence():
     assert not [p for p in app.get("properties") or []
                 if p["name"] == "yocto:dependency:evidence"]
     assert "elsewhere" not in [c["name"] for c in sbom["components"]]
+
+
+def composition_for(sbom, ref):
+    matches = [c for c in sbom.get("compositions") or [] if ref in c["assemblies"]]
+    assert len(matches) == 1, f"expected exactly one composition for {ref}"
+    return matches[0]
+
+
+def test_compositions_declare_dependency_evidence_complete_from_debug_sources():
+    facts = default_facts(fragments={
+        "app": fragment(pkgs=[pkg("app", "1", "ref-app")],
+                        dependencies=[dep("ref-app", ["libother"])]),
+        "libother": fragment(pkgs=[pkg("libother", "2", "ref-lib")]),
+    }, image_install_recipes=["app"], debug_sources={
+        "app": {"/usr/bin/app": ["/usr/src/debug/app/1.0-r0/src/main.c"]},
+        "libother": {"/usr/lib/libother.so.2":
+                     ["/usr/src/debug/libother/2.0-r1/libother.c"]},
+    })
+    sbom, _vex, _logs = render_docs(facts)
+
+    assert composition_for(sbom, "ref-app")["aggregate"] == "complete"
+    assert composition_for(sbom, "ref-lib")["aggregate"] == "complete"
+
+
+def test_unknown_dependency_evidence_is_never_declared_complete():
+    # Without static-link evidence the graph structure alone says nothing
+    # about completeness: the composition must say unknown, not complete.
+    sbom, _vex, _logs = render_docs(default_facts())
+
+    assert composition_for(sbom, "ref-busybox")["aggregate"] == "unknown"
+
+
+def test_inhibited_debug_sources_declare_unknown_composition():
+    # INHIBIT_PACKAGE_DEBUG_SPLIT leaves a package without debug sources:
+    # honest unknown, never an absence-of-dependencies claim.
+    facts = default_facts(debug_sources={"busybox": {}})
+    sbom, _vex, _logs = render_docs(facts)
+
+    assert composition_for(sbom, "ref-busybox")["aggregate"] == "unknown"
+
+
+def test_compositions_mirror_the_dependency_entry_of_every_component():
+    facts = default_facts(fragments={
+        "app": fragment(pkgs=[pkg("app", "1", "ref-app")],
+                        dependencies=[dep("ref-app", ["busybox", "ghost"])]),
+        "busybox": fragment(pkgs=[pkg("busybox", "1.36", "ref-b")]),
+    }, debug_sources={
+        "app": {"/usr/bin/app": ["/usr/src/debug/app/1.0-r0/main.c"]},
+        "busybox": {"/bin/busybox": ["/usr/src/debug/busybox/1.36/main.c"]},
+    })
+    sbom, _vex, _logs = render_docs(facts)
+
+    ghost = component_by_name(sbom, "ghost")
+    app_comp = composition_for(sbom, "ref-app")
+    assert app_comp["dependencies"] == [{"ref": "ref-app",
+                                         "dependsOn": ["ref-b", ghost["bom-ref"]]}]
+    # The external component's own composition is honest about what the
+    # build cannot see: unknown, never complete.
+    assert composition_for(sbom, ghost["bom-ref"])["aggregate"] == "unknown"
