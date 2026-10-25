@@ -56,6 +56,10 @@ fragments             per-recipe normalized facts, keyed by recipe name, in
                       the on-disk partial-SBOM format written by
                       do_populate_cyclonedx: "pkgs", "cves", "dependencies",
                       "extra_components", "extra_dependencies", "extra_roots",
+                      plus "extra_bom_errors": rows {"file", "error"} for
+                      imported ecosystem BOM files the adapter could not
+                      read or attach in report enforcement (the graph is
+                      composed from what is usable; the rest is reported),
                       plus creator and URI evidence keys "creator",
                       "source_uri" and "deployable_uri" (grammar strings /
                       URIs; explicit overrides above recorded metadata),
@@ -74,9 +78,12 @@ debug_sources         recipe -> delivered file -> debug-source paths recorded
                       static coverage, never absent dependencies)
 included_images       ordered embedded-image documents:
     name                          recipe name of the included image
-    sbom                          its completed SBOM document
+    sbom                          its completed SBOM document, or None when
+                                  unreadable (see sbom_error)
     vex                           its completed VEX document, or None
     vex_error                     parse error text when unreadable, else None
+    sbom_error                    parse/availability error text when the
+                                  SBOM itself is unreadable, else absent
 """
 
 import copy

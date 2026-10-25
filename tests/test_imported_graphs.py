@@ -183,3 +183,42 @@ def test_strict_enforcement_fails_on_the_unusable_included_image():
 
     assert "failure" in docs
     assert "REQ-MERGE-001" in docs["failure"]["unmetRequirementIds"]
+
+
+def composition_for(sbom, ref):
+    matches = [c for c in sbom.get("compositions") or []
+               if ref in c["assemblies"]]
+    assert len(matches) == 1, f"expected exactly one composition for {ref}"
+    return matches[0]
+
+
+def three_module_graph():
+    mods = [{"bom-ref": f"cargo://m{i}", "type": "library", "name": f"m{i}",
+             "version": "1", "purl": f"pkg:cargo/m{i}@1"}
+            for i in range(3)]
+    edges = [{"ref": "cargo://m0", "dependsOn": ["cargo://m1"]},
+             {"ref": "cargo://m1", "dependsOn": ["cargo://m2"]}]
+    return default_facts(fragments={
+        "rust-app": fragment(pkgs=[pkg("rust-app", "1", "ref-r")],
+                             **contributed(mods, edges, ["cargo://m0"]))})
+
+
+def test_recursive_imported_graph_survives_several_levels():
+    # m0 -> m1 -> m2 stays a chain: the merge composes the imported
+    # resolution, it never flattens it onto the owner's level.
+    sbom, _vex, _logs = render_docs(three_module_graph())
+
+    assert dep_entry(sbom, "ref-r")["dependsOn"] == ["cargo://m0"]
+    assert dep_entry(sbom, "cargo://m0")["dependsOn"] == ["cargo://m1"]
+    assert dep_entry(sbom, "cargo://m1")["dependsOn"] == ["cargo://m2"]
+    assert dep_entry(sbom, "cargo://m2")["dependsOn"] == []
+
+
+def test_imported_subtree_composition_is_unknown_not_complete():
+    # The ecosystem BOM declares its own tree, but meta-cyclonedx cannot
+    # claim that resolution saw everything: without Yocto static-link
+    # evidence the aggregate stays unknown, never complete.
+    sbom, _vex, _logs = render_docs(three_module_graph())
+
+    assert composition_for(sbom, "cargo://m0")["aggregate"] == "unknown"
+    assert composition_for(sbom, "cargo://m2")["aggregate"] == "unknown"
