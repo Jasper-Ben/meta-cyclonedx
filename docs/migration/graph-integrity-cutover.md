@@ -1,8 +1,9 @@
 # Breaking change: core graph integrity cutover
 
 Audience: consumers diffing SBOMs across this upgrade and recipe authors.
-This fragment collects the observable dependency-graph changes for the
-final migration guidance (ticket #13 reuses it). Development branch only;
+This fragment collects the observable dependency-graph changes; the
+[consolidated migration guidance](tr-03183-alignment.md) links the
+fragments for consumers. Development branch only;
 isolated lossless-graph correctness fixes may be considered for Wrynose or
 Scarthgap only after separate risk assessment.
 
