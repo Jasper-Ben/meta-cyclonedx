@@ -1983,7 +1983,12 @@ python do_deploy_cyclonedx() {
 do_cyclonedx_complete[noexec] = "1"
 python () {
     if bb.data.inherits_class("image", d):
-        bb.build.addtask("do_deploy_cyclonedx", "do_image_complete", "do_image", d)
+        # The regeneration must observe the FINAL deploy directory: the
+        # dated image artifacts reach DEPLOY_DIR_IMAGE through
+        # do_image_complete's sstate installation, so the task runs
+        # after it; hashing before that step records the previous
+        # build's bytes for every artifact do_image_complete owns.
+        bb.build.addtask("do_deploy_cyclonedx", "do_build", "do_image_complete", d)
         complete_after = "do_deploy_cyclonedx"
         if cyclonedx_sbom_cve_check_enabled(d):
             complete_after = "do_cyclonedx_sbom_cve_check"

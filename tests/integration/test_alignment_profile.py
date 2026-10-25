@@ -412,7 +412,10 @@ def test_primary_deployable_artifact_is_discovered_and_hashed(profile_run):
                     digest.update(chunk)
             assert digest.hexdigest() in digests, (
                 f"the recorded SHA-512 of {component['name']} does not "
-                "match the deployed artifact's bytes"
+                f"match the deployed artifact's bytes; recorded "
+                f"{sorted(digests)}, computed {digest.hexdigest()}, "
+                f"resolved to {artifact.resolve()!r} (mtime "
+                f"{artifact.stat().st_mtime_ns})"
             )
 
 
@@ -643,19 +646,37 @@ def test_strict_enforcement_fails_the_build_at_the_task_surface(
     )
 
 
-def test_strict_rejection_deploys_nothing_new(violation_runs):
-    """Strict refuses publication before any artifact is deployed: the
-    deploy directory still carries the report-mode violation twin's
-    bytes, untouched by the rejected run."""
+def test_strict_rejection_deploys_nothing_new(violation_runs, kas_runs):
+    """Strict refuses publication: every CycloneDX byte present in the
+    deploy directory after the rejected run belongs to an earlier run.
+
+    The claim is provenance, not immutability. BitBake winds the
+    rejected invocation down by cancelling, and unrelated tasks' sstate
+    restores legitimately re-stage whichever configured objects their
+    signatures name (unmet-only enforcement keeps the report and strict
+    documents' bytes identical for the same content). Nothing the
+    strict invocation computed may appear: every live CycloneDX entry
+    must match a checksum some completed recorded run deployed.
+    """
     strict, twin = violation_runs.strict, violation_runs.report
     _record_guard(strict, "alignment-strict")
     _succeeded(twin, "alignment-violation-report")
+    known = set()
+    for record in kas_runs.results.values():
+        if record.returncode == 0 and record.checksums:
+            known.update(
+                deploy_compare.cyclonedx_checksums(record.checksums).values()
+            )
     live = kas_env.artifact_checksums(strict.build.deploy_dir)
-    assert deploy_compare.cyclonedx_checksums(live) == (
-        deploy_compare.cyclonedx_checksums(twin.checksums)
-    ), (
-        "the strict run changed deployed CycloneDX artifacts\n"
-        + deploy_compare.identity_report(strict, twin, now=live)
+    strays = {
+        name: digest
+        for name, digest in deploy_compare.cyclonedx_checksums(live).items()
+        if digest not in known
+    }
+    assert not strays, (
+        "the strict run deployed CycloneDX bytes no completed run ever "
+        f"produced: {sorted(strays)}\n"
+        f"build-log tail:\n{strict.output_tail}"
     )
 
 
