@@ -1023,14 +1023,62 @@ def _check_scope_of_delivery_resolution(context):
 
 
 def _check_static_link_coverage(context):
-    unknown = (context.get("graph") or {}).get("staticUnknownRefs") or []
-    if unknown:
-        return "unverifiable", ("debug-source records are missing or "
-                                "inhibited for these components, so static "
-                                "linking is unknown coverage, never an "
-                                "absence-of-dependencies claim"), unknown
+    """Coverage state of the pkgdata debug-source evidence lane; per
+    component, missing records already yield unverifiable compositions
+    (CycloneDX aggregate `unknown`), never absent claims (ADR-0004)."""
+    graph = context.get("graph") or {}
+    coverage = ((graph.get("dependencyEvidence") or {})
+                .get("pkgdataDebugSources") or {}).get("coverage")
+    unknown = graph.get("staticUnknownRefs") or []
+    if coverage == "partial" or unknown:
+        return ("unverifiable",
+                "pkgdata debug-source records cover only part of the "
+                "delivered recipes, so static linking for the rest is "
+                "unknown coverage, never an absence-of-dependencies "
+                "claim", unknown)
+    if coverage != "complete":
+        return ("unverifiable",
+                "the build recorded no usable pkgdata debug-source "
+                "records for the delivered recipes; static linking is "
+                "unknown coverage, never an absence-of-dependencies "
+                "claim")
     return "verified", ("every delivered recipe's pkgdata debug-source "
                         "records were consumed for static-link attribution")
+
+
+def _dependency_evidence_source(lane, verdict_of):
+    def check(context):
+        evidence = ((context.get("graph") or {}).get("dependencyEvidence")
+                    or {}).get(lane) or {}
+        return verdict_of(evidence.get("coverage"), evidence)
+    return check
+
+
+def _runtime_evidence_verdict(coverage, _evidence):
+    if coverage == "observed":
+        return ("verified", "Yocto runtime dependency metadata supplied "
+                            "observed installed-package edges for the "
+                            "dependency graph")
+    return ("unverifiable", "the build recorded no runtime dependency "
+                            "metadata; edges from that source are unknown "
+                            "coverage, never assumed")
+
+
+def _imported_evidence_verdict(coverage, evidence):
+    defects = evidence.get("defects") or 0
+    if coverage == "used":
+        message = ("imported ecosystem BOM graphs contributed their "
+                   "authored dependency structure to the graph")
+        if defects:
+            message += (f"; {defects} defective imported input(s) are "
+                        "judged by the composition finding, not hidden")
+        return "verified", message
+    message = ("no usable ecosystem BOM dependency graphs were imported "
+               "for this build; that source contributed no coverage")
+    if defects:
+        message += (f"; {defects} defective imported input(s) are judged "
+                    "by the composition finding, not hidden")
+    return "unverifiable", message
 
 
 def _check_reference_integrity(context):
@@ -1223,8 +1271,31 @@ TR03183_2_REQUIREMENTS = [
                    "dependencies)"),
         "representation": ("dependency edges derived from pkgdata "
                            "debug-source records, with evidence origin"),
-        "origin": "generated-document",
+        "origin": "recipe-metadata",
         "check": _check_static_link_coverage,
+    },
+    {
+        "id": "REQ-DEPS-006",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a74 (dependency graph) and "
+                   "\u00a75.2.2 (dependency evidence from the build)"),
+        "representation": ("the runtime dependency metadata source of the "
+                           "build reports its coverage of the dependency "
+                           "graph"),
+        "origin": "recipe-metadata",
+        "check": _dependency_evidence_source("yoctoRuntimeMetadata",
+                                             _runtime_evidence_verdict),
+    },
+    {
+        "id": "REQ-DEPS-007",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a74 (dependency graph) and "
+                   "\u00a75.2.2 (dependency evidence from imported "
+                   "ecosystem documents)"),
+        "representation": ("imported ecosystem BOM graphs report their "
+                           "coverage of the dependency graph; defective "
+                           "inputs stay visible"),
+        "origin": "upstream-metadata",
+        "check": _dependency_evidence_source("importedBomGraphs",
+                                             _imported_evidence_verdict),
     },
     {
         "id": "REQ-REF-001",

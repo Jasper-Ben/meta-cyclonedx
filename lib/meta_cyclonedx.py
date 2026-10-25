@@ -1732,6 +1732,28 @@ def render(facts):
 
     graph = _graph_evidence(sbom, metadata_component_ref, ref_recipes,
                             debug_evidence_recipes, merge_defects, log)
+    # Which dependency-evidence sources fed the graph, as coverage
+    # states the requirements matrix turns into verdicts: an absent
+    # source is unknown coverage, never a silent assumption that the
+    # dependency picture is complete (ADR-0004).
+    fragment_rows = [f for f in fragments.values() if isinstance(f, dict)]
+    imported_used = any(
+        f.get("extra_components") or f.get("extra_dependencies")
+        or f.get("extra_roots") for f in fragment_rows)
+    delivered_recipes = {r for r in ref_recipes.values() if r}
+    debug_covered = delivered_recipes & debug_evidence_recipes
+    graph["dependencyEvidence"] = {
+        "yoctoRuntimeMetadata": {
+            "coverage": "observed" if runtime_edges else "unavailable"},
+        "importedBomGraphs": {
+            "coverage": "used" if imported_used else "unavailable",
+            "defects": sum(len(f.get("extra_bom_errors") or [])
+                           for f in fragment_rows)},
+        "pkgdataDebugSources": {
+            "coverage": ("unavailable" if not debug_covered else
+                         "complete" if debug_covered == delivered_recipes
+                         else "partial")},
+    }
     if file_facts:
         graph["fileInventory"] = {"entries": [
             {key: artifact.get(key)
