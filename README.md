@@ -645,6 +645,29 @@ where applicable and a diagnostic message. Caller assertions can only ever
 produce `asserted` findings, never `verified` ones, and `unverifiable`
 findings never block the output.
 
+#### Validation Before Publication
+
+With a profile selected, every emitted document is validated before
+publication. Every check is a requirements-matrix row, so its verdict
+rides the alignment report and gates strict enforcement exactly like
+every other finding:
+
+- **Official CycloneDX schema.** Every emitted SBOM and VEX validates
+  against the official JSON schema of the selected CycloneDX version
+  (`REQ-FMT-002`, `REQ-FMT-003`). The official schemas are vendored
+  with the layer under `lib/data/cyclonedx/` (provenance and pin in
+  the README there); the `jsonschema` library is feature-detected. A
+  build host without it records `unverifiable` schema findings - a
+  validator that cannot run never reports a silent pass, and
+  `unverifiable` never blocks `strict` enforcement.
+- **Report enforcement publishes documents with findings** - that
+  includes a schema-invalid document: it is published with loud
+  `unmet` findings naming the violated schema locations, and the
+  finding keeps the alignment report honest about the defect. **Strict
+  enforcement refuses publication** of the same document before any
+  artifact is deployed. This split is deliberate: report mode exists
+  to make gaps visible in CI, strict mode to gate them.
+
 #### Creator and URI Evidence
 
 With a profile selected, the product integration supplies the creator

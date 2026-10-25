@@ -1005,12 +1005,14 @@ def _valid_uri(uri):
 
 
 def _parse_contacts(spec, log=None):
-    """Parse creator-contact grammar into sorted organizationalEntities.
+    """Parse creator-contact grammar into sorted organizationalContacts.
 
-    One entity per ';'-separated entry; each entry is
+    One contact per machine-actionable email address or URL, shaped the
+    way the CycloneDX schema's organizationalContact expects it (both
+    supported versions name the same `authors` fields); an entry is
     "NAME <EMAIL-or-URL>", "<URL>", a bare email address or a bare URL.
     An entry without a machine-actionable email or URL is rejected with a
-    warning and never emitted as contact data. Entities come back sorted
+    warning and never emitted as contact data. Contacts come back sorted
     so equivalent evidence always renders identical bytes.
     """
     entities = {}
@@ -1038,38 +1040,31 @@ def _parse_contacts(spec, log=None):
         entity[kind].add(value)
     contacts = []
     for name, found in entities.items():
-        entity = {}
-        if name:
-            entity["name"] = name
         for kind in ("email", "url"):
-            if found[kind]:
-                entity[kind] = sorted(found[kind])
-        contacts.append(entity)
-    contacts.sort(key=lambda entity: (entity.get("name", ""),
-                                      entity.get("email", []),
-                                      entity.get("url", [])))
+            contacts.extend({**({"name": name} if name else {}), kind: value}
+                            for value in sorted(found[kind]))
+    contacts.sort(key=lambda contact: (
+        contact.get("name", ""), contact.get("email", contact.get("url", ""))))
     return contacts
 
 
-def _creator_fields(entities):
-    """author and contact strings for a component from parsed contacts."""
-    author = next((entity["name"] for entity in entities if entity.get("name")),
-                  "")
-    component_contacts = sorted({contact
-                                 for entity in entities
-                                 for contact in entity.get("email", [])
-                                 + entity.get("url", [])})
-    return author, component_contacts
+def _apply_creator_identity(component, contacts):
+    """Stamp creator contacts onto a component; never overwrite claims.
 
-
-def _apply_creator_identity(component, entities):
-    """Stamp creator contacts onto a component; never overwrite claims."""
-    author, contacts = _creator_fields(entities)
-    if not contacts or component.get("author") or component.get("contact"):
+    Components carry creator contacts through the schema's `authors`
+    field (an organizationalContact array); the deprecated `author`
+    string is kept alongside for the name so readers of either field
+    find the same identity. A component that already names an author or
+    carries authors of its own keeps what it states (ADR-0006: creator
+    claims are never silently rewritten).
+    """
+    if not contacts or component.get("author") or component.get("authors"):
         return False
+    author = next((contact["name"] for contact in contacts
+                   if contact.get("name")), "")
     if author:
         component["author"] = author
-    component["contact"] = contacts
+    component["authors"] = [dict(contact) for contact in contacts]
     return True
 
 
@@ -1107,7 +1102,7 @@ def _upstream_creator_entities(component):
         host = match.group("host")
         owner, project = match.group("owner"), match.group("project")
     project = re.sub(r"\.git$", "", project)
-    return [{"name": owner, "url": [f"https://{host}/{owner}/{project}"]}]
+    return [{"name": owner, "url": f"https://{host}/{owner}/{project}"}]
 
 
 def _compatible_component_records(existing, candidate):
@@ -1299,7 +1294,7 @@ def render(facts):
             creator_override = _parse_contacts(pn_list.get("creator"), log)
             if creator_override:
                 _apply_creator_identity(pn_pkg, creator_override)
-            elif not pn_pkg.get("author") and not pn_pkg.get("contact"):
+            elif not pn_pkg.get("author") and not pn_pkg.get("authors"):
                 _apply_creator_identity(
                     pn_pkg, _upstream_creator_entities(pn_pkg))
 

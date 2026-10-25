@@ -1944,6 +1944,21 @@ do_populate_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/alignment_pr
 do_rootfs[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/alignment_profile.py:True"
 do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/alignment_profile.py:True"
 do_cyclonedx_sbom_cve_check[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/alignment_profile.py:True"
+# The schema-validation module and the vendored official schemas are read
+# by the renderer when documents are generated, so their bytes belong in
+# the generating tasks' signatures (do_rootfs runs do_export_cyclonedx).
+do_rootfs[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/schema_validation.py:True"
+do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/schema_validation.py:True"
+do_rootfs[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx/bom-1.6.schema.json:True"
+do_rootfs[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx/bom-1.7.schema.json:True"
+do_rootfs[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx/spdx.schema.json:True"
+do_rootfs[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx/jsf-0.82.schema.json:True"
+do_rootfs[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx/cryptography-defs.schema.json:True"
+do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx/bom-1.6.schema.json:True"
+do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx/bom-1.7.schema.json:True"
+do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx/spdx.schema.json:True"
+do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx/jsf-0.82.schema.json:True"
+do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx/cryptography-defs.schema.json:True"
 python do_cyclonedx_sbom_cve_check_setscene() {
     sstate_setscene(d)
 }

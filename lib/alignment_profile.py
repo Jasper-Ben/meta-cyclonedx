@@ -20,7 +20,37 @@ meta-cyclonedx uses this to produce an alignment report; it never labels an
 SBOM, product or manufacturer conformant with TR-03183-2 or the CRA.
 """
 
+import importlib
+import importlib.util
+import os
+import sys
 import urllib.parse
+
+
+def _schema_validation():
+    """
+    Load the shared CycloneDX schema-validation module that sits next to
+    this file. Under BitBake the layer's lib directory is not on the
+    worker's module search path, so fall back to loading by path, the way
+    this module itself is loaded. That module feature-detects the optional
+    jsonschema dependency and the vendored schemas: a validator that
+    cannot run yields `unverifiable` verdicts, never a silent pass.
+    """
+    module = sys.modules.get("cyclonedx_schema_validation")
+    if module is not None:
+        return module
+    try:
+        return importlib.import_module("schema_validation")
+    except ImportError:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "schema_validation.py")
+        spec = importlib.util.spec_from_file_location(
+            "cyclonedx_schema_validation", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["cyclonedx_schema_validation"] = module
+        spec.loader.exec_module(module)
+        return module
+
 
 # Evaluation rules return a verdict for one requirement against one
 # rendered document set; they live next to the rows they evaluate.
@@ -35,6 +65,36 @@ def _check_cyclonedx_format(context):
     return "unmet", (f"the SBOM is not a CycloneDX JSON document at spec "
                      f"version 1.6 or later (bomFormat {sbom.get('bomFormat')!r}, "
                      f"specVersion {version!r})")
+
+
+# Every emitted SBOM and VEX is validated against the official schema of
+# the selected CycloneDX version before publication.
+def _document_schema_check(kind_label, document_key):
+    def check(context):
+        status, diagnostics = _schema_validation().check(
+            context[document_key], context["spec_version"])
+        if status == "valid":
+            return ("verified",
+                    f"the emitted {kind_label} validates against the "
+                    f"official CycloneDX {context['spec_version']} JSON "
+                    "schema")
+        if status == "unavailable":
+            return ("unverifiable",
+                    f"schema validation of the {kind_label} cannot run "
+                    f"({diagnostics}); the document is not assumed valid")
+        return ("unmet",
+                f"the emitted {kind_label} violates the official "
+                f"CycloneDX {context['spec_version']} JSON schema: "
+                f"{diagnostics}")
+    return check
+
+
+def _check_sbom_schema(context):
+    return _document_schema_check("SBOM", "sbom")(context)
+
+
+def _check_vex_schema(context):
+    return _document_schema_check("VEX", "vex")(context)
 
 
 def _check_sbom_creator(context):
@@ -349,7 +409,7 @@ _applies_deployable_uris, _check_deployable_uris = _uri_field(
 
 def _check_primary_component_creator(context):
     primary = (context["sbom"].get("metadata") or {}).get("component") or {}
-    if primary.get("author") or primary.get("contact"):
+    if primary.get("author") or primary.get("authors"):
         return "asserted", ("the product integration asserts the primary "
                             "component creator; meta-cyclonedx cannot "
                             "independently verify the manufacturer's "
@@ -427,7 +487,7 @@ def _check_component_creators(context):
                   for component in context["sbom"].get("components") or []
                   if component.get("type") != "file"]
     missing = [component["bom-ref"] for component in components
-               if not component.get("author") and not component.get("contact")]
+               if not component.get("author") and not component.get("authors")]
     if missing:
         return ("unverifiable",
                 ("components carry no creator identifiable by email address "
@@ -699,6 +759,24 @@ TR03183_2_REQUIREMENTS = [
         "check": _check_cyclonedx_format,
     },
     {
+        "id": "REQ-FMT-002",
+        "source": ("BSI TR-03183-2 v2.1.0 §4 (CycloneDX format: schema-"
+                   "valid documents)"),
+        "representation": ("the SBOM validates against the official "
+                           "CycloneDX JSON schema of the selected version"),
+        "origin": "generated-document",
+        "check": _check_sbom_schema,
+    },
+    {
+        "id": "REQ-FMT-003",
+        "source": ("BSI TR-03183-2 v2.1.0 §4 (CycloneDX format: schema-"
+                   "valid documents)"),
+        "representation": ("the VEX validates against the official "
+                           "CycloneDX JSON schema of the selected version"),
+        "origin": "generated-document",
+        "check": _check_vex_schema,
+    },
+    {
         "id": "REQ-SBOM-001",
         "source": ("BSI TR-03183-2 v2.1.0 §5.2.1 (SBOM-level data fields: "
                    "creator of SBOM)"),
@@ -735,8 +813,8 @@ TR03183_2_REQUIREMENTS = [
         "id": "REQ-COMP-012",
         "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.2 (component-level data "
                    "fields: primary component creator)"),
-        "representation": ("metadata.component author or contact with an "
-                           "email address or URL"),
+        "representation": ("metadata.component authors contacts (or the "
+                           "author name) with an email address or URL"),
         "origin": "caller-assertion",
         "check": _check_primary_component_creator,
     },
@@ -955,9 +1033,10 @@ TR03183_2_REQUIREMENTS = [
         "id": "REQ-COMP-010",
         "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.2 (component-level data "
                    "fields: component creator)"),
-        "representation": ("component author or contact with an email "
-                           "address or URL, from an explicit override or "
-                           "trustworthy upstream identity metadata"),
+        "representation": ("component authors contacts with an email "
+                           "address or URL (organizationalContact), or "
+                           "the author name, from an explicit override "
+                           "or trustworthy upstream identity metadata"),
         "origin": "generated-document",
         "check": _check_component_creators,
     },
@@ -1023,7 +1102,7 @@ PROFILES = {
         "guideline": "BSI TR-03183-2",
         "guidelineVersion": "2.1.0",
         "propertyTaxonomyVersion": "0.1.2",
-        "requirementsMatrixVersion": "2.1.0-r7",
+        "requirementsMatrixVersion": "2.1.0-r8",
         "specVersions": ["1.6", "1.7"],
         "requirements": TR03183_2_REQUIREMENTS,
     },

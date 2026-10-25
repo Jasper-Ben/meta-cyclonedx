@@ -58,29 +58,25 @@ def _component_refs(sbom):
 
 
 def test_sbom_validates_against_vendored_cyclonedx_17_schema(
-    cold_run, cyclonedx_17_validator
+    cold_run, schema_validation
 ):
-    from tests.integration import schema_validation
-
     sbom = cold_run.sbom
     assert sbom.get("specVersion") == "1.7", (
         f"deployed SBOM declares specVersion {sbom.get('specVersion')!r}, "
         "not the CycloneDX 1.7 the vendored schema validates; build-log "
         f"tail:\n{cold_run.build.output_tail}"
     )
-    violations = list(cyclonedx_17_validator.iter_errors(sbom))
-    assert not violations, (
+    status, diagnostics = schema_validation.check(sbom, "1.7")
+    assert status == "valid", (
         f"deployed SBOM violates the vendored CycloneDX 1.7 schema:\n"
-        f"{schema_validation.describe_errors(violations)}\n"
+        f"{diagnostics}\n"
         f"build-log tail:\n{cold_run.build.output_tail}"
     )
 
 
 def test_vex_deployed_alongside_and_structurally_sound(
-    cold_run, cyclonedx_17_validator
+    cold_run, schema_validation
 ):
-    from tests.integration import schema_validation
-
     vex = cold_run.vex
     assert vex.get("specVersion") == "1.7", (
         f"deployed VEX declares specVersion {vex.get('specVersion')!r}, "
@@ -96,10 +92,10 @@ def test_vex_deployed_alongside_and_structurally_sound(
         "the deployed VEX correlates no vulnerabilities at all; build-log "
         f"tail:\n{cold_run.build.output_tail}"
     )
-    violations = list(cyclonedx_17_validator.iter_errors(vex))
-    assert not violations, (
+    status, diagnostics = schema_validation.check(vex, "1.7")
+    assert status == "valid", (
         f"deployed VEX violates the vendored CycloneDX 1.7 schema:\n"
-        f"{schema_validation.describe_errors(violations)}\n"
+        f"{diagnostics}\n"
         f"build-log tail:\n{cold_run.build.output_tail}"
     )
 
