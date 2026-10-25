@@ -66,8 +66,8 @@ def test_zero_exit_invocation_leaves_later_stages_unaffected(monkeypatch, tmp_pa
     recorder = recorder_with("cold", 0, deploy_dir(tmp_path))
     launched = []
 
-    def stream(command, env):
-        launched.append(command)
+    def stream(command, env, **stream_kwargs):
+        launched.append(stream_kwargs)
         return 0, FAILURE_LINES
 
     patch_stage_environment(monkeypatch, recorder, tmp_path, stream=stream)
@@ -75,6 +75,30 @@ def test_zero_exit_invocation_leaves_later_stages_unaffected(monkeypatch, tmp_pa
 
     assert launched, "the warm stage must still launch"
     assert record.returncode == 0
+
+
+def test_deliberate_failure_runs_are_not_harness_aborted(monkeypatch, tmp_path):
+    """An expected-failure invocation winds BitBake down itself.
+
+    A harness-side interrupt would kill in-flight sstate restores
+    mid-manifest and leave the deploy directory transitional, so the
+    recorder must disable first-failure aborting exactly for
+    expect_failure invocations and keep it everywhere else.
+    """
+    seen = []
+
+    def stream(command, env, *, abort_on_failure=True):
+        seen.append(abort_on_failure)
+        return 0, FAILURE_LINES
+
+    recorder = recorder_streaming(stream, tmp_path, monkeypatch)
+    recorder.invoke("alignment-report")
+    recorder.invoke("alignment-strict", expect_failure=True)
+
+    assert seen == [True, False], (
+        f"aborting must be on for ordinary runs and off for deliberate "
+        f"rejections, saw {seen}"
+    )
 
 
 def test_recorded_failure_is_not_relunched_under_its_own_name(monkeypatch, tmp_path):
@@ -107,8 +131,8 @@ def test_expected_failure_invocation_does_not_gate_later_stages(
     """
     launched = []
 
-    def stream(command, env):
-        launched.append(command)
+    def stream(command, env, **stream_kwargs):
+        launched.append(stream_kwargs)
         return (1 if len(launched) == 1 else 0), FAILURE_LINES
 
     recorder = recorder_streaming(stream, tmp_path, monkeypatch)
@@ -127,7 +151,7 @@ def test_unexpected_failure_gates_later_stages_despite_an_expected_one(
 ):
     """The exemption is per-record: accidental failures still gate."""
     recorder = recorder_streaming(
-        lambda command, env: (1, FAILURE_LINES), tmp_path, monkeypatch
+        lambda command, env, **kw: (1, FAILURE_LINES), tmp_path, monkeypatch
     )
     recorder.invoke("strict-violation", expect_failure=True)
     recorder.invoke("cold")
@@ -142,7 +166,7 @@ def test_expected_failure_that_unexpectedly_succeeds_gates_nothing(
 ):
     """A zero-exit expected-failure run is just a successful run to the gate."""
     recorder = recorder_streaming(
-        lambda command, env: (0, FAILURE_LINES), tmp_path, monkeypatch
+        lambda command, env, **kw: (0, FAILURE_LINES), tmp_path, monkeypatch
     )
     assert recorder.invoke("strict-violation", expect_failure=True).returncode == 0
     assert recorder.invoke("next-stage").returncode == 0
@@ -175,7 +199,7 @@ def test_profile_invocation_captures_the_alignment_report(monkeypatch, tmp_path)
         },
     )
     recorder = recorder_streaming(
-        lambda command, env: (0, FAILURE_LINES), tmp_path, monkeypatch
+        lambda command, env, **kw: (0, FAILURE_LINES), tmp_path, monkeypatch
     )
     record = recorder.invoke(
         "alignment-report", extra_env=kas_env.ALIGNMENT_REPORT_ENV
@@ -202,7 +226,7 @@ def test_plain_invocation_never_captures_a_stale_alignment_report(
         },
     )
     recorder = recorder_streaming(
-        lambda command, env: (0, FAILURE_LINES), tmp_path, monkeypatch
+        lambda command, env, **kw: (0, FAILURE_LINES), tmp_path, monkeypatch
     )
     record = recorder.invoke("warm")
 

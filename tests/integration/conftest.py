@@ -204,7 +204,7 @@ class KasRunRecorder:
         env["KAS_CONTAINER_ENGINE"] = self.engine
         command, env_extras = kas_env.kas_invocation(self.engine, extra_env=extra_env)
         env.update(env_extras)
-        returncode, lines = self._stream(command, env)
+        returncode, lines = self._stream(command, env, abort_on_failure=not expect_failure)
         build = KasBuildResult(
             engine=self.engine,
             returncode=returncode,
@@ -221,8 +221,16 @@ class KasRunRecorder:
         )
         return record
 
-    def _stream(self, command, env):
-        """Run *command*, echoing live (cold builds run for tens of minutes)."""
+    def _stream(self, command, env, abort_on_failure=True):
+        """Run *command*, echoing live (cold builds run for tens of minutes).
+
+        *abort_on_failure* watches for the first failed-task line and
+        interrupts the build group; a deliberate rejection run passes
+        False, because BitBake winds down its own scheduler on failure
+        and a harness-side SIGINT would kill in-flight sstate restores
+        mid-manifest, leaving the deploy directory transitional rather
+        than merely stale.
+        """
         proc = subprocess.Popen(
             command,
             cwd=kas_env.REPO_ROOT,
@@ -241,7 +249,7 @@ class KasRunRecorder:
                 lines.append(line)
                 sys.stderr.write(line)
                 sys.stderr.flush()
-                if _TASK_FAILURE.search(line) and not task_failed.is_set():
+                if abort_on_failure and _TASK_FAILURE.search(line) and not task_failed.is_set():
                     aborted.append(line)
                     task_failed.set()
 
