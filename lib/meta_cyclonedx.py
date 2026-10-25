@@ -76,6 +76,22 @@ debug_sources         recipe -> delivered file -> debug-source paths recorded
                       in pkgdata; prefixes of other recipes become statically
                       linked dependency edges (missing/empty = unknown
                       static coverage, never absent dependencies)
+file_inventory         recipe -> ordered delivered-file artifact facts,
+                      collected only while an alignment profile is
+                      selected and covering only mandatory files
+                      (executables and archives); each entry:
+    path                        delivered path inside the root filesystem
+    sha512                      SHA-512 of the delivered bytes (absent on
+                                defective entries)
+    executable / archive /
+      structured                taxonomy values (absent on defective
+                                entries)
+    error                       "missing", "unreadable" or
+                                "ambiguous-classification" (defective
+                                entries stay reported, never vanish)
+                      The adapter skips symlinks and other non-regular
+                      entries: their content identity belongs to the
+                      regular file they resolve to.
 included_images       ordered embedded-image documents:
     name                          recipe name of the included image
     sbom                          its completed SBOM document, or None when

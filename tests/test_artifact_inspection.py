@@ -148,3 +148,27 @@ def test_zstd_stream_is_an_archive_without_entry_metadata():
     assert verdict["mandatory"] is True
     assert verdict["archive"] == "archive"
     assert verdict["structured"] == "unstructured"
+
+
+def test_symlinks_are_not_inventoried_as_separate_artifacts():
+    # Decision: a symlink is a second name for an artifact, not an
+    # artifact; its content identity is carried by the regular file it
+    # resolves to, which the inventory covers as a delivered file. Even
+    # the always-0777 link mode bits never classify a link as executable.
+    verdict = CLASSIFY("/bin/sh", SYMLINK | 0o777, b"")
+    assert verdict["inventory"] is False
+    assert verdict["mandatory"] is False
+
+
+def test_directories_and_devices_are_not_inventoried():
+    assert CLASSIFY("/dev/null", 0o040000 | 0o755, b"")["inventory"] is False
+    assert CLASSIFY("/dev/ttyS0", 0o020000 | 0o660,
+                    b"")["inventory"] is False
+
+
+def test_empty_executable_file_is_a_valid_artifact():
+    verdict = CLASSIFY("/usr/bin/placeholder", REGULAR | 0o755, b"")
+    assert verdict["mandatory"] is True
+    assert verdict["executable"] == "executable"
+    assert verdict["structured"] == "unstructured"
+    assert "error" not in verdict
