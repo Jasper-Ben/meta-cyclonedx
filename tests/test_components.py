@@ -1,6 +1,7 @@
-"""Component inventory behavior: inclusion, ordering, scope, CPE deduplication."""
+"""Component inventory behavior: inclusion, ordering, scope, and CPE
+collisions that never deduplicate component instances."""
 
-from helpers import component_by_name, component_names, default_config, default_facts, dep, fragment, pkg, ref_of, render_docs
+from helpers import component_by_name, component_names, default_config, default_facts, dep, fragment, pkg, render_docs
 
 
 def test_all_recipe_components_appear_sorted_by_identity():
@@ -42,20 +43,22 @@ def test_scope_assignment_can_be_disabled():
     assert all("scope" not in c for c in sbom["components"])
 
 
-def test_recipes_sharing_a_cpe_collapse_to_one_component():
+def test_recipes_sharing_a_cpe_remain_separate_component_instances():
     shared_cpe = "cpe:2.3:*:*:widget:1.0:*:*:*:*:*:*:*"
     facts = default_facts(fragments={
         "widget-a": fragment(pkgs=[pkg("widget", "1.0", "ref-a", cpe=shared_cpe)]),
         "widget-b": fragment(pkgs=[pkg("widget", "1.0", "ref-b", cpe=shared_cpe)]),
     })
-    sbom, _vex, logs = render_docs(facts)
+    sbom, _vex, _logs = render_docs(facts)
 
-    assert component_names(sbom).count("widget") == 1
-    # first recipe (alphabetical) wins the surviving bom-ref
-    assert ref_of(sbom, "widget") == "ref-a"
+    widgets = [c for c in sbom["components"] if c["name"] == "widget"]
+    assert [c["bom-ref"] for c in widgets] == ["ref-a", "ref-b"]
+    assert all(c["cpe"] == shared_cpe for c in widgets)
 
 
-def test_dependency_on_a_dropped_duplicate_resolves_to_the_survivor():
+def test_dependency_resolves_to_the_instance_its_recipe_names():
+    # A dependency on widget-b reaches widget-b's instance even though
+    # widget-a contributes a colliding component of the same name.
     shared_cpe = "cpe:2.3:*:*:widget:1.0:*:*:*:*:*:*:*"
     facts = default_facts(fragments={
         "widget-a": fragment(pkgs=[pkg("widget", "1.0", "ref-a", cpe=shared_cpe)]),
@@ -66,24 +69,23 @@ def test_dependency_on_a_dropped_duplicate_resolves_to_the_survivor():
     sbom, _vex, _logs = render_docs(facts)
 
     entry = next(e for e in sbom["dependencies"] if e["ref"] == "ref-c")
-    assert entry["dependsOn"] == ["ref-a"]
+    assert entry["dependsOn"] == ["ref-b"]
 
 
-def test_recipe_level_dedup_map_redirects_its_own_dependency_edge():
+def test_colliding_instances_keep_their_own_dependency_entries():
+    shared_cpe = "cpe:2.3:*:*:widget:1.0:*:*:*:*:*:*:*"
     facts = default_facts(fragments={
-        "multi": fragment(
-            pkgs=[pkg("multi", "1", "ref-main"), pkg("multi-alias", "1", "ref-dup")],
-            dependencies=[dep("ref-dup", ["libc"])],
-            dedup={"ref-dup": "ref-main"}),
+        "widget-a": fragment(pkgs=[pkg("widget", "1.0", "ref-a", cpe=shared_cpe)],
+                             dependencies=[dep("ref-a", ["libc"])]),
+        "widget-b": fragment(pkgs=[pkg("widget", "1.0", "ref-b", cpe=shared_cpe)],
+                             dependencies=[dep("ref-b", ["libc"])]),
         "libc": fragment(pkgs=[pkg("libc", "2.40", "ref-libc")]),
     })
     sbom, _vex, _logs = render_docs(facts)
 
-    # The fragment owned its dependency entry under a dropped bom-ref; the
-    # graph must expose it once, under the surviving ref.
-    entries = [e for e in sbom["dependencies"] if e["ref"] == "ref-main"]
-    assert len(entries) == 1
-    assert entries[0]["dependsOn"] == ["ref-libc"]
+    for ref in ("ref-a", "ref-b"):
+        entry = next(e for e in sbom["dependencies"] if e["ref"] == ref)
+        assert entry["dependsOn"] == ["ref-libc"]
 
 
 def test_fragment_input_is_not_mutated():

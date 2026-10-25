@@ -343,6 +343,39 @@ Neither affects cross-image lookup. The included image can use a different
 If its internal image data is missing, a warning is emitted and the image
 is skipped without failing the export.
 
+### Logical Component Identity
+
+Each recipe contributes exactly one logical component: an independently
+assessable component instance with a creator-assigned name and version.
+The defaults are the recipe's `BPN` and `PV` (shortened: `+git...`
+suffixes are dropped), used only when semantically valid — a name-like
+and version-like value; degenerate values degrade to the `"unknown"`
+placeholder. Explicit overrides take precedence verbatim:
+
+```sh
+# Per-recipe, in the recipe or a .bbappend:
+CYCLONEDX_COMPONENT_NAME = "upstream-widget"
+CYCLONEDX_COMPONENT_VERSION = "2.4.1"
+```
+
+`CVE_PRODUCT` and `CVE_VERSION` are vulnerability-correlation aliases
+only: they never create or rename components. Every whitespace-separated
+alias token (including `vendor:`-qualified tokens, which qualify the
+correlation CPE) remains available in the component's
+`yocto:cve:product`, `yocto:cve:version` and `yocto:cve:cpe` properties,
+so all aliases keep reaching CVE and VEX matching. The Yocto/package
+identity of the build stays in the component purl (`pkg:yocto/...`,
+OpenEmbedded's purl prefix) alongside the logical identity.
+
+Two component instances that share a CPE are never deduplicated: they
+remain separate while their artifact, build, dependency, licence or
+vulnerability evidence differs; indistinguishable duplicates produce a
+`REQ-IDEN-001` alignment finding (see the alignment profile below) and a
+build warning. Backported fixes are recorded as VEX statements and never
+change the logical component version. See
+`docs/migration/component-identity-cutover.md` for the breaking change
+history.
+
 ### Component Scopes
 
 When including both runtime and build-time packages, meta-cyclonedx uses
@@ -727,6 +760,10 @@ CYCLONEDX_SPLIT_LICENSE_EXPRESSIONS = "1"
 # Space-separated "name=value" pairs attached to this recipe's components
 # as a CycloneDX properties array (default: "").
 CYCLONEDX_COMPONENT_PROPERTIES = ""
+
+# Explicit logical component identity overrides (default: "" = BPN/PV).
+CYCLONEDX_COMPONENT_NAME = ""
+CYCLONEDX_COMPONENT_VERSION = ""
 
 # CycloneDX 1.7 optional features
 CYCLONEDX_ADD_LICENSE_DETAILS = "1"  # Include license text for custom licenses

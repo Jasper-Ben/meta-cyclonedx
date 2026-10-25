@@ -3,13 +3,26 @@
 # SPDX-FileCopyrightText: Copyright (C) 2024 Savoir-faire Linux Inc. (<www.savoirfairelinux.com>).
 # SPDX-FileCopyrightText: Copyright (C) 2026 iris-GmbH infrared & intelligent sensors.
 
-# The product name that the CVE database uses.  Defaults to BPN, but may need to
-# be overriden per recipe (for example tiff.bb sets CVE_PRODUCT=libtiff).
+# Vulnerability-correlation aliases only (ADR-0006, ADR-0009): whitespace-
+# separated CVE_PRODUCT and CVE_VERSION values are used to match components
+# against CVE databases and CPEs; they never create or rename components.
+# Defaults to BPN and PV, but may need to be overriden per recipe (for
+# example tiff.bb sets CVE_PRODUCT=libtiff). Vendor-qualified tokens
+# ("vendor:name") carry the vendor into the correlation CPE.
 CVE_PRODUCT ??= "${BPN}"
 CVE_VERSION ??= "${PV}"
 
 # Set the update field in the CPE string. Defaults to "no applicable update value exists"
 CYCLONEDX_CPE_UPDATE ??= "-"
+# Logical component identity override: the creator-assigned upstream name
+# and version of the recipe's component. An explicit value takes
+# precedence verbatim; when empty, the renderer defaults to BPN and the
+# short PV, used only when they are semantically valid (degenerate values
+# degrade to the "unknown" placeholder). CVE_PRODUCT/CVE_VERSION remain
+# vulnerability-correlation aliases either way. See
+# docs/migration/component-identity-cutover.md.
+CYCLONEDX_COMPONENT_NAME ??= ""
+CYCLONEDX_COMPONENT_VERSION ??= ""
 
 # Defines SBOM_CVE_CHECK_DEPLOY_DB_DIR, used by the kernel CVE filtering below
 # to find the cvelist database deployed by sbom-cve-check-update-cvelist-native.
@@ -244,19 +257,16 @@ python do_populate_cyclonedx() {
         if pn.endswith(ignored_suffix):
             return
 
-    # get all CVE product names and version from the recipe
-    name = d.getVar("CVE_PRODUCT")
-    version = d.getVar("CVE_VERSION")
+    # One recipe is one independently assessable logical component with a
+    # creator-assigned identity (ADR-0006, ADR-0009). CVE_PRODUCT and
+    # CVE_VERSION feed the renderer only as vulnerability-correlation
+    # aliases; CYCLONEDX_COMPONENT_NAME/_VERSION override the logical
+    # identity explicitly, otherwise BPN and PV are the defaults.
     cpe_update = d.getVar("CYCLONEDX_CPE_UPDATE")
 
     # We create and populate a per-recipe partial sbom which will be added to the sstate cache
     pn_list = {}
-    pn_list["pkgs"] = []
     cves = []
-
-    # Track duplicate bom-refs that map to the same CPE
-    # This prevents self-dependencies when multiple packages share the same CPE
-    bom_ref_dedup_map = {}
 
     # The renderer owns component identity. The package URL and any
     # SRC_URI external references are artifact facts collected here.
@@ -267,50 +277,49 @@ python do_populate_cyclonedx() {
     references = (generate_source_references(d)
                   if d.getVar("CYCLONEDX_ADD_COMPONENT_SOURCE_REFERENCES") == "1" else None)
 
-    # append all defined package names for recipe to pn_list pkgs
-    for pkg in renderer.component_identity(name, version, cpe_update, purl, references):
-        # Check if we already have a package with this CPE
-        existing_pkg = next((c for c in pn_list["pkgs"] if c["cpe"] == pkg["cpe"]), None)
-        if existing_pkg:
-            # Map this bom-ref to the existing (canonical) bom-ref
-            bom_ref_dedup_map[pkg["bom-ref"]] = existing_pkg["bom-ref"]
-            continue
+    pkg = renderer.component_identity(
+        d.getVar("BPN"),
+        d.getVar("PV"),
+        purl,
+        cve_products=d.getVar("CVE_PRODUCT"),
+        cve_versions=d.getVar("CVE_VERSION"),
+        cpe_update=cpe_update,
+        name_override=d.getVar("CYCLONEDX_COMPONENT_NAME"),
+        version_override=d.getVar("CYCLONEDX_COMPONENT_VERSION"),
+        external_references=references)
 
-        if d.getVar("CYCLONEDX_ADD_COMPONENT_LICENSES") == "1":
-            bb.debug(2, f"Resolving licenses for {pkg['name']}")
-            licenses = resolve_license_data(d)
-            if len(licenses) != 0:
-                pkg["licenses"] = licenses
-            else:
-                bb.warn(f"LICENSE variable not set for package {pn}")
+    if d.getVar("CYCLONEDX_ADD_COMPONENT_LICENSES") == "1":
+        bb.debug(2, f"Resolving licenses for {pkg['name']}")
+        licenses = resolve_license_data(d)
+        if len(licenses) != 0:
+            pkg["licenses"] = licenses
+        else:
+            bb.warn(f"LICENSE variable not set for package {pn}")
 
-        custom_properties = get_custom_properties(d)
-        if custom_properties:
-            pkg["properties"] = custom_properties
+    custom_properties = get_custom_properties(d)
+    if custom_properties:
+        pkg.setdefault("properties", []).extend(custom_properties)
 
-        pn_list["pkgs"].append(pkg)
-        bom_ref = pkg["bom-ref"]
+    pn_list["pkgs"] = [pkg]
+    bom_ref = pkg["bom-ref"]
 
-        # append any CVEs either patched or taken from CVE_STATUS
-        patched_cves = get_patched_cves(d)
-        for cve_id, cve_info in patched_cves.items():
-            cve = (
-                cve_id,
-                cve_info["abbrev-status"],
-                cve_info["status"],
-                cve_info.get("justification", "")
-            )
-            renderer.add_status_vex_statement(
-                cve, cves, bom_ref, d.getVar("BPN"),
-                d.getVar('CYCLONEDX_SBOM_SERIAL_PLACEHOLDER'),
-                d.getVar('CYCLONEDX_ADD_VULN_TIMESTAMPS') == "1",
-                log=_cyclonedx_log)
+    # append any CVEs either patched or taken from CVE_STATUS
+    patched_cves = get_patched_cves(d)
+    for cve_id, cve_info in patched_cves.items():
+        cve = (
+            cve_id,
+            cve_info["abbrev-status"],
+            cve_info["status"],
+            cve_info.get("justification", "")
+        )
+        renderer.add_status_vex_statement(
+            cve, cves, bom_ref, d.getVar("BPN"),
+            d.getVar('CYCLONEDX_SBOM_SERIAL_PLACEHOLDER'),
+            d.getVar('CYCLONEDX_ADD_VULN_TIMESTAMPS') == "1",
+            log=_cyclonedx_log)
 
     # append any cve status within recipe to pn_list cves
     pn_list["cves"] = cves
-
-    # Store the deduplication map for use during deployment
-    pn_list["bom_ref_dedup_map"] = bom_ref_dedup_map
 
     # Add dependencies
     dependencies = []
@@ -466,6 +475,10 @@ list_buildtime_recipes[vardepsexclude] += "BB_TASKDEPDATA"
 addtask do_populate_cyclonedx before do_build after do_package do_packagedata
 do_populate_cyclonedx[cleandirs] = "${CYCLONEDX_PNDATA_WORKDIR}"
 do_populate_cyclonedx[vardeps] += "CVE_STATUS"
+# Logical component identity and its vulnerability-correlation aliases are
+# fragment inputs; a change to any of them must regenerate the fragment.
+do_populate_cyclonedx[vardeps] += "CVE_PRODUCT CVE_VERSION"
+do_populate_cyclonedx[vardeps] += "CYCLONEDX_COMPONENT_NAME CYCLONEDX_COMPONENT_VERSION"
 SSTATETASKS += "do_populate_cyclonedx"
 do_populate_cyclonedx[sstate-inputdirs] = "${CYCLONEDX_PNDATA_WORKDIR}"
 do_populate_cyclonedx[sstate-outputdirs] = "${CYCLONEDX_PNDATA}/${SSTATE_PKGARCH}"

@@ -55,12 +55,30 @@ def test_included_image_becomes_a_firmware_component_on_the_root():
     assert firmware["bom-ref"] in root_entry(sbom)["dependsOn"]
 
 
-def test_shared_cpe_components_stay_single_with_parent_identity():
+def test_same_identity_components_merge_onto_the_parent_instance():
+    # Same name, version and package purl: the very same component
+    # instance, so the included copy resolves to the parent's bom-ref.
+    # A shared CPE alone would not merge anything.
     sbom, _vex, _logs = render_docs(parent_facts(included_images=[included_image()]))
 
     assert component_by_name(sbom, "zlib")["bom-ref"] == "ref-z"
     # parent "required" outranks the included "excluded"
     assert component_by_name(sbom, "zlib")["scope"] == "required"
+
+
+def test_same_cpe_different_build_stays_separate_when_merged():
+    other = document(
+        INC_SERIAL,
+        components=[pkg("zlib", "1.3", "inc-z2", cpe=CPE_Z,
+                        purl="pkg:yocto/meta-independent/zlib@1.3")],
+        dependencies=[],
+        metadata_component={"bom-ref": "inc-meta", "type": "firmware",
+                            "name": "initramfs", "version": "2.0"})
+    sbom, _vex, _logs = render_docs(parent_facts(included_images=[
+        {"name": "initramfs", "sbom": other, "vex": None, "vex_error": None}]))
+
+    sharing = [c for c in sbom["components"] if c.get("cpe") == CPE_Z]
+    assert sorted(c["bom-ref"] for c in sharing) == ["inc-z2", "ref-z"]
 
 
 def test_unique_components_join_with_required_scope():

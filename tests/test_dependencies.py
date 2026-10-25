@@ -31,8 +31,9 @@ def test_recipe_name_token_resolves_to_the_recipe_components():
 
 
 def test_dependency_on_recipe_resolves_when_component_name_differs():
-    # A recipe named binutils whose components are named libb (CVE_PRODUCT):
-    # the dependency names the recipe, and reaches its component anyway.
+    # A recipe named binutils whose logical component is named libb
+    # (identity override): the dependency names the recipe, and reaches
+    # its component anyway.
     facts = default_facts(fragments={
         "app": fragment(pkgs=[pkg("app", "1", "ref-app")],
                         dependencies=[dep("ref-app", ["binutils"])]),
@@ -44,17 +45,18 @@ def test_dependency_on_recipe_resolves_when_component_name_differs():
     assert entry["dependsOn"] == ["ref-libb"]
 
 
-def test_dependency_token_reaches_every_alias_component_of_a_recipe():
+def test_dependency_token_resolves_to_the_recipes_single_logical_component():
+    # One recipe is one logical component (ADR-0006); the recipe token
+    # reaches exactly that component.
     facts = default_facts(fragments={
-        "alias-owner": fragment(
-            pkgs=[pkg("alias-a", "1", "ref-a1"), pkg("alias-b", "1", "ref-a2")]),
-        "consumer": fragment(pkgs=[pkg("consumer", "1", "ref-c")],
-                             dependencies=[dep("ref-c", ["alias-owner"])]),
+        "libc": fragment(pkgs=[pkg("glibc", "2.40", "ref-libc")],
+                         dependencies=[dep("ref-libc", ["app"])]),
+        "app": fragment(pkgs=[pkg("app", "1", "ref-app")]),
     })
     sbom, _vex, _logs = render_docs(facts)
 
-    entry = next(e for e in sbom["dependencies"] if e["ref"] == "ref-c")
-    assert sorted(entry["dependsOn"]) == ["ref-a1", "ref-a2"]
+    entry = next(e for e in sbom["dependencies"] if e["ref"] == "ref-libc")
+    assert entry["dependsOn"] == ["ref-app"]
 
 
 def test_dependency_on_a_recipe_outside_the_image_is_pruned():
