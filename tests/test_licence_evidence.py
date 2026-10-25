@@ -175,3 +175,47 @@ def test_effective_licence_is_omitted_and_not_applicable_by_default():
                    *docs["sbom"]["components"]]:
         assert not [p for p in holder.get("properties") or []
                     if p["name"] == meta_cyclonedx.EFFECTIVE_LICENCE_PROPERTY]
+
+
+def test_identified_boundary_components_are_exempt_from_licence_rows():
+    facts = default_facts(
+        config=profile_config(),
+        fragments={"busybox": fragment(
+            distribution_licence="MIT",
+            dependencies=[{"ref": "ref-busybox", "dependsOn": ["zlib"]}],
+            pkgs=[pkg("busybox", "1.36", "ref-busybox",
+                      licenses=[{"license": {"id": "MIT"},
+                                 "acknowledgement": "declared"}])])},
+        primary={"type": "firmware", "name": "core-image", "version": "1.0",
+                 "distribution_licence": "MIT",
+                 "licenses": [{"expression": "MIT",
+                               "acknowledgement": "declared"}]},
+    )
+    docs, _logs = render_all(facts)
+    boundary = [c for c in docs["sbom"]["components"] if c["name"] == "zlib"]
+    assert boundary
+    for requirement_id in ("REQ-COMP-011", "REQ-COMP-013"):
+        finding = finding_by_id(docs["report"], requirement_id)
+        assert finding["verdict"] in ("verified", "asserted"), requirement_id
+        assert "bomRefs" not in finding
+
+
+def test_strict_enforcement_passes_with_complete_licence_evidence():
+    facts = default_facts(
+        config=profile_config(enforcement="strict"),
+        fragments={"busybox": fragment(
+            distribution_licence="MIT",
+            pkgs=[pkg("busybox", "1.36", "ref-busybox",
+                      licenses=[{"license": {"id": "MIT"},
+                                 "acknowledgement": "declared"}])])},
+        primary={"type": "firmware", "name": "core-image", "version": "1.0",
+                 "distribution_licence": "MIT",
+                 "creator": "Acme GmbH <product@acme.example>",
+                 "licenses": [{"expression": "MIT",
+                               "acknowledgement": "declared"}]},
+        sbom_creator="sbom@acme.example",
+    )
+    docs, _logs = render_all(facts)
+    assert "failure" not in docs
+    assert finding_by_id(docs["report"], "REQ-COMP-011")["verdict"] == "asserted"
+    assert finding_by_id(docs["report"], "REQ-COMP-013")["verdict"] == "verified"
