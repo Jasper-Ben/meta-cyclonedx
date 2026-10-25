@@ -213,3 +213,59 @@ def test_file_components_never_borrow_logical_component_identity_evidence():
         finding = finding_by_id(docs["report"], requirement_id)
         assert sh["bom-ref"] not in finding.get("bomRefs", []), requirement_id
     assert file_components(sbom)[0]["bom-ref"] == sh["bom-ref"]
+
+
+def test_file_components_without_artifact_facts_are_unmet():
+    # A file component with no delivered-file fact behind it is an
+    # unverified claim; the fidelity row names it (REQ-FILE-001).
+    ghost = pkg("ghost.bin", "1.0", "ref-ghost", type="file",
+                hashes=[{"alg": "SHA-512", "content": "f" * 128}],
+                properties=[
+                    {"name": "bsi:component:filename", "value": "ghost.bin"},
+                    {"name": "bsi:component:executable", "value": "executable"},
+                    {"name": "bsi:component:archive", "value": "no archive"},
+                    {"name": "bsi:component:structured", "value": "unstructured"},
+                ])
+    facts = default_facts(
+        config=profile_config(),
+        fragments={"busybox": fragment(
+            pkgs=[pkg("busybox", "1.36", "ref-busybox"), ghost])},
+        file_inventory={"busybox": [file_entry("/bin/sh", sha512="a" * 128)]},
+    )
+    docs, _logs = render_all(facts)
+    finding = finding_by_id(docs["report"], "REQ-FILE-001")
+    assert finding["verdict"] == "unmet"
+    assert "ref-ghost" in finding["bomRefs"]
+    assert file_ref("busybox", "/bin/sh") not in finding["bomRefs"]
+
+
+def test_file_versions_follow_the_delivering_recipe_identity():
+    # Convention: an inventoried file carries the version of the logical
+    # component (creator-assigned identity) of the recipe that delivered
+    # it; artifact facts carry no separate version of their own.
+    facts = default_facts(
+        config=profile_config(),
+        fragments={"busybox": fragment(
+            pkgs=[pkg("busybox", "1.42.1", "ref-busybox")])},
+        file_inventory={"busybox": [file_entry("/bin/sh", sha512="a" * 128)]},
+    )
+    sbom, _vex, _logs = render_docs(facts)
+    assert file_component(sbom, "busybox", "/bin/sh")["version"] == "1.42.1"
+
+
+def test_files_of_recipes_without_a_logical_component_have_no_owner():
+    # Inventory facts for an unrepresented recipe cannot form an owning
+    # relationship: the file is still published and stays a finding.
+    facts = default_facts(
+        config=profile_config(),
+        file_inventory={"ghostly": [file_entry("/usr/bin/phantom",
+                                               sha512="a" * 128)]},
+    )
+    docs, _logs = render_all(facts)
+    sbom = docs["sbom"]
+    phantom = file_component(sbom, "ghostly", "/usr/bin/phantom")
+    assert phantom["version"] == "unknown"
+    finding = finding_by_id(docs["report"], "REQ-FILE-003")
+    assert finding["verdict"] == "unmet"
+    assert finding["bomRefs"] == [file_ref("ghostly", "/usr/bin/phantom")]
+    assert finding_by_id(docs["report"], "REQ-FILE-001")["verdict"] == "verified"
