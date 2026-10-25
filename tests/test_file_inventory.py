@@ -12,7 +12,6 @@ and artifact inspection never analyzes binary contents (ADR-0002).
 import copy
 import re
 
-import helpers
 import meta_cyclonedx
 from helpers import (affect_refs, default_facts, dep_entry,
                      file_components, file_entry, file_component, file_ref,
