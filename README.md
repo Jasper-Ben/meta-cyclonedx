@@ -457,6 +457,12 @@ The licenses data is taken from the component recipe
 Single licenses are matched against a list of [known SPDX licenses](/https://github.com/iris-GmbH/meta-cyclonedx/tree/main/meta/files/spdx-license-list-data)
 where possible.
 
+These are original licence evidence only - the licences the component
+creator assigned, carried with the CycloneDX acknowledgement `declared`.
+The distribution and effective licence roles and their authoritative
+sources are documented under "Licence Roles" in the alignment profile
+section below.
+
 If multiple licenses are specified using `&` or `|`, the license is converted
 into a [SPDX license expression](https://spdx.github.io/spdx-spec/v2.3/SPDX-license-expressions/#).
 
@@ -680,6 +686,36 @@ emitted URI is syntax-validated; recorded URIs that fail validation are
 not emitted and are reported as `unmet`. Equivalent normalized evidence
 always produces identical creator, URI and report output.
 
+#### Licence Roles
+
+Recipe `LICENSE` metadata is **original licence** evidence - the
+licences assigned by a component's creator - and is represented as
+CycloneDX `licenses` entries with the `declared` acknowledgement. The
+other two licence roles exist only when the product integration
+supplies them explicitly and are never inferred from `LICENSE` or from
+each other:
+
+```python
+# The licence under which recipients may use the component; an SPDX
+# licence expression, the explicitly identified semantically
+# authoritative source (recipe scope: components built here; image
+# scope: the delivered product).
+CYCLONEDX_DISTRIBUTION_LICENCE = "MIT"
+
+# The licence under which the creator of this SBOM uses the component;
+# optional, represented with the bsi:component:effectiveLicence
+# property only where supplied.
+CYCLONEDX_EFFECTIVE_LICENCE = ""
+```
+
+The generator performs no legal or composition analysis: expressions
+are validated as SPDX licence syntax, licence roles are never converted
+into one another, and missing required original or distribution licence
+evidence is reported as `unmet` instead of relabelling available
+metadata (ADR-0003). Assertion-evidenced licence requirements stay
+`asserted` in the alignment report; they are never upgraded to
+`verified`.
+
 The versioned mapping from each baseline requirement to its CycloneDX
 representation and evaluation rule is project-owned data in
 `lib/alignment_profile.py`; an existing profile never floats to a newer
@@ -687,8 +723,8 @@ guideline, taxonomy or schema version.
 
 Note: at this stage the profile's requirements matrix covers the
 TR-03183-2 v2.1.0 data-field and dependency-graph baseline; requirements
-whose generator support arrives with later alignment work (file inventory,
-creator and licence evidence) are reported as `unmet` under `report`
+whose generator support arrives with later alignment work (the
+file-component inventory) are reported as `unmet` under `report`
 enforcement, so `strict` enforcement currently fails until that work has
 landed. Where the build itself cannot establish completeness (component
 discovery, dependency depth beyond the scope of delivery, missing debug

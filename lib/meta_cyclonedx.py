@@ -39,6 +39,14 @@ primary               the delivered product:
                                   creator of the delivered product
     source_uri / deployable_uri   optional explicit URIs for the primary
                                   component (source and deployable form)
+    licenses                      optional original licence entries for the
+                                  delivered product (its recipe LICENSE)
+    distribution_licence          optional SPDX expression; the explicitly
+                                  identified authoritative distribution
+                                  licence source of the delivered product
+    effective_licence             optional SPDX expression; the effective
+                                  licence the SBOM creator supplies for the
+                                  delivered product
 sbom_creator            creator-contact grammar string naming the entity
                         responsible for compiling this SBOM; entries are
                         separated by ';' and each entry is
@@ -50,7 +58,11 @@ fragments             per-recipe normalized facts, keyed by recipe name, in
                       "extra_components", "extra_dependencies", "extra_roots",
                       plus creator and URI evidence keys "creator",
                       "source_uri" and "deployable_uri" (grammar strings /
-                      URIs; explicit overrides above recorded metadata)
+                      URIs; explicit overrides above recorded metadata),
+                      plus licence-role evidence keys
+                      "distribution_licence" and "effective_licence" (SPDX
+                      expressions; the component "licenses" entries are
+                      original licence evidence only)
 runtime_recipes       recipe names whose components are "required"
 image_install_recipes recipe names installed by image author intent; their
                       components hang directly off the graph root
@@ -210,6 +222,126 @@ DEPENDENCY_EVIDENCE_PROPERTY = "yocto:dependency:evidence"
 # keeps it distinct from delivered component instances — and resolution
 # stops there unless deeper evidence exists (ADR-0004, never a silent drop).
 DELIVERY_SCOPE_PROPERTY = "yocto:delivery:scope"
+
+
+# Licence roles (BSI TR-03183-2 v2.1.0 §3.2.8 and the §8.2 mapping
+# tables): ORIGINAL licences are the licences assigned by the component
+# creator and ride the CycloneDX licences field with acknowledgement
+# "declared"; DISTRIBUTION licences ("concluded") are the licences under
+# which a recipient may use the component and require a semantically
+# authoritative source; the EFFECTIVE licence is the licence under which
+# the creator of the current SBOM uses the component and rides the
+# official BSI property. The property name follows the pinned property
+# taxonomy v0.1.2 registry spelling ("Licence"); the TR-03183-2 v2.1.0
+# PDF tables carry a "License" variant of the same property. The
+# generator performs no legal or composition analysis and never derives
+# one licence role from another (ADR-0003).
+EFFECTIVE_LICENCE_PROPERTY = "bsi:component:effectiveLicence"
+ORIGINAL_LICENCE_ACKNOWLEDGEMENT = "declared"
+DISTRIBUTION_LICENCE_ACKNOWLEDGEMENT = "concluded"
+
+# A distribution or effective licence fact must be a syntactically valid
+# SPDX licence expression (TR-03183-2 v2.1.0 §6.1): licence identifiers
+# combined with the AND, OR and WITH operators and parentheses. This is
+# pure syntax; the generator draws no conclusion about the identifiers'
+# legal relationship and infers no licence role from another.
+SPDX_LICENCE_ID_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9.\-+]*")
+
+
+def _spdx_expression_is_valid(expression):
+    """True when the string parses as an SPDX licence expression."""
+    if not isinstance(expression, str) or not expression.strip():
+        return False
+    expect_operand = True
+    after_identifier = False
+    depth = 0
+    for token in re.findall(r"\(|\)|\S+", expression):
+        if token == "(":
+            if not expect_operand:
+                return False
+            depth += 1
+            expect_operand = True
+        elif token == ")":
+            if expect_operand or depth == 0:
+                return False
+            depth -= 1
+            expect_operand = False
+            after_identifier = False
+        elif token in ("AND", "OR"):
+            if expect_operand:
+                return False
+            expect_operand = True
+            after_identifier = False
+        elif token == "WITH":
+            if expect_operand or not after_identifier:
+                return False
+            expect_operand = True
+        elif expect_operand and SPDX_LICENCE_ID_TOKEN.fullmatch(token):
+            expect_operand = False
+            after_identifier = True
+            continue
+        else:
+            return False
+        after_identifier = False
+    return not expect_operand and depth == 0
+
+
+def _apply_distribution_licence(component, expression, log, holder):
+    """Append an explicitly supplied distribution licence entry."""
+    if not _spdx_expression_is_valid(expression):
+        _log(log, "warn", f"{holder}: distribution licence {expression!r} "
+                           f"is not a valid SPDX licence expression; "
+                           f"omitted")
+        return
+    component.setdefault("licenses", []).append(
+        {"expression": expression,
+         "acknowledgement": DISTRIBUTION_LICENCE_ACKNOWLEDGEMENT})
+
+
+def _apply_effective_licence(component, expression, log, holder):
+    """Attach an explicitly supplied effective licence property once."""
+    if not _spdx_expression_is_valid(expression):
+        _log(log, "warn", f"{holder}: effective licence {expression!r} is "
+                           f"not a valid SPDX licence expression; omitted")
+        return
+    properties = component.setdefault("properties", [])
+    if any(p.get("name") == EFFECTIVE_LICENCE_PROPERTY
+           for p in properties):
+        return
+    properties.append({"name": EFFECTIVE_LICENCE_PROPERTY,
+                       "value": expression})
+
+
+
+def _apply_licence_evidence(component, evidence, log, holder):
+    """Attach explicitly supplied distribution and effective licences.
+
+    Both roles exist only from a semantically authoritative source the
+    product integration supplied; neither is ever derived from original
+    licence evidence (ADR-0003).
+    """
+    if evidence.get("distribution_licence"):
+        _apply_distribution_licence(component,
+                                    evidence["distribution_licence"],
+                                    log, holder)
+    if evidence.get("effective_licence"):
+        _apply_effective_licence(component, evidence["effective_licence"],
+                                 log, holder)
+
+
+def _mark_original_licences(component):
+    """Make the original licence role explicit on every licence entry.
+
+    Recipe LICENSE metadata is original licence evidence only; entries
+    that already carry an acknowledgement keep whatever role the
+    document states, and none is ever rewritten into another.
+    """
+    for entry in component.get("licenses") or []:
+        if "acknowledgement" in entry:
+            continue
+        target = entry["license"] if isinstance(entry.get("license"),
+                                                 dict) else entry
+        target.setdefault("acknowledgement", ORIGINAL_LICENCE_ACKNOWLEDGEMENT)
 
 
 def _identified_component(recipe_name, add_scope):
@@ -739,12 +871,18 @@ def render(facts):
         sbom_metadata["component"]["externalReferences"] = primary["external_references"]
     _apply_creator_identity(
         sbom_metadata["component"], _parse_contacts(primary.get("creator"), log))
+    if primary.get("licenses"):
+        sbom_metadata["component"]["licenses"] = copy.deepcopy(
+            primary["licenses"])
     for reference_key, reference_type in (("source_uri", "vcs"),
                                           ("deployable_uri", "distribution")):
         if primary.get(reference_key):
             sbom_metadata["component"].setdefault(
                 "externalReferences", []).append(
                     {"type": reference_type, "url": primary[reference_key]})
+    _mark_original_licences(sbom_metadata["component"])
+    _apply_licence_evidence(sbom_metadata["component"], primary, log,
+                            "primary component")
 
     sbom = {
         "bomFormat": "CycloneDX",
@@ -844,6 +982,12 @@ def render(facts):
                     pn_pkg.setdefault("externalReferences", []).append(
                         {"type": reference_type,
                          "url": pn_list[reference_key]})
+
+            # Recipe LICENSE metadata enters the document only as
+            # original licence evidence; its role is made explicit here
+            # and never rewritten into another role (ADR-0003).
+            _mark_original_licences(pn_pkg)
+            _apply_licence_evidence(pn_pkg, pn_list, log, pkg)
 
             if pkg in image_install_recipes and pn_pkg.get("bom-ref"):
                 directly_installed_component_refs.add(pn_pkg["bom-ref"])
