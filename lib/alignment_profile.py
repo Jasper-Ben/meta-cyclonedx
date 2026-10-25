@@ -875,11 +875,77 @@ def _check_effective_licences(context):
 
 
 def _check_no_vulnerability_data_in_sbom(context):
-    if "vulnerabilities" in context["sbom"]:
-        return "unmet", ("the SBOM embeds vulnerability records; vulnerability "
-                         "status belongs in the separate VEX document")
-    return "verified", ("the SBOM carries no vulnerability data; status lives "
-                        "in the separate VEX document")
+    """Vulnerability data may hide at any depth: a top-level key, an
+    embedded image subtree copied verbatim into a component, a nested
+    components[] entry. The renderer copies foreign subtrees verbatim
+    (never repairs them), so the scan is document-wide."""
+    occurrences = _vulnerability_nodes(context["sbom"])
+    offenders = sorted({ref for ref, _node in occurrences if ref})
+    if offenders or any(ref is None for ref, _node in occurrences):
+        message = ("the SBOM embeds vulnerability records at one or more "
+                   "places; vulnerability status belongs in the separate "
+                   "VEX document")
+        if offenders:
+            message += " - within components " + ", ".join(offenders)
+        return "unmet", message, offenders
+    return ("verified", "the SBOM carries no vulnerability data at any "
+                        "depth; status lives in the separate VEX document")
+
+
+def _vulnerability_nodes(node, current_ref=None, seen=None):
+    """(owning bom-ref, value) for every `vulnerabilities` subtree in
+    the document, at any depth."""
+    if seen is None:
+        seen = set()
+    found = []
+    if id(node) in seen:
+        return found
+    seen.add(id(node))
+    if isinstance(node, dict):
+        ref = node.get("bom-ref") or current_ref
+        if "vulnerabilities" in node:
+            found.append((ref, node["vulnerabilities"]))
+        for value in node.values():
+            found.extend(_vulnerability_nodes(value, ref, seen))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_vulnerability_nodes(item, current_ref, seen))
+    return found
+
+
+def _check_vex_targets_logical_components(context):
+    """Every VEX assertion must resolve to a logical component of the
+    product SBOM; files are delivery detail, never vulnerability
+    subjects."""
+    components = {ref: component
+                  for ref, component in _taxonomy_property_holders(
+                      context["sbom"]) if ref}
+    dangling = set()
+    file_targets = set()
+    for statement in (context.get("vex") or {}).get(
+            "vulnerabilities") or []:
+        for affect in statement.get("affects") or []:
+            ref = affect.get("ref")
+            if not isinstance(ref, str) or not ref:
+                continue
+            ref = ref.rpartition("#")[2] or ref
+            component = components.get(ref)
+            if component is None:
+                dangling.add(ref)
+            elif component.get("type") == "file":
+                file_targets.add(ref)
+    if dangling or file_targets:
+        problems = []
+        if dangling:
+            problems.append("reference(s) that the SBOM does not define")
+        if file_targets:
+            problems.append("assertion(s) against file components, which "
+                            "are delivery detail and not vulnerability "
+                            "subjects")
+        return ("unmet", "the VEX carries " + " and ".join(problems),
+                sorted(dangling | file_targets))
+    return ("verified", "every VEX assertion resolves to a logical "
+                        "component of the product SBOM")
 
 
 def _check_logical_identity_collisions(context):
@@ -1417,6 +1483,17 @@ TR03183_2_REQUIREMENTS = [
                            "only"),
         "origin": "generated-document",
         "check": _check_no_vulnerability_data_in_sbom,
+    },
+    {
+        "id": "REQ-VULN-002",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a73.1 (vulnerability status "
+                   "assessed against the product's logical components) and "
+                   "\u00a75.2.2 (file components as delivery detail)"),
+        "representation": ("every VEX affects reference resolves to a "
+                           "logical (non-file) component of the product "
+                           "SBOM"),
+        "origin": "generated-document",
+        "check": _check_vex_targets_logical_components,
     },
 ]
 

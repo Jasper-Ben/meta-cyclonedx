@@ -677,6 +677,12 @@ every other finding:
   (`REQ-IDEN-003`), and every SHA-512 is lowercase hex of 512 bits
   riding `components[].hashes[]` under the `SHA-512` algorithm
   (`REQ-IDEN-004`).
+- **Vulnerability separation.** No vulnerability data hides anywhere in
+  the SBOM - a document-wide scan catches embedded or nested records
+  the renderer copied verbatim (`REQ-VULN-001`) - and every VEX
+  assertion resolves to a logical, non-file component of the product:
+  files are delivery detail, never vulnerability subjects
+  (`REQ-VULN-002`).
 - **Report enforcement publishes documents with findings** - that
   includes a schema-invalid document: it is published with loud
   `unmet` findings naming the violated schema locations, and the
