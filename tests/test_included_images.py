@@ -1,8 +1,8 @@
 """Embedded image composition: CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES merging."""
 
 from helpers import (affect_refs, component_by_name, default_facts, document,
-                     fragment, pkg, ref_of, render_docs, root_entry, vuln,
-                     vex_document)
+                     finding_by_id, fragment, pkg, profile_config, ref_of,
+                     render_all, render_docs, root_entry, vuln, vex_document)
 
 INC_SERIAL = "11111111-2222-3333-4444-555555555555"
 CPE_Z = "cpe:2.3:*:*:zlib:1.3:*:*:*:*:*:*:*"
@@ -146,12 +146,112 @@ def test_missing_included_vex_skips_only_the_vex_merge():
     assert vex["vulnerabilities"] == []
 
 
-def test_unparseable_included_vex_is_warned_and_skipped():
+def test_unparseable_included_vex_is_reported_not_silently_skipped():
+    # The image's SBOM still merges and its VEX statements cannot be
+    # salvaged, but the loss is an explicit composition finding now -
+    # report enforcement publishes it, strict enforcement rejects it.
     entry = included_image()
     entry["vex"] = None
     entry["vex_error"] = "Expecting value: line 1 column 1 (char 0)"
-    _sbom, vex, logs = render_docs(parent_facts(included_images=[entry]))
+    facts = parent_facts(config=profile_config(), included_images=[entry])
+    docs, logs = render_all(facts)
 
     assert any(level == "warn" and "cannot parse VEX" in message
                for level, message in logs)
-    assert vex["vulnerabilities"] == []
+    assert docs["vex"]["vulnerabilities"] == []
+    assert component_by_name(docs["sbom"], "busybox")
+    finding = finding_by_id(docs["report"], "REQ-MERGE-001")
+    assert finding["verdict"] == "unmet"
+
+
+def test_included_component_with_conflicting_ref_and_other_instance_is_kept():
+    # The image's openssl happens to reuse a bom-ref the parent minted
+    # for its app component. It is a different component instance, so it
+    # must not be dropped to tidy the merged document: both components
+    # are published and the duplicate ref becomes a finding (ADR-0004).
+    other = document(
+        INC_SERIAL,
+        components=[pkg("openssl", "3.0", "ref-app")],
+        dependencies=[],
+        metadata_component={"bom-ref": "inc-meta", "type": "firmware",
+                            "name": "initramfs", "version": "2.0"})
+    facts = parent_facts(config=profile_config(),
+                         included_images=[{"name": "initramfs",
+                                           "sbom": other, "vex": None,
+                                           "vex_error": None}])
+    docs, _logs = render_all(facts)
+
+    colliding = [c for c in docs["sbom"]["components"]
+                 if c["bom-ref"] == "ref-app"]
+    assert sorted(c["name"] for c in colliding) == ["app", "openssl"]
+    finding = finding_by_id(docs["report"], "REQ-REF-001")
+    assert finding["verdict"] == "unmet"
+    assert "ref-app" in finding["bomRefs"]
+
+
+def test_reconciled_instance_keeps_licence_evidence_from_both_documents():
+    # Same instance (name, version, purl) but the embedded document
+    # carries licence evidence the parent's copy lacks. Reconciling the
+    # instances must union the evidence, not discard the image's view.
+    entry = included_image()
+    entry["sbom"]["components"][0]["licenses"] = [{"license": {"id": "Zlib"}}]
+    sbom, _vex, _logs = render_docs(parent_facts(included_images=[entry]))
+
+    zlib = component_by_name(sbom, "zlib")
+    assert zlib["bom-ref"] == "ref-z"
+    assert {"license": {"id": "Zlib"}} in zlib["licenses"]
+
+
+def test_included_vex_statement_with_a_different_analysis_stays_separate():
+    # Parent and image analyse the same CVE differently for different
+    # instances. Folding affects may only unify statements that analyse
+    # identically; a distinct analysis is a distinct statement and must
+    # survive the merge (no lost statements).
+    parent_vuln = vuln("CVE-2024-9", "ref-app", state="resolved")
+    entry = included_image(vex=vex_document([{
+        "id": "CVE-2024-9",
+        "source": {"name": "NVD",
+                   "url": "https://nvd.nist.gov/vuln/detail/CVE-2024-9"},
+        "analysis": {"state": "unresolved", "detail": ""},
+        "affects": [{"ref": f"urn:cdx:{INC_SERIAL}/1#inc-u"}],
+    }]))
+    facts = parent_facts(included_images=[entry], fragments={
+        "zlib": fragment(pkgs=[pkg("zlib", "1.3", "ref-z", cpe=CPE_Z)]),
+        "app": fragment(pkgs=[pkg("app", "1.0", "ref-app")],
+                        cves=[parent_vuln]),
+    }, runtime_recipes=["zlib", "app"], image_install_recipes=["app"])
+    sbom, vex, _logs = render_docs(facts)
+
+    statements = [v for v in vex["vulnerabilities"]
+                  if v["id"] == "CVE-2024-9"]
+    assert len(statements) == 2
+    states = {v["analysis"]["state"] for v in statements}
+    assert states == {"resolved", "unresolved"}
+    unresolved = next(v for v in statements
+                      if v["analysis"]["state"] == "unresolved")
+    serial = sbom["serialNumber"].removeprefix("urn:uuid:")
+    assert affect_refs(unresolved) == [f"urn:cdx:{serial}/1#inc-u"]
+
+
+def test_included_image_without_metadata_root_is_found_and_dangling():
+    # A parseable image SBOM whose metadata.component root is absent:
+    # the graph cannot silently re-home its edges. The dangling root
+    # reference and the composition finding make the malformed input
+    # visible instead.
+    other = document(
+        INC_SERIAL,
+        components=[pkg("busybox", "1.36", "inc-u")],
+        dependencies=[{"ref": "inc-meta", "dependsOn": ["inc-u"]}],
+        metadata_component=None)
+    facts = parent_facts(config=profile_config(),
+                         included_images=[{"name": "initramfs",
+                                           "sbom": other, "vex": None,
+                                           "vex_error": None}])
+    docs, _logs = render_all(facts)
+
+    assert component_by_name(docs["sbom"], "busybox")["bom-ref"] == "inc-u"
+    entry_refs = [e["ref"] for e in docs["sbom"]["dependencies"]]
+    assert "inc-meta" in entry_refs
+    finding = finding_by_id(docs["report"], "REQ-MERGE-001")
+    assert finding["verdict"] == "unmet"
+    assert "inc-meta" in finding["diagnosticMessage"]

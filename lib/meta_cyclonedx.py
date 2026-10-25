@@ -56,6 +56,10 @@ fragments             per-recipe normalized facts, keyed by recipe name, in
                       the on-disk partial-SBOM format written by
                       do_populate_cyclonedx: "pkgs", "cves", "dependencies",
                       "extra_components", "extra_dependencies", "extra_roots",
+                      plus "extra_bom_errors": rows {"file", "error"} for
+                      imported ecosystem BOM files the adapter could not
+                      read or attach in report enforcement (the graph is
+                      composed from what is usable; the rest is reported),
                       plus creator and URI evidence keys "creator",
                       "source_uri" and "deployable_uri" (grammar strings /
                       URIs; explicit overrides above recorded metadata),
@@ -74,9 +78,12 @@ debug_sources         recipe -> delivered file -> debug-source paths recorded
                       static coverage, never absent dependencies)
 included_images       ordered embedded-image documents:
     name                          recipe name of the included image
-    sbom                          its completed SBOM document
+    sbom                          its completed SBOM document, or None when
+                                  unreadable (see sbom_error)
     vex                           its completed VEX document, or None
     vex_error                     parse error text when unreadable, else None
+    sbom_error                    parse/availability error text when the
+                                  SBOM itself is unreadable, else absent
 """
 
 import copy
@@ -818,6 +825,42 @@ def _upstream_creator_entities(component):
     return [{"name": owner, "url": [f"https://{host}/{owner}/{project}"]}]
 
 
+def _compatible_component_records(existing, candidate):
+    """
+    True when a candidate component carries no evidence contradicting the
+    component already in the graph under the same bom-ref: every field
+    present in both (bom-ref aside) agrees. Only then may the candidate
+    merge onto the existing record without losing an independently
+    assessable component instance.
+    """
+    for key, value in candidate.items():
+        if key == "bom-ref":
+            continue
+        if key in existing and existing[key] != value:
+            return False
+    return True
+
+
+def _merge_instance_evidence(existing, incoming, add_scopes):
+    """
+    Fold one component instance's evidence into the surviving instance:
+    the higher-priority scope wins and licence entries union. Dependency
+    evidence unions separately as the graph edges merge, so a reconciled
+    instance never loses what either document declared about it.
+    """
+    if add_scopes:
+        merged_scope = _highest_priority_scope(existing.get("scope"),
+                                               incoming.get("scope"))
+        if merged_scope:
+            existing["scope"] = merged_scope
+    licences = incoming.get("licenses")
+    if licences:
+        kept = existing.setdefault("licenses", [])
+        for licence in licences:
+            if licence not in kept:
+                kept.append(licence)
+
+
 def render(facts):
     """
     Render the SBOM and VEX documents from normalized build facts.
@@ -1074,23 +1117,93 @@ def render(facts):
     # its fragment under "extra_components" / "extra_dependencies", and it is
     # merged into the image BOM here.
     #
-    # These entries already carry their own bom-refs, purls and dependency
-    # edges, so they are appended verbatim: the recipe-name dependency
-    # remapping above applies to components derived from Yocto packages and
-    # would corrupt an externally resolved tree.
-    extra_seen_refs = {c["bom-ref"] for c in sbom["components"] if c.get("bom-ref")}
+    # These entries carry their own bom-refs, purls and dependency edges,
+    # so the recipe-name dependency remapping above does not apply: it
+    # addresses Yocto-derived components and would corrupt an externally
+    # resolved tree. Components are reconciled by instance identity
+    # (logical name, version and purl), edges are merged, and everything
+    # that stays unusable is published as a composition finding.
+    merge_defects = []
+    for pkg in sorted(fragments):
+        for failure in fragments[pkg].get("extra_bom_errors") or []:
+            _log(log, "warn", f"CYCLONEDX_EXTRA_BOM_FILES: {pkg}: imported "
+                              f"BOM {failure.get('file')} is unusable: "
+                              f"{failure.get('error')}")
+            merge_defects.append({
+                "kind": "imported-bom-unusable",
+                "source": f"{pkg} ({failure.get('file')})",
+                "message": f"imported BOM {failure.get('file')} could not "
+                           f"be read: {failure.get('error')}",
+                "refs": [],
+            })
+    extra_ref_components = {}
+    extra_identity_index = {}
+    for component in sbom["components"]:
+        ref = component.get("bom-ref")
+        if ref:
+            extra_ref_components.setdefault(ref, component)
+        key = _instance_key(component)
+        if key and key not in extra_identity_index:
+            extra_identity_index[key] = component
+    contributed_ref_remap = {}
     for pkg in sorted(fragments):
         pn_list = fragments[pkg]
         for component in pn_list.get("extra_components", []):
-            ref = component.get("bom-ref") or component.get("purl")
-            if ref:
-                if ref in extra_seen_refs:
-                    continue
-                extra_seen_refs.add(ref)
+            ref = component.get("bom-ref")
+            key = _instance_key(component)
+            survivor = extra_identity_index.get(key) if key else None
+            if survivor is not None and survivor.get("bom-ref") != ref:
+                # Same logical name, version and package build seen
+                # through two ecosystem documents: one component
+                # instance, reconciled onto the surviving bom-ref. Both
+                # graphs' edges converge on it below; a shared CPE alone
+                # never reconciles anything (ADR-0006).
+                if ref:
+                    contributed_ref_remap[ref] = survivor["bom-ref"]
+                _merge_instance_evidence(survivor, component, add_scopes)
+                continue
+            if ref and ref in extra_ref_components and \
+                    _compatible_component_records(extra_ref_components[ref],
+                                                  component):
+                # The very same record is already in the graph; merging
+                # onto it loses no evidence. Contradicting evidence under
+                # the same bom-ref keeps both instances and surfaces as a
+                # reference-integrity finding, never a silent drop.
+                continue
             sbom["components"].append(component)
-        for dep_entry in pn_list.get("extra_dependencies", []):
-            if dep_entry not in sbom["dependencies"]:
-                sbom["dependencies"].append(dep_entry)
+            if ref:
+                extra_ref_components.setdefault(ref, component)
+            if key and key not in extra_identity_index:
+                extra_identity_index[key] = component
+
+    # Fold the imported edges in after the whole contributed graph is
+    # reconciled, so ref rewrites apply consistently. Edges are merged,
+    # never recomputed or flattened: the ecosystem document remains
+    # authoritative for its own resolution (no package-manager
+    # reimplementation here), this layer only composes it.
+    for pkg in sorted(fragments):
+        pn_list = fragments[pkg]
+        for edge in pn_list.get("extra_dependencies") or []:
+            edge_ref = contributed_ref_remap.get(edge.get("ref"),
+                                                 edge.get("ref"))
+            if not edge_ref:
+                _log(log, "warn", f"CYCLONEDX_EXTRA_BOM_FILES: {pkg}: "
+                                  f"contributed dependency entry without "
+                                  f"a ref; its edges cannot be attached")
+                continue
+            depends_on = [contributed_ref_remap.get(target, target)
+                          for target in edge.get("dependsOn") or []
+                          if contributed_ref_remap.get(target,
+                                                       target) != edge_ref]
+            existing_entry = next((entry for entry in sbom["dependencies"]
+                                   if entry["ref"] == edge_ref), None)
+            if existing_entry is None:
+                sbom["dependencies"].append({"ref": edge_ref,
+                                             "dependsOn": depends_on})
+            else:
+                existing_entry["dependsOn"].extend(
+                    target for target in depends_on
+                    if target not in existing_entry["dependsOn"])
 
         # Attach each contributed tree to the recipe that produced it, so the
         # modules are attributable to the binary they are linked into instead of
@@ -1109,7 +1222,24 @@ def render(facts):
             owner_entry = {"ref": owner_ref, "dependsOn": []}
             sbom["dependencies"].append(owner_entry)
         for root_ref in extra_roots:
-            if root_ref in extra_seen_refs and root_ref not in owner_entry["dependsOn"]:
+            root_ref = contributed_ref_remap.get(root_ref, root_ref)
+            if root_ref not in extra_ref_components:
+                # A root no component carries: the imported document is
+                # malformed. The attach edge is published anyway and goes
+                # out as a dangling reference finding, never silently
+                # detached from the owner (ADR-0004).
+                _log(log, "warn", f"CYCLONEDX_EXTRA_BOM_FILES: {pkg}: "
+                                  f"contributed root {root_ref} names no "
+                                  f"component; the imported graph is "
+                                  f"malformed")
+                merge_defects.append({
+                    "kind": "imported-root-missing",
+                    "source": pkg,
+                    "message": f"contributed root {root_ref} names no "
+                               f"component",
+                    "refs": [root_ref],
+                })
+            if root_ref not in owner_entry["dependsOn"]:
                 owner_entry["dependsOn"].append(root_ref)
 
     # Fold in complete SBOMs of the included embedded images. Components
@@ -1118,7 +1248,8 @@ def render(facts):
     # added with scope "required". A shared CPE alone never merges.
     _merge_included_images(sbom, vex, copy.deepcopy(facts.get("included_images")) or (),
                            config, spec_version, sbom_serial_number,
-                           add_scopes, directly_installed_component_refs, log)
+                           add_scopes, directly_installed_component_refs, log,
+                           merge_defects)
 
     # Statically linked edges observed from pkgdata debug-source records:
     # another recipe's debug-source prefix in this recipe's file list proves
@@ -1231,7 +1362,7 @@ def render(facts):
                                      "assemblies": [component_ref]})
 
     graph = _graph_evidence(sbom, metadata_component_ref, ref_recipes,
-                            debug_evidence_recipes, log)
+                            debug_evidence_recipes, merge_defects, log)
 
     # Replace SBOM serial placeholder in VEX vulnerabilities
     # This must be done after all vulnerabilities are collected to ensure each image
@@ -1452,13 +1583,22 @@ def _instance_key(component):
 
 def _merge_included_images(sbom, vex, included_images, config, spec_version,
                            sbom_serial_number, add_scopes,
-                           directly_installed_component_refs, log):
+                           directly_installed_component_refs, log,
+                           merge_defects=None):
     """
     Merge the completed SBOM and VEX of each embedded image into the parent
     documents, remapping bom-refs of components that are the same instance
     as one of the parent's (same logical identity from the same package
     build) and the VEX references to the parent SBOM serial number.
+
+    Defective input is recorded in merge_defects and reported; the graph
+    is never repaired by dropping nodes, edges, scopes or VEX statements
+    (ADR-0004).
     """
+    if merge_defects is None:
+        merge_defects = []
+    ref_components = {c["bom-ref"]: c for c in sbom["components"]
+                      if c.get("bom-ref")}
     extra_seen_image_refs = {c["bom-ref"] for c in sbom["components"] if c.get("bom-ref")}
     identity_index = {}
     for component in sbom["components"]:
@@ -1470,6 +1610,34 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
         img_sbom_data = img["sbom"]
         img_vex_data = img.get("vex")
         img_vex_error = img.get("vex_error")
+        img_sbom_error = img.get("sbom_error")
+
+        if img_sbom_data is None:
+            # The adapter could not read the embedded document at all.
+            # The delivered payload stays represented - as a firmware
+            # component of unknown version, hung off the graph root -
+            # and the unreadable evidence becomes a composition finding,
+            # never a silently missing delivery-item part (ADR-0004).
+            _log(log, "warn", f"CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES: "
+                              f"cannot read SBOM for {img_name}: "
+                              f"{img_sbom_error or 'no document'}")
+            merge_defects.append({
+                "kind": "embedded-sbom-unusable",
+                "source": img_name,
+                "message": f"embedded image SBOM could not be read: "
+                           f"{img_sbom_error or 'no document'}",
+                "refs": [],
+            })
+            orphan_ref = str(uuid.uuid4())
+            orphan_comp = {"type": "firmware", "name": img_name,
+                           "version": "unknown", "bom-ref": orphan_ref}
+            if add_scopes:
+                orphan_comp["scope"] = "required"
+            sbom["components"].append(orphan_comp)
+            extra_seen_image_refs.add(orphan_ref)
+            directly_installed_component_refs.add(orphan_ref)
+            continue
+
 
         img_spec = img_sbom_data.get("specVersion")
         if img_spec and img_spec != spec_version:
@@ -1492,10 +1660,12 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
             existing = identity_index.get(key)
             if existing:
                 included_bom_ref_remap[inc_ref] = existing["bom-ref"]
-                if add_scopes:
-                    merged_scope = _highest_priority_scope(existing.get("scope"), inc_comp.get("scope"))
-                    if merged_scope:
-                        existing["scope"] = merged_scope
+                # The same package build seen through two documents: the
+                # survivor unions both views' evidence - the higher
+                # scope and every licence entry - so reconciliation never
+                # discloses into evidence loss. Dependency evidence
+                # unions separately as the image edges merge.
+                _merge_instance_evidence(existing, inc_comp, add_scopes)
 
         # Add components unique to the included image (no instance match in the parent SBOM).
         for inc_comp in img_sbom_data.get("components") or []:
@@ -1503,7 +1673,13 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
             key = _instance_key(inc_comp)
             if inc_ref and inc_ref in included_bom_ref_remap:
                 continue
-            if inc_ref and inc_ref in extra_seen_image_refs:
+            if inc_ref and inc_ref in ref_components and \
+                    _compatible_component_records(ref_components[inc_ref],
+                                                  inc_comp):
+                # The very same record; merging onto it loses nothing.
+                # Contradicting evidence under a colliding bom-ref keeps
+                # both instances and surfaces as a reference-integrity
+                # finding, never a silent drop of an image component.
                 continue
             if add_scopes and "scope" not in inc_comp:
                 inc_comp = dict(inc_comp)
@@ -1511,6 +1687,7 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
             sbom["components"].append(inc_comp)
             if inc_ref:
                 extra_seen_image_refs.add(inc_ref)
+                ref_components.setdefault(inc_ref, inc_comp)
             if key and key not in identity_index:
                 identity_index[key] = inc_comp
 
@@ -1533,6 +1710,32 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
         inc_metadata_ref = inc_metadata_comp.get("bom-ref")
         if inc_metadata_ref:
             included_bom_ref_remap[inc_metadata_ref] = img_firmware_ref
+        else:
+            # No root to hang the graph on: the document is malformed.
+            # Its components and edges stay in the merged graph and the
+            # missing attachment is published as a finding instead of
+            # being tidied away (ADR-0004).
+            unattached = sorted({
+                included_bom_ref_remap.get(entry.get("ref", ""),
+                                           entry.get("ref", ""))
+                for entry in img_sbom_data.get("dependencies") or []
+                if entry.get("ref")
+                and included_bom_ref_remap.get(entry.get("ref", ""),
+                                               entry.get("ref", "")) not in
+                extra_seen_image_refs})
+            _log(log, "warn", f"CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES: "
+                              f"{img_name} SBOM has no metadata.component "
+                              f"bom-ref; its graph cannot be attached as "
+                              f"a tree")
+            merge_defects.append({
+                "kind": "embedded-root-missing",
+                "source": img_name,
+                "message": "embedded image SBOM has no metadata.component "
+                           "root" + (f"; unattached graph reference(s): "
+                                     + ", ".join(unattached)
+                                     if unattached else ""),
+                "refs": unattached,
+            })
 
         def remap_ref(ref, _remap=included_bom_ref_remap):
             return _remap.get(ref, ref)
@@ -1566,6 +1769,14 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
         # Merge VEX vulnerabilities: remap included SBOM serial and shared bom-refs, avoid CVE ID duplicates.
         if img_vex_error:
             _log(log, "warn", f"CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES: cannot parse VEX for {img_name}: {img_vex_error}")
+            merge_defects.append({
+                "kind": "embedded-vex-unusable",
+                "source": img_name,
+                "message": f"embedded image VEX could not be read: "
+                           f"{img_vex_error}; its SBOM graph was still "
+                           f"merged",
+                "refs": [],
+            })
             continue
         if img_vex_data is None:
             _log(log, 1, f"CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES: no VEX for {img_name}")
@@ -1594,7 +1805,14 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
             existing_vuln = next(
                 (v for v in vex["vulnerabilities"] if v.get("id") == cve_id), None
             )
-            if existing_vuln:
+            same_analysis = (
+                (existing_vuln or {}).get("analysis", {}).get("state") ==
+                inc_vuln.get("analysis", {}).get("state"))
+            if existing_vuln and same_analysis:
+                # One analysis seen twice: union the affected refs. A
+                # differing analysis is a distinct statement about the
+                # same CVE and rides along separately - folding would
+                # silently lose it.
                 for a in remapped_affects:
                     if a not in existing_vuln["affects"]:
                         existing_vuln["affects"].append(a)
@@ -1746,7 +1964,8 @@ def _graph_integrity(sbom, root_ref):
             "ambiguous": sorted(set(ambiguous))}
 
 
-def _graph_evidence(sbom, root_ref, ref_recipes, debug_evidence_recipes, log):
+def _graph_evidence(sbom, root_ref, ref_recipes, debug_evidence_recipes,
+                    merge_defects, log):
     """
     Summarize the graph facts the requirements matrix evaluates: reference
     integrity (logged even without a profile, so defects are never silent),
@@ -1771,7 +1990,8 @@ def _graph_evidence(sbom, root_ref, ref_recipes, debug_evidence_recipes, log):
         and ref_recipes.get(component["bom-ref"]) not in debug_evidence_recipes})
     return {"rootRef": root_ref, "integrity": integrity,
             "boundaryRefs": boundary_refs,
-            "staticUnknownRefs": static_unknown_refs}
+            "staticUnknownRefs": static_unknown_refs,
+            "mergeDefects": merge_defects}
 
 
 def _highest_priority_scope(*scopes):
