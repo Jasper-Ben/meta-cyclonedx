@@ -211,6 +211,55 @@ def test_primary_source_and_deployable_uris_are_emitted_when_valid():
     assert finding_by_id(docs["report"], "REQ-URI-003")["verdict"] == "verified"
 
 
+def test_equivalent_evidence_order_produces_identical_documents_and_report():
+    def facts_for(contacts, reverse_fragments):
+        fragments = {
+            "aaa": fragment(creator="Team A <a@first.example>",
+                            pkgs=[pkg("aaa", "1.0", "ref-aaa")]),
+            "bbb": fragment(creator="Team B <b@second.example>",
+                            pkgs=[pkg("bbb", "2.0", "ref-bbb")]),
+        }
+        if reverse_fragments:
+            fragments = {"bbb": fragments["bbb"], "aaa": fragments["aaa"]}
+        return default_facts(config=profile_config(),
+                             sbom_creator=contacts,
+                             fragments=fragments)
+    first, _logs = render_all(facts_for(
+        "SBOM Office <sbom@acme.example>; https://acme.example", False))
+    second, _logs = render_all(facts_for(
+        "https://acme.example; SBOM Office <sbom@acme.example>", True))
+    assert first["sbom"]["metadata"]["authors"] == \
+        second["sbom"]["metadata"]["authors"]
+    assert meta_cyclonedx.serialize_report(first["report"]) == \
+        meta_cyclonedx.serialize_report(second["report"])
+    def creators(docs):
+        return {component["name"]:
+                (component.get("author"), component.get("contact"))
+                for component in docs["sbom"]["components"]}
+    assert creators(first) == creators(second)
+
+
+def test_creator_and_uri_findings_carry_traceable_evidence_origins():
+    facts = default_facts(
+        config=profile_config(),
+        sbom_creator="sbom@acme.example",
+        primary={"type": "firmware", "name": "core-image", "version": "1.0",
+                 "creator": "Acme GmbH <product@acme.example>",
+                 "deployable_uri": "https://download.example/core-image.img"},
+        fragments={"openssl": fragment(
+            pkgs=[pkg("openssl", "3.0", "ref-openssl",
+                      purl="pkg:github/openssl/openssl")])},
+    )
+    docs, _logs = render_all(facts)
+    origins = {finding["requirementId"]: finding["evidenceOrigin"]
+               for finding in docs["report"]["findings"]}
+    assert origins["REQ-SBOM-001"] == "caller-assertion"
+    assert origins["REQ-COMP-012"] == "caller-assertion"
+    assert origins["REQ-COMP-010"] == "upstream-metadata"
+    assert origins["REQ-URI-002"] == "generated-document"
+    assert origins["REQ-URI-003"] == "generated-document"
+
+
 def test_sbom_creator_grammar_becomes_metadata_authors():
     facts = default_facts(
         config=profile_config(),
