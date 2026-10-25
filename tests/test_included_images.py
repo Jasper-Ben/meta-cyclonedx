@@ -180,3 +180,47 @@ def test_included_component_with_conflicting_ref_and_other_instance_is_kept():
     finding = finding_by_id(docs["report"], "REQ-REF-001")
     assert finding["verdict"] == "unmet"
     assert "ref-app" in finding["bomRefs"]
+
+
+def test_reconciled_instance_keeps_licence_evidence_from_both_documents():
+    # Same instance (name, version, purl) but the embedded document
+    # carries licence evidence the parent's copy lacks. Reconciling the
+    # instances must union the evidence, not discard the image's view.
+    entry = included_image()
+    entry["sbom"]["components"][0]["licenses"] = [{"license": {"id": "Zlib"}}]
+    sbom, _vex, _logs = render_docs(parent_facts(included_images=[entry]))
+
+    zlib = component_by_name(sbom, "zlib")
+    assert zlib["bom-ref"] == "ref-z"
+    assert {"license": {"id": "Zlib"}} in zlib["licenses"]
+
+
+def test_included_vex_statement_with_a_different_analysis_stays_separate():
+    # Parent and image analyse the same CVE differently for different
+    # instances. Folding affects may only unify statements that analyse
+    # identically; a distinct analysis is a distinct statement and must
+    # survive the merge (no lost statements).
+    parent_vuln = vuln("CVE-2024-9", "ref-app", state="resolved")
+    entry = included_image(vex=vex_document([{
+        "id": "CVE-2024-9",
+        "source": {"name": "NVD",
+                   "url": "https://nvd.nist.gov/vuln/detail/CVE-2024-9"},
+        "analysis": {"state": "unresolved", "detail": ""},
+        "affects": [{"ref": f"urn:cdx:{INC_SERIAL}/1#inc-u"}],
+    }]))
+    facts = parent_facts(included_images=[entry], fragments={
+        "zlib": fragment(pkgs=[pkg("zlib", "1.3", "ref-z", cpe=CPE_Z)]),
+        "app": fragment(pkgs=[pkg("app", "1.0", "ref-app")],
+                        cves=[parent_vuln]),
+    }, runtime_recipes=["zlib", "app"], image_install_recipes=["app"])
+    sbom, vex, _logs = render_docs(facts)
+
+    statements = [v for v in vex["vulnerabilities"]
+                  if v["id"] == "CVE-2024-9"]
+    assert len(statements) == 2
+    states = {v["analysis"]["state"] for v in statements}
+    assert states == {"resolved", "unresolved"}
+    unresolved = next(v for v in statements
+                      if v["analysis"]["state"] == "unresolved")
+    serial = sbom["serialNumber"].removeprefix("urn:uuid:")
+    assert affect_refs(unresolved) == [f"urn:cdx:{serial}/1#inc-u"]

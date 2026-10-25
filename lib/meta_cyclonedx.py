@@ -1653,10 +1653,12 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
             existing = identity_index.get(key)
             if existing:
                 included_bom_ref_remap[inc_ref] = existing["bom-ref"]
-                if add_scopes:
-                    merged_scope = _highest_priority_scope(existing.get("scope"), inc_comp.get("scope"))
-                    if merged_scope:
-                        existing["scope"] = merged_scope
+                # The same package build seen through two documents: the
+                # survivor unions both views' evidence - the higher
+                # scope and every licence entry - so reconciliation never
+                # discloses into evidence loss. Dependency evidence
+                # unions separately as the image edges merge.
+                _merge_instance_evidence(existing, inc_comp, add_scopes)
 
         # Add components unique to the included image (no instance match in the parent SBOM).
         for inc_comp in img_sbom_data.get("components") or []:
@@ -1762,7 +1764,14 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
             existing_vuln = next(
                 (v for v in vex["vulnerabilities"] if v.get("id") == cve_id), None
             )
-            if existing_vuln:
+            same_analysis = (
+                (existing_vuln or {}).get("analysis", {}).get("state") ==
+                inc_vuln.get("analysis", {}).get("state"))
+            if existing_vuln and same_analysis:
+                # One analysis seen twice: union the affected refs. A
+                # differing analysis is a distinct statement about the
+                # same CVE and rides along separately - folding would
+                # silently lose it.
                 for a in remapped_affects:
                     if a not in existing_vuln["affects"]:
                         existing_vuln["affects"].append(a)
