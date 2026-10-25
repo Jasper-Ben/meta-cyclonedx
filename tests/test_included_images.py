@@ -1,8 +1,8 @@
 """Embedded image composition: CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES merging."""
 
 from helpers import (affect_refs, component_by_name, default_facts, document,
-                     fragment, pkg, ref_of, render_docs, root_entry, vuln,
-                     vex_document)
+                     finding_by_id, fragment, pkg, profile_config, ref_of,
+                     render_all, render_docs, root_entry, vuln, vex_document)
 
 INC_SERIAL = "11111111-2222-3333-4444-555555555555"
 CPE_Z = "cpe:2.3:*:*:zlib:1.3:*:*:*:*:*:*:*"
@@ -155,3 +155,28 @@ def test_unparseable_included_vex_is_warned_and_skipped():
     assert any(level == "warn" and "cannot parse VEX" in message
                for level, message in logs)
     assert vex["vulnerabilities"] == []
+
+
+def test_included_component_with_conflicting_ref_and_other_instance_is_kept():
+    # The image's openssl happens to reuse a bom-ref the parent minted
+    # for its app component. It is a different component instance, so it
+    # must not be dropped to tidy the merged document: both components
+    # are published and the duplicate ref becomes a finding (ADR-0004).
+    other = document(
+        INC_SERIAL,
+        components=[pkg("openssl", "3.0", "ref-app")],
+        dependencies=[],
+        metadata_component={"bom-ref": "inc-meta", "type": "firmware",
+                            "name": "initramfs", "version": "2.0"})
+    facts = parent_facts(config=profile_config(),
+                         included_images=[{"name": "initramfs",
+                                           "sbom": other, "vex": None,
+                                           "vex_error": None}])
+    docs, _logs = render_all(facts)
+
+    colliding = [c for c in docs["sbom"]["components"]
+                 if c["bom-ref"] == "ref-app"]
+    assert sorted(c["name"] for c in colliding) == ["app", "openssl"]
+    finding = finding_by_id(docs["report"], "REQ-REF-001")
+    assert finding["verdict"] == "unmet"
+    assert "ref-app" in finding["bomRefs"]

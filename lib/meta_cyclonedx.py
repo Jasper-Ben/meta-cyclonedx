@@ -1590,6 +1590,8 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
     """
     if merge_defects is None:
         merge_defects = []
+    ref_components = {c["bom-ref"]: c for c in sbom["components"]
+                      if c.get("bom-ref")}
     extra_seen_image_refs = {c["bom-ref"] for c in sbom["components"] if c.get("bom-ref")}
     identity_index = {}
     for component in sbom["components"]:
@@ -1662,7 +1664,13 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
             key = _instance_key(inc_comp)
             if inc_ref and inc_ref in included_bom_ref_remap:
                 continue
-            if inc_ref and inc_ref in extra_seen_image_refs:
+            if inc_ref and inc_ref in ref_components and \
+                    _compatible_component_records(ref_components[inc_ref],
+                                                  inc_comp):
+                # The very same record; merging onto it loses nothing.
+                # Contradicting evidence under a colliding bom-ref keeps
+                # both instances and surfaces as a reference-integrity
+                # finding, never a silent drop of an image component.
                 continue
             if add_scopes and "scope" not in inc_comp:
                 inc_comp = dict(inc_comp)
@@ -1670,6 +1678,7 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
             sbom["components"].append(inc_comp)
             if inc_ref:
                 extra_seen_image_refs.add(inc_ref)
+                ref_components.setdefault(inc_ref, inc_comp)
             if key and key not in identity_index:
                 identity_index[key] = inc_comp
 
