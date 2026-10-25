@@ -10,8 +10,10 @@ and artifact inspection never analyzes binary contents (ADR-0002).
 """
 
 import copy
+import re
 
 import helpers
+import meta_cyclonedx
 from helpers import (default_facts, dep_entry, file_components,
                      file_entry, file_component, file_ref, finding_by_id,
                      fragment, pkg, profile_config, ref_of, render_all,
@@ -90,3 +92,32 @@ def test_delivered_files_become_file_components_with_artifact_identity():
         {"name": "bsi:component:archive", "value": "archive"},
         {"name": "bsi:component:structured", "value": "structured"},
     ]
+
+
+def test_the_file_inventory_is_path_ordered_and_rerun_stable():
+    entries = [file_entry(path, sha512=str(index) * 128)
+               for index, path in enumerate(
+                   ["/usr/sbin/zdaemon", "/etc/weekly.job", "/bin/ash"])]
+    facts_a = default_facts(config=profile_config(),
+                            file_inventory={"busybox": list(reversed(entries))})
+    facts_b = default_facts(config=profile_config(),
+                            file_inventory={"busybox": list(entries)})
+    docs_a, _logs_a = render_all(facts_a)
+    docs_b, _logs_b = render_all(facts_b)
+
+    expected_refs = [file_ref("busybox", "/bin/ash"),
+                     file_ref("busybox", "/etc/weekly.job"),
+                     file_ref("busybox", "/usr/sbin/zdaemon")]
+    for docs in (docs_a, docs_b):
+        assert [component["bom-ref"]
+                for component in file_components(docs["sbom"])] == expected_refs
+        assert _stable_refs(docs["sbom"]) == _stable_refs(docs_b["sbom"])
+    assert meta_cyclonedx.serialize_report(docs_a["report"]) == \
+        meta_cyclonedx.serialize_report(docs_b["report"])
+
+
+def _stable_refs(sbom):
+    """Dependency-entry refs with the documented per-render uuids removed."""
+    return [entry["ref"] for entry in sbom["dependencies"]
+            if not re.fullmatch(r"[0-9a-f]{8}(-[0-9a-f]{4}){3}-[0-9a-f]{12}",
+                                entry["ref"])]
