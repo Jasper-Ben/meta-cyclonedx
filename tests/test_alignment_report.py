@@ -30,7 +30,7 @@ def test_report_records_exact_profile_baseline():
         "guidelineVersion": "2.1.0",
         "propertyTaxonomyVersion": "0.1.2",
         "cyclonedxSchemaVersion": "1.7",
-        "requirementsMatrixVersion": "2.1.0-r2",
+        "requirementsMatrixVersion": "2.1.0-r3",
     }
 
 

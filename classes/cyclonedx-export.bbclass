@@ -24,6 +24,27 @@ CYCLONEDX_CPE_UPDATE ??= "-"
 CYCLONEDX_COMPONENT_NAME ??= ""
 CYCLONEDX_COMPONENT_VERSION ??= ""
 
+# Creator evidence. CYCLONEDX_SBOM_CREATOR names the entity responsible
+# for compiling the SBOM and CYCLONEDX_PRIMARY_COMPONENT_CREATOR the
+# product manufacturer as creator of the delivered product; both use the
+# contact grammar "NAME <email-or-url>", "<URL>", a bare email address
+# or a bare URL, with ';' separating multiple contacts. The product
+# manufacturer is never applied to third-party components.
+CYCLONEDX_SBOM_CREATOR ??= ""
+CYCLONEDX_PRIMARY_COMPONENT_CREATOR ??= ""
+# Recipe-scoped creator override, taking precedence over the upstream
+# repository identity recorded in the component metadata (upstream purl
+# or fetcher-recorded vcs reference); set it where that evidence is
+# absent or wrong.
+CYCLONEDX_COMPONENT_CREATOR ??= ""
+# Explicit source and deployable URIs. URIs are emitted only from these
+# overrides or from metadata the layer already records (SRC_URI-derived
+# references, layer revisions), and only when syntactically valid.
+CYCLONEDX_COMPONENT_SOURCE_URI ??= ""
+CYCLONEDX_COMPONENT_DEPLOYABLE_URI ??= ""
+CYCLONEDX_PRIMARY_COMPONENT_SOURCE_URI ??= ""
+CYCLONEDX_PRIMARY_COMPONENT_DEPLOYABLE_URI ??= ""
+
 # Defines SBOM_CVE_CHECK_DEPLOY_DB_DIR, used by the kernel CVE filtering below
 # to find the cvelist database deployed by sbom-cve-check-update-cvelist-native.
 require conf/sbom-cve-check-config.inc
@@ -386,6 +407,17 @@ python do_populate_cyclonedx() {
     if extra_roots:
         pn_list["extra_roots"] = extra_roots
 
+    # Creator and URI evidence overrides: the renderer owns the
+    # precedence (explicit override above recorded metadata) and the
+    # syntax validation; the adapter only forwards the configured values.
+    for fact_key, variable in (("creator", "CYCLONEDX_COMPONENT_CREATOR"),
+                               ("source_uri", "CYCLONEDX_COMPONENT_SOURCE_URI"),
+                               ("deployable_uri",
+                                "CYCLONEDX_COMPONENT_DEPLOYABLE_URI")):
+        value = d.getVar(variable)
+        if value:
+            pn_list[fact_key] = value
+
     # Add "not_affected" VEX entries for kernel CVEs whose affected files were
     # never compiled, based on the sources actually compiled for this kernel
     # (only applies to whichever recipe provides virtual/kernel).
@@ -479,6 +511,8 @@ do_populate_cyclonedx[vardeps] += "CVE_STATUS"
 # fragment inputs; a change to any of them must regenerate the fragment.
 do_populate_cyclonedx[vardeps] += "CVE_PRODUCT CVE_VERSION"
 do_populate_cyclonedx[vardeps] += "CYCLONEDX_COMPONENT_NAME CYCLONEDX_COMPONENT_VERSION"
+do_populate_cyclonedx[vardeps] += "CYCLONEDX_COMPONENT_CREATOR"
+do_populate_cyclonedx[vardeps] += "CYCLONEDX_COMPONENT_SOURCE_URI CYCLONEDX_COMPONENT_DEPLOYABLE_URI"
 SSTATETASKS += "do_populate_cyclonedx"
 do_populate_cyclonedx[sstate-inputdirs] = "${CYCLONEDX_PNDATA_WORKDIR}"
 do_populate_cyclonedx[sstate-outputdirs] = "${CYCLONEDX_PNDATA}/${SSTATE_PKGARCH}"
@@ -1363,6 +1397,14 @@ def export_cyclonedx(d):
             primary["version"],
             d.getVar("CYCLONEDX_IMAGE_CPE") or None)
         primary["purl"] = renderer.image_purl(*image_purl_facts(d))
+    for variable, fact_key in (
+            ("CYCLONEDX_PRIMARY_COMPONENT_CREATOR", "creator"),
+            ("CYCLONEDX_PRIMARY_COMPONENT_SOURCE_URI", "source_uri"),
+            ("CYCLONEDX_PRIMARY_COMPONENT_DEPLOYABLE_URI",
+             "deployable_uri")):
+        value = d.getVar(variable)
+        if value:
+            primary[fact_key] = value
     if d.getVar("CYCLONEDX_ADD_LAYER_REFERENCES") == "1":
         primary["external_references"] = generate_layer_references(d)
 
@@ -1400,6 +1442,7 @@ def export_cyclonedx(d):
             "enforcement": d.getVar('CYCLONEDX_PROFILE_ENFORCEMENT') or "report",
         },
         "timestamp": timestamp,
+        "sbom_creator": d.getVar('CYCLONEDX_SBOM_CREATOR') or "",
         "log": _cyclonedx_log,
         "primary": primary,
         "fragments": fragments,
@@ -1476,6 +1519,10 @@ export_cyclonedx[vardeps] += "CYCLONEDX_EXPORT_SBOM CYCLONEDX_EXPORT_VEX \
     CYCLONEDX_EXPORT_SBOM_LINK CYCLONEDX_EXPORT_VEX_LINK \
     CYCLONEDX_EXPORT_ALIGNMENT_REPORT CYCLONEDX_EXPORT_ALIGNMENT_REPORT_LINK \
     CYCLONEDX_PROFILE CYCLONEDX_PROFILE_ENFORCEMENT"
+export_cyclonedx[vardeps] += "CYCLONEDX_SBOM_CREATOR"
+export_cyclonedx[vardeps] += "CYCLONEDX_PRIMARY_COMPONENT_CREATOR \
+    CYCLONEDX_PRIMARY_COMPONENT_SOURCE_URI \
+    CYCLONEDX_PRIMARY_COMPONENT_DEPLOYABLE_URI"
 
 SSTATETASKS += "do_deploy_cyclonedx"
 do_deploy_cyclonedx[sstate-inputdirs] = "${CYCLONEDX_TMP_EXPORT_DIR} ${CYCLONEDX_IMAGEDATA_WORKDIR}"

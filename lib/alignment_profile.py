@@ -20,6 +20,8 @@ meta-cyclonedx uses this to produce an alignment report; it never labels an
 SBOM, product or manufacturer conformant with TR-03183-2 or the CRA.
 """
 
+import urllib.parse
+
 # Evaluation rules return a verdict for one requirement against one
 # rendered document set; they live next to the rows they evaluate.
 
@@ -38,7 +40,10 @@ def _check_cyclonedx_format(context):
 def _check_sbom_creator(context):
     metadata = context["sbom"].get("metadata") or {}
     if metadata.get("authors"):
-        return "verified", "the SBOM names its creator through metadata.authors"
+        return "asserted", ("the product integration asserts the SBOM "
+                            "creator through metadata.authors; the contact "
+                            "of the asserting party cannot be independently "
+                            "checked by meta-cyclonedx")
     return "unmet", ("the SBOM does not identify an SBOM creator with an "
                      "email address or URL")
 
@@ -106,22 +111,117 @@ def _check_sbom_uri(context):
     return "verified", "the declared SBOM-URI is present"
 
 
-def _uri_field(reference_types, label):
+def _uri_is_valid(uri):
+    """Independent document-side validation of an emitted URI's syntax."""
+    if not isinstance(uri, str) or not uri.strip():
+        return False
+    try:
+        parsed = urllib.parse.urlparse(uri.strip())
+    except ValueError:
+        return False
+    if parsed.scheme.lower() == "mailto":
+        return bool(parsed.path or parsed.netloc)
+    return bool(parsed.scheme and parsed.netloc)
+
+
+def _emitted_uri_references(context, reference_types):
+    sbom = context["sbom"]
+    metadata_component = ((sbom.get("metadata") or {}).get("component") or {})
+    holders = [(metadata_component.get("bom-ref"), metadata_component)]
+    holders.extend((component.get("bom-ref"), component)
+                   for component in sbom.get("components") or [])
+    return [(reference, holder_ref)
+            for holder_ref, holder in holders
+            for reference in holder.get("externalReferences") or ()
+            if reference.get("type") in reference_types]
+
+
+def _recorded_uri_candidates(context, reference_types, fact_keys):
+    """Every URI of the category the build facts recorded, per holder."""
+    facts = context["facts"]
+    sbom = context["sbom"]
+    primary = facts.get("primary") or {}
+    primary_ref = ((sbom.get("metadata") or {}).get("component") or {}) \
+        .get("bom-ref")
+    candidates = [(primary.get(key), primary_ref) for key in fact_keys
+                  if primary.get(key)]
+    candidates += [(reference.get("url"), primary_ref)
+                   for reference in primary.get("external_references") or ()
+                   if reference.get("type") in reference_types]
+    for fragment in (facts.get("fragments") or {}).values():
+        contributors = (list(fragment.get("pkgs") or [])
+                        + list(fragment.get("extra_components") or []))
+        first_ref = contributors[0].get("bom-ref") if contributors else None
+        candidates += [(fragment.get(key), first_ref) for key in fact_keys
+                       if fragment.get(key)]
+        for component in contributors:
+            candidates += [(reference.get("url"), component.get("bom-ref"))
+                           for reference
+                           in component.get("externalReferences") or ()
+                           if reference.get("type") in reference_types]
+    for image in facts.get("included_images") or ():
+        document = image.get("sbom") or {}
+        components = [((document.get("metadata") or {}).get("component")
+                       or {})]
+        components += list(document.get("components") or [])
+        for component in components:
+            candidates += [(reference.get("url"), component.get("bom-ref"))
+                           for reference
+                           in component.get("externalReferences") or ()
+                           if reference.get("type") in reference_types]
+    return candidates
+
+
+def _uri_field(reference_types, fact_keys, label):
     def applies(context):
-        if _external_references(context, reference_types):
+        emitted = {reference.get("url")
+                   for reference, _ref
+                   in _emitted_uri_references(context, reference_types)}
+        rejected = [holder_ref for url, holder_ref
+                    in _recorded_uri_candidates(context, reference_types,
+                                                fact_keys)
+                    if url and url not in emitted]
+        if emitted or rejected:
             return True, ""
-        return False, f"the SBOM carries no {label} URIs, so the field does not apply"
+        return False, (f"the SBOM carries no {label} URIs, so the field "
+                       f"does not apply")
 
     def check(context):
-        refs = _external_references(context, reference_types)
-        if all(ref.get("url") for ref in refs):
-            return "verified", f"every {label} URI carries a usable URL"
-        return "unmet", f"{label} URIs lack a usable URL"
+        emitted = _emitted_uri_references(context, reference_types)
+        emitted_urls = {reference.get("url") for reference, _ref in emitted}
+        rejected = [holder_ref for url, holder_ref
+                    in _recorded_uri_candidates(context, reference_types,
+                                                fact_keys)
+                    if url and url not in emitted_urls]
+        invalid = [holder_ref for reference, holder_ref in emitted
+                   if not _uri_is_valid(reference.get("url"))]
+        affected = sorted({holder for holder in rejected + invalid
+                           if holder})
+        if affected:
+            return ("unmet", (f"{label} URIs were recorded as evidence but "
+                              f"not emitted, or carry a syntactically "
+                              f"invalid URL; URIs are emitted only from "
+                              f"trustworthy metadata and are validated "
+                              f"when present"), affected)
+        return "verified", f"every {label} URI carries a usable URL"
     return applies, check
 
 
-_applies_source_uris, _check_source_uris = _uri_field({"vcs", "source-distribution"}, "source code")
-_applies_deployable_uris, _check_deployable_uris = _uri_field({"distribution"}, "deployable form")
+_applies_source_uris, _check_source_uris = _uri_field(
+    {"vcs", "source-distribution"}, ("source_uri",), "source code")
+_applies_deployable_uris, _check_deployable_uris = _uri_field(
+    {"distribution"}, ("deployable_uri",), "deployable form")
+
+
+def _check_primary_component_creator(context):
+    primary = (context["sbom"].get("metadata") or {}).get("component") or {}
+    if primary.get("author") or primary.get("contact"):
+        return "asserted", ("the product integration asserts the primary "
+                            "component creator; meta-cyclonedx cannot "
+                            "independently verify the manufacturer's "
+                            "identity")
+    return "unmet", ("the product integration did not assert a creator for "
+                     "the primary component")
 
 
 def _check_component_names(context):
@@ -182,14 +282,29 @@ def _check_dependency_completeness_declaration(context):
 
 
 def _check_component_creators(context):
-    missing = [component["bom-ref"]
-               for component in context["sbom"].get("components") or []
+    override_refs = {component.get("bom-ref")
+                     for fragment in (context["facts"].get("fragments")
+                                      or {}).values()
+                     if fragment.get("creator")
+                     for component in fragment.get("pkgs") or ()}
+    components = context["sbom"].get("components") or []
+    missing = [component["bom-ref"] for component in components
                if not component.get("author") and not component.get("contact")]
-    if not missing:
-        return "verified", ("every component carries a creator identifiable "
-                            "by email address or URL")
-    return "unmet", ("components carry no creator identifiable by email "
-                     "address or URL"), missing
+    if missing:
+        return ("unverifiable",
+                ("components carry no creator identifiable by email address "
+                 "or URL; upstream metadata records none and no explicit "
+                 "override was supplied; the product manufacturer is never "
+                 "assumed as the creator of third-party software"), missing)
+    if override_refs & {component["bom-ref"] for component in components}:
+        return ("asserted",
+                ("every component carries a creator, at least one of them "
+                 "asserted through an explicit override, which "
+                 "meta-cyclonedx cannot verify independently"),
+                None, "caller-assertion")
+    return ("verified",
+            ("every component carries a creator derived from trustworthy "
+             "upstream identity metadata"), None, "upstream-metadata")
 
 
 def _check_distribution_licences(context):
@@ -334,7 +449,7 @@ TR03183_2_REQUIREMENTS = [
         "source": ("BSI TR-03183-2 v2.1.0 §5.2.1 (SBOM-level data fields: "
                    "creator of SBOM)"),
         "representation": "metadata.authors entry with an email address or URL",
-        "origin": "generated-document",
+        "origin": "caller-assertion",
         "check": _check_sbom_creator,
     },
     {
@@ -361,6 +476,15 @@ TR03183_2_REQUIREMENTS = [
                            "identifying the delivered product"),
         "origin": "caller-assertion",
         "check": _check_primary_component_assertion,
+    },
+    {
+        "id": "REQ-COMP-012",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.2 (component-level data "
+                   "fields: primary component creator)"),
+        "representation": ("metadata.component author or contact with an "
+                           "email address or URL"),
+        "origin": "caller-assertion",
+        "check": _check_primary_component_creator,
     },
     {
         "id": "REQ-DEPS-001",
@@ -511,8 +635,9 @@ TR03183_2_REQUIREMENTS = [
         "id": "REQ-COMP-010",
         "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.2 (component-level data "
                    "fields: component creator)"),
-        "representation": ("component author or contact with an email address "
-                           "or URL"),
+        "representation": ("component author or contact with an email "
+                           "address or URL, from an explicit override or "
+                           "trustworthy upstream identity metadata"),
         "origin": "generated-document",
         "check": _check_component_creators,
     },
@@ -554,7 +679,7 @@ PROFILES = {
         "guideline": "BSI TR-03183-2",
         "guidelineVersion": "2.1.0",
         "propertyTaxonomyVersion": "0.1.2",
-        "requirementsMatrixVersion": "2.1.0-r2",
+        "requirementsMatrixVersion": "2.1.0-r3",
         "specVersions": ["1.6", "1.7"],
         "requirements": TR03183_2_REQUIREMENTS,
     },
@@ -609,13 +734,14 @@ def _evaluate_requirement(row, spec_version, sbom, vex, facts,
         result = row["check"](context)
 
     verdict, message = result[0], result[1]
+    origin = result[3] if len(result) > 3 else row["origin"]
     finding = {
         "requirementId": row["id"],
         "normativeSource": row["source"],
         "cyclonedxRepresentation": row["representation"],
         "applicability": applicability,
         "verdict": verdict,
-        "evidenceOrigin": row["origin"],
+        "evidenceOrigin": origin,
         "diagnosticMessage": message,
     }
     declared_refs = result[2] if len(result) > 2 else None
