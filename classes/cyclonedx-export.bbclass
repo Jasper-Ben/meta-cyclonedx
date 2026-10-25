@@ -1590,65 +1590,104 @@ def export_cyclonedx(d, deploy_phase=False):
     timestamp = datetime.now(timezone.utc).isoformat()
 
 
-    # taken from https://github.com/yoctoproject/poky/blob/fec201518be3c35a9359ec8c37675a33e458b92d/meta/classes/cve-check.bbclass
-    # SPDX-License-Identifier: MIT
-    # SPDX-FileCopyrightText: Copyright OpenEmbedded Contributors
-    # Determine runtime packages for scope assignment
-    runtime_recipes = list_runtime_recipes(d)
+    is_image = bb.data.inherits_class("image", d)
+    profile = (d.getVar("CYCLONEDX_PROFILE") or "")
 
-    # Determine recipes explicitly requested by the image author.
-    image_install_recipes = list_image_install_recipes(d)
-
-    # Determine which recipes to include
-    recipes = set()
-    if d.getVar('CYCLONEDX_RUNTIME_PACKAGES_ONLY') == "1":
-        recipes = set(runtime_recipes)
+    # Image recipes under a profile generate twice: once in do_rootfs
+    # and finally, with the complete deployable-artifact evidence, in
+    # do_deploy_cyclonedx (ticket #10). The runtime facts below come
+    # from the package manager's view of the assembled root filesystem,
+    # and that view only exists inside do_rootfs's pseudo environment:
+    # querying it again in the deploy phase makes dnf fail and fails
+    # the task. The rootfs phase therefore persists the facts it
+    # assembled, and the deploy phase reuses them instead of
+    # re-deriving anything from installed packages.
+    facts_file = os.path.join(d.getVar("WORKDIR"),
+                              "cyclonedx-rootfs-facts.json")
+    if profile and is_image and deploy_phase:
+        if not os.path.exists(facts_file):
+            bb.fatal(f"CycloneDX rootfs-phase facts {facts_file} missing; "
+                     "was do_rootfs run without the profile?")
+        rootfs_facts = read_json(facts_file)
+        fragments = rootfs_facts["fragments"]
+        runtime_recipes = set(rootfs_facts["runtime_recipes"])
+        image_install_recipes = set(rootfs_facts["image_install_recipes"])
+        runtime_edges = {pkg: set(deps)
+                         for pkg, deps in rootfs_facts["runtime_edges"].items()}
     else:
-        recipes = list_buildtime_recipes(d).union(runtime_recipes)
+        # taken from https://github.com/yoctoproject/poky/blob/fec201518be3c35a9359ec8c37675a33e458b92d/meta/classes/cve-check.bbclass
+        # SPDX-License-Identifier: MIT
+        # SPDX-FileCopyrightText: Copyright OpenEmbedded Contributors
+        # Determine runtime packages for scope assignment
+        runtime_recipes = list_runtime_recipes(d)
 
-    # Always include explicitly requested recipes (e.g. optee-os embedded in fitImage)
-    # Resolve virtual/* entries via PREFERRED_PROVIDER_*
-    extra_recipes = set()
+        # Determine recipes explicitly requested by the image author.
+        image_install_recipes = list_image_install_recipes(d)
 
-    for recipe in (d.getVar('CYCLONEDX_EXTRA_RUNTIME_RECIPES') or '').split():
-        if recipe.startswith("virtual/"):
-            resolved = (d.getVar("PREFERRED_RPROVIDER_" + recipe)
-                        or d.getVar("PREFERRED_PROVIDER_" + recipe))
-            if not resolved:
-                bb.warn(f"CYCLONEDX_EXTRA_RUNTIME_RECIPES: no provider for {recipe}, skipping")
+        # Determine which recipes to include
+        recipes = set()
+        if d.getVar('CYCLONEDX_RUNTIME_PACKAGES_ONLY') == "1":
+            recipes = set(runtime_recipes)
+        else:
+            recipes = list_buildtime_recipes(d).union(runtime_recipes)
+
+        # Always include explicitly requested recipes (e.g. optee-os embedded in fitImage)
+        # Resolve virtual/* entries via PREFERRED_PROVIDER_*
+        extra_recipes = set()
+
+        for recipe in (d.getVar('CYCLONEDX_EXTRA_RUNTIME_RECIPES') or '').split():
+            if recipe.startswith("virtual/"):
+                resolved = (d.getVar("PREFERRED_RPROVIDER_" + recipe)
+                            or d.getVar("PREFERRED_PROVIDER_" + recipe))
+                if not resolved:
+                    bb.warn(f"CYCLONEDX_EXTRA_RUNTIME_RECIPES: no provider for {recipe}, skipping")
+                    continue
+                bb.debug(2, f"CYCLONEDX_EXTRA_RUNTIME_RECIPES: resolved {recipe} -> {resolved}")
+                recipe = resolved
+            extra_recipes.add(recipe)
+        recipes = recipes.union(extra_recipes)
+
+        # Extra runtime recipes are runtime content and direct image-install intent.
+        runtime_recipes = set(runtime_recipes) | extra_recipes
+        image_install_recipes = set(image_install_recipes).union(extra_recipes)
+
+        # Load the per-recipe facts written by do_populate_cyclonedx. They are
+        # plain JSON fragments; the renderer never sees the data store.
+        fragments = {}
+        pkgarchs = d.getVar("SSTATE_ARCHS").split()
+        pkgarchs.reverse()
+        for pkg in sorted(recipes):
+            for pkgarch in pkgarchs:
+                pn_list_filepath = os.path.join(d.getVar("CYCLONEDX_PNDATA"),
+                                                pkgarch, f"{pkg}.json")
+                if os.path.exists(pn_list_filepath):
+                    break
+            if not os.path.exists(pn_list_filepath):
+                bb.error(f"CycloneDX PN file not found: {pkg}.json")
                 continue
-            bb.debug(2, f"CYCLONEDX_EXTRA_RUNTIME_RECIPES: resolved {recipe} -> {resolved}")
-            recipe = resolved
-        extra_recipes.add(recipe)
-    recipes = recipes.union(extra_recipes)
+            fragments[pkg] = read_json(pn_list_filepath)
 
-    # Extra runtime recipes are runtime content and direct image-install intent.
-    runtime_recipes = set(runtime_recipes) | extra_recipes
-    image_install_recipes = set(image_install_recipes).union(extra_recipes)
+        # Runtime edges derived from pkgdata cover RRECOMMENDS, per-package
+        # RDEPENDS and generated shlib dependencies, which the recipe metadata
+        # alone misses. With configured export dependencies the caller has
+        # resolved them instead.
+        runtime_edges = {}
+        if not (d.getVar("CYCLONEDX_EXPORT_DEPENDS") or "").split():
+            runtime_edges = build_runtime_dependency_edges(d)
 
-    # Load the per-recipe facts written by do_populate_cyclonedx. They are
-    # plain JSON fragments; the renderer never sees the data store.
-    fragments = {}
-    pkgarchs = d.getVar("SSTATE_ARCHS").split()
-    pkgarchs.reverse()
-    for pkg in sorted(recipes):
-        for pkgarch in pkgarchs:
-            pn_list_filepath = os.path.join(d.getVar("CYCLONEDX_PNDATA"),
-                                            pkgarch, f"{pkg}.json")
-            if os.path.exists(pn_list_filepath):
-                break
-        if not os.path.exists(pn_list_filepath):
-            bb.error(f"CycloneDX PN file not found: {pkg}.json")
-            continue
-        fragments[pkg] = read_json(pn_list_filepath)
-
-    # Runtime edges derived from pkgdata cover RRECOMMENDS, per-package
-    # RDEPENDS and generated shlib dependencies, which the recipe metadata
-    # alone misses. With configured export dependencies the caller has
-    # resolved them instead.
-    runtime_edges = {}
-    if not (d.getVar("CYCLONEDX_EXPORT_DEPENDS") or "").split():
-        runtime_edges = build_runtime_dependency_edges(d)
+        # The profile's final generation in do_deploy_cyclonedx reuses
+        # these assembled facts beside the file inventory written
+        # below; the record of the build-time recipe selection stays in
+        # the file for provenance (the fragments carry its result).
+        if profile and is_image and not deploy_phase:
+            write_json(facts_file, {
+                "runtime_recipes": sorted(runtime_recipes),
+                "image_install_recipes": sorted(image_install_recipes),
+                "recipes": sorted(recipes),
+                "runtime_edges": {pkg: sorted(deps)
+                                  for pkg, deps in runtime_edges.items()},
+                "fragments": fragments,
+            })
 
     # Statically linked dependency evidence from the debugsrc lists
     # recorded in pkgdata; the renderer derives the edges and never parses
@@ -1664,13 +1703,12 @@ def export_cyclonedx(d, deploy_phase=False):
     # deployable artifact's bytes are final (ticket #10; hashing them
     # inside do_rootfs would chase a moving target). The final
     # generation reuses the root-filesystem inventory persisted by the
-    # rootfs phase instead of re-walking the rootfs outside its pseudo
-    # environment.
+    # rootfs phase (like the recipe facts above) instead of re-walking
+    # the rootfs outside its pseudo environment.
     file_inventory = {}
     inventory_file = os.path.join(d.getVar("WORKDIR"),
                                   "cyclonedx-file-inventory.json")
-    is_image = bb.data.inherits_class("image", d)
-    if (d.getVar("CYCLONEDX_PROFILE") or ""):
+    if profile:
         if deploy_phase and is_image:
             if os.path.exists(inventory_file):
                 file_inventory = read_json(inventory_file)
