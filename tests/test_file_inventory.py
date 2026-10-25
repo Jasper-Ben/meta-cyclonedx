@@ -146,3 +146,42 @@ def test_unreadable_mandatory_artifact_produces_an_alignment_finding():
         [file_ref("busybox", "/bin/sh")]
     assert finding_by_id(docs["report"], "REQ-FILE-001")["verdict"] == "verified"
     assert finding_by_id(docs["report"], "REQ-FILE-003")["verdict"] == "verified"
+
+
+def test_strict_enforcement_fails_on_defective_mandatory_artifacts():
+    facts = default_facts(
+        config=profile_config(enforcement="strict"),
+        file_inventory={"busybox": [
+            file_entry("/bin/sh", sha512="a" * 128),
+            file_entry("/var/db/ghost.pkg", error="missing"),
+            file_entry("/usr/bin/truncated.zip", error="ambiguous-classification"),
+        ]},
+    )
+    docs, _logs = render_all(facts)
+
+    assert "sbom" not in docs
+    failure = docs["failure"]
+    assert "REQ-FILE-002" in failure["unmetRequirementIds"]
+    finding = finding_by_id(failure["report"], "REQ-FILE-002")
+    assert finding["bomRefs"] == [file_ref("busybox", "/usr/bin/truncated.zip"),
+                                  file_ref("busybox", "/var/db/ghost.pkg")]
+    assert "missing" in finding["diagnosticMessage"]
+    assert "ambiguous-classification" in finding["diagnosticMessage"]
+    # The usable file still reached the report evaluation; nothing vanished.
+    assert finding_by_id(failure["report"],
+                         "REQ-FILE-001")["verdict"] == "verified"
+
+
+def test_file_inventory_requirements_are_not_applicable_without_inventory():
+    docs, _logs = render_all(default_facts(config=profile_config()))
+    for requirement_id in ("REQ-FILE-001", "REQ-FILE-002", "REQ-FILE-003"):
+        finding = finding_by_id(docs["report"], requirement_id)
+        assert finding["applicability"] == "not-applicable", requirement_id
+        assert finding["verdict"] == "unverifiable", requirement_id
+    # Without inventory data the file rows add nothing to strict output.
+    strict, _logs = render_all(default_facts(
+        config=profile_config(enforcement="strict")))
+    report = strict.get("report") or strict.get("failure", {}).get("report")
+    assert all(finding["applicability"] == "not-applicable"
+               for finding in report["findings"]
+               if finding["requirementId"].startswith("REQ-FILE"))
