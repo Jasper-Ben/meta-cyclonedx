@@ -1319,6 +1319,123 @@ def collect_debug_sources(d, recipes):
     return sources
 
 
+def _file_mode_is_executable(mode):
+    """True when a pkgdata files_info mode says executable."""
+    if mode is None:
+        return False
+    try:
+        return bool(int(str(mode), 8) & 0o111)
+    except ValueError:
+        return False
+
+
+def collect_file_inventory(d, recipes):
+    """
+    Collect the mandatory-file artifact facts of the assembled root
+    filesystem for the alignment profile: every delivered executable and
+    archive, classified deterministically and hashed with SHA-512 over
+    the delivered bytes; nothing else is inventoried (ADR-0005) and no
+    binary analysis, debug extraction or dependency inference from file
+    contents ever happens (ADR-0002).
+
+    Discovery reuses the pkgdata files_info records that
+    collect_debug_sources() already consumes: they name the files the
+    packages deliver, keyed by delivered path. The rootfs existence
+    check is the delivery ground truth - files of packages that were not
+    installed (e.g. -dbg, -src) never enter the inventory - and a path
+    claimed by several recipes is attributed to the first in sorted
+    recipe order. Classification lives in the renderer's pure
+    classify_delivered_file(); the delivered lstat mode decides, so the
+    always-executable bits of symlinks never count: a symlink is a second
+    name for the regular file it resolves to, not an artifact of its own.
+    Hashes mix in no mode, path or timestamp, and the adapter reads the
+    rootfs inside the task's pseudo environment during do_rootfs.
+    Entries that are missing, unreadable or not decidable from the
+    signature carry an error kind instead of vanishing (ADR-0004).
+
+    Cost: one pkgdata extended-record pass (same files debug-source
+    collection already reads), the first 64 KiB of every claimed file
+    for signature checks, plus a full read and SHA-512 of each mandatory
+    file. A core-image-minimal rootfs is tens of megabytes, so hashing
+    adds well under a second; non-mandatory content is never hashed.
+    """
+    import hashlib
+    import os
+    import stat
+    import oe.packagedata
+
+    renderer = _cyclonedx_renderer(d)
+    rootfs = d.getVar("IMAGE_ROOTFS")
+    if not rootfs or not os.path.isdir(rootfs):
+        bb.note("CycloneDX file inventory: no assembled root filesystem; "
+                "the file inventory is empty for this export")
+        return {}
+
+    claims = {}
+    for pn in sorted(recipes):
+        recipe_data = oe.packagedata.read_pkgdata(pn, d)
+        packages = (recipe_data.get("PACKAGES") or pn).split()
+        for pkg in sorted(packages):
+            extended = oe.packagedata.read_subpkgdata_extended(pkg, d)
+            if not extended:
+                continue
+            for fpath, info in (extended.get("files_info") or {}).items():
+                claims.setdefault(fpath,
+                                  (pn, (info or {}).get("mode")))
+
+    def defective(pn, fpath, kind):
+        bb.warn(f"CycloneDX file inventory: {pn}: delivered mandatory file "
+                f"{fpath} is {kind}")
+        inventory.setdefault(pn, []).append({"path": fpath, "error": kind})
+
+    inventory = {}
+    for fpath, (pn, mode_hint) in sorted(claims.items()):
+        delivered = os.path.join(rootfs, fpath.lstrip("/"))
+        try:
+            mode = os.lstat(delivered).st_mode
+        except FileNotFoundError:
+            if _file_mode_is_executable(mode_hint):
+                defective(pn, fpath, "missing")
+            continue
+        except OSError:
+            if _file_mode_is_executable(mode_hint):
+                defective(pn, fpath, "unreadable")
+            continue
+        if not stat.S_ISREG(mode):
+            continue  # symlinks and special entries: not artifacts
+        try:
+            with open(delivered, "rb") as artifact:
+                head = artifact.read(renderer.ARTIFACT_HEAD_SIZE)
+        except OSError:
+            if (renderer.classify_delivered_file(
+                    fpath, mode, b"")["executable"] == "executable"):
+                defective(pn, fpath, "unreadable")
+            continue
+        if not renderer.classify_delivered_file(fpath, mode,
+                                                head)["mandatory"]:
+            continue
+        try:
+            with open(delivered, "rb") as artifact:
+                data = artifact.read()
+        except OSError:
+            defective(pn, fpath, "unreadable")
+            continue
+        verdict = renderer.classify_delivered_file(fpath, mode, data)
+        entry = {key: verdict[key]
+                 for key in ("executable", "archive", "structured")
+                 if key in verdict}
+        entry["path"] = fpath
+        if verdict.get("error"):
+            entry["error"] = verdict["error"]
+            bb.warn(f"CycloneDX file inventory: {pn}: delivered mandatory "
+                    f"file {fpath} is {verdict['error']}")
+        else:
+            entry["sha512"] = hashlib.sha512(data).hexdigest()
+        inventory.setdefault(pn, []).append(entry)
+    return {pn: sorted(entries, key=lambda e: e["path"])
+            for pn, entries in sorted(inventory.items())}
+
+
 def export_cyclonedx(d):
     """
     Collect normalized build facts and artifact facts, hand them to the
@@ -1396,6 +1513,12 @@ def export_cyclonedx(d):
     # recorded in pkgdata; the renderer derives the edges and never parses
     # a delivered binary.
     debug_sources = collect_debug_sources(d, sorted(fragments))
+
+    # The mandatory delivered-file inventory belongs to the alignment
+    # profile (ADR-0005); without one, no file is read or hashed at all.
+    file_inventory = {}
+    if (d.getVar("CYCLONEDX_PROFILE") or ""):
+        file_inventory = collect_file_inventory(d, sorted(fragments))
 
     primary = {
         "type": d.getVar("CYCLONEDX_IMAGE_TYPE") or "firmware",
@@ -1475,6 +1598,7 @@ def export_cyclonedx(d):
         "image_install_recipes": sorted(image_install_recipes),
         "runtime_edges": {pkg: sorted(deps) for pkg, deps in runtime_edges.items()},
         "debug_sources": debug_sources,
+        "file_inventory": file_inventory,
         "included_images": included_images,
     })
     if "failure" in docs:
