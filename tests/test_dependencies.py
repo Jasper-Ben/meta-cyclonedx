@@ -1,6 +1,7 @@
 """Dependency graph behavior: root node, token resolution, merging, pruning."""
 
-from helpers import default_facts, dep, fragment, pkg, ref_of, render_docs, root_entry
+from helpers import (default_facts, dep, dep_entry, fragment, pkg,
+                     ref_of, render_docs, root_entry)
 
 
 def test_root_node_is_first_and_lists_directly_installed_components():
@@ -59,28 +60,30 @@ def test_dependency_token_resolves_to_the_recipes_single_logical_component():
     assert entry["dependsOn"] == ["ref-app"]
 
 
-def test_dependency_on_a_recipe_outside_the_image_is_pruned():
+def test_dependency_on_a_recipe_outside_the_image_identifies_the_boundary():
+    # The known path continues through the first component outside the
+    # scope of delivery; it is never pruned from the evidence (ADR-0004).
     facts = default_facts(fragments={
         "app": fragment(pkgs=[pkg("app", "1", "ref-app")],
                         dependencies=[dep("ref-app", ["busybox", "ghost"])]),
         "busybox": fragment(pkgs=[pkg("busybox", "1.36", "ref-b")]),
     })
-    sbom, _vex, logs = render_docs(facts)
+    sbom, _vex, _logs = render_docs(facts)
 
     entry = next(e for e in sbom["dependencies"] if e["ref"] == "ref-app")
-    assert entry["dependsOn"] == ["ref-b"]
-    assert any("ghost" in message for _level, message in logs)
+    ghost = next(c for c in sbom["components"] if c["name"] == "ghost")
+    assert entry["dependsOn"] == ["ref-b", ghost["bom-ref"]]
 
 
-def test_self_dependency_is_dropped():
+def test_self_dependency_edge_is_dropped_from_the_component_entry():
     facts = default_facts(fragments={
         "app": fragment(pkgs=[pkg("app", "1", "ref-app")],
                         dependencies=[dep("ref-app", ["app"])]),
     })
     sbom, _vex, _logs = render_docs(facts)
 
-    assert "ref-app" not in [e["ref"] for e in sbom["dependencies"]
-                             if e["ref"] != sbom["metadata"]["component"]["bom-ref"]]
+    entry = dep_entry(sbom, "ref-app")
+    assert entry["dependsOn"] == []
 
 
 def test_runtime_edges_are_merged_into_existing_recipe_edges():
@@ -108,14 +111,15 @@ def test_runtime_edges_alone_produce_dependency_entries():
     assert entry["dependsOn"] == ["ref-libc"]
 
 
-def test_fragments_without_edges_have_no_dependency_node():
+def test_fragments_without_edges_still_get_a_leaf_dependency_node():
     facts = default_facts(fragments={
         "busybox": fragment(pkgs=[pkg("busybox", "1.36", "ref-b")]),
     })
     sbom, _vex, _logs = render_docs(facts)
 
     refs = [e["ref"] for e in sbom["dependencies"]]
-    assert refs == [sbom["metadata"]["component"]["bom-ref"]]
+    assert refs == [sbom["metadata"]["component"]["bom-ref"], "ref-b"]
+    assert dep_entry(sbom, "ref-b")["dependsOn"] == []
 
 
 def test_dependency_component_refs_point_at_rendered_components():
