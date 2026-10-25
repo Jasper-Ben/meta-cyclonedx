@@ -269,6 +269,99 @@ def component_identity(bpn, pv, purl, cve_products=None, cve_versions=None,
     return pkg
 
 
+def component_correlation_cpes(component):
+    """Every correlation CPE of a component: its own plus alias CPEs."""
+    cpes = set()
+    if component.get("cpe"):
+        cpes.add(component["cpe"])
+    for prop in component.get("properties") or []:
+        if prop.get("name") == ALIAS_CPE_PROPERTY and prop.get("value"):
+            cpes.add(prop["value"])
+    return cpes
+
+
+def identity_collisions(sbom, vex=None):
+    """
+    Group the components whose CPE correlation identifiers collide.
+
+    Components sharing at least one CPE (transitively) form one collision
+    group. A group is explained when every member carries observable
+    evidence that distinguishes it from all others — package purl, licence
+    set, dependency targets or VEX status — which is exactly the case for
+    genuinely independent instances. Any two members indistinguishable on
+    all these axes are an unresolved identity collision. Returns a list
+    of dicts with keys bomRefs and correlationCpes (both sorted) and bool
+    explained, ordered by the first bomRef.
+    """
+    components_by_ref = {}
+    for component in sbom.get("components") or []:
+        ref = component.get("bom-ref")
+        if ref:
+            components_by_ref[ref] = component
+
+    dep_targets = {}
+    for entry in sbom.get("dependencies") or []:
+        ref = entry.get("ref")
+        if ref:
+            dep_targets[ref] = sorted(set(entry.get("dependsOn") or []))
+
+    vex_status = {}
+    for vuln in (vex or {}).get("vulnerabilities") or []:
+        state = (vuln.get("analysis") or {}).get("state")
+        for affect in vuln.get("affects") or []:
+            _prefix, _sep, ref = (affect.get("ref") or "").rpartition("#")
+            if ref:
+                vex_status.setdefault(ref, []).append((vuln["id"], state))
+
+    def distinguishable_evidence(component):
+        ref = component.get("bom-ref")
+        return (
+            component.get("purl"),
+            json.dumps(component.get("licenses"), sort_keys=True),
+            tuple(dep_targets.get(ref, [])),
+            tuple(sorted(vex_status.get(ref, []))))
+
+    # union-find over the shared-CPE relation
+    parents = {ref: ref for ref in components_by_ref}
+
+    def find(ref):
+        while parents[ref] != ref:
+            ref = parents[ref]
+        return ref
+
+    cpe_owner = {}
+    for ref in sorted(components_by_ref):
+        for cpe in sorted(component_correlation_cpes(components_by_ref[ref])):
+            owner = cpe_owner.get(cpe)
+            if owner is None:
+                cpe_owner[cpe] = ref
+                continue
+            root_owner, root_ref = find(owner), find(ref)
+            if root_owner != root_ref:
+                parents[root_ref] = root_owner
+
+    groups = {}
+    for ref in sorted(components_by_ref):
+        groups.setdefault(find(ref), []).append(ref)
+
+    collisions = []
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        cpes = set()
+        for ref in group:
+            cpes |= component_correlation_cpes(components_by_ref[ref])
+        evidence = [distinguishable_evidence(components_by_ref[ref])
+                    for ref in group]
+        collisions.append({
+            "bomRefs": sorted(group),
+            "correlationCpes": sorted(cpes),
+            "explained": len(set(evidence)) == len(evidence),
+        })
+    collisions.sort(key=lambda collision: collision["bomRefs"][0])
+    return collisions
+
+
 def normalize_cve_id(cve_id):
     """
     Normalize CVE ID by removing patch file suffixes.
@@ -696,11 +789,30 @@ def render(facts):
     # Sort vulnerabilities by CVE id for a stable, human-readable order.
     vex["vulnerabilities"].sort(key=lambda v: v["id"])
 
+    # CPE equality never authorizes deduplication; ambiguous identity
+    # collisions are reported instead. Explainable groups (distinct
+    # artifact, build, dependency, licence or vulnerability evidence) are
+    # deliberately separate instances; indistinguishable duplicates are
+    # an unresolved collision.
+    collisions = identity_collisions(sbom, vex)
+    for collision in collisions:
+        refs = ", ".join(collision["bomRefs"])
+        cpes = ", ".join(collision["correlationCpes"])
+        if collision["explained"]:
+            _log(log, 2, f"Component instances {refs} share CPE(s) {cpes} "
+                         f"with distinct evidence; kept separate")
+        else:
+            _log(log, "warn", f"Unexplained component identity collision: "
+                              f"{refs} share CPE(s) {cpes} with identical "
+                              f"artifact, build, dependency, licence and "
+                              f"vulnerability evidence; kept separate, never "
+                              f"deduplicated")
+
     if not profile:
         return {"sbom": sbom, "vex": vex}
 
     baseline, findings = _alignment_profile().evaluate(
-        profile, spec_version, sbom, vex, facts)
+        profile, spec_version, sbom, vex, facts, collisions=collisions)
     report = {
         "alignmentProfile": profile,
         "alignmentEnforcement": enforcement,
@@ -731,7 +843,8 @@ def merge_sbom_cve_check(sbom, vex, report, config, log=None):
     Map a completed sbom-cve-check report onto the VEX document.
 
     Issues are attached to the logical components they match in the SBOM
-    (by CPE first, falling back to the recipe purl), duplicate statements
+    (by any correlation CPE — the component's own or a CVE alias — first,
+    falling back to the recipe purl), duplicate statements
     already covered by the VEX are skipped, and every remaining issue
     becomes one statement per analysis (id, detail, state). The VEX is
     modified in place; returns the number of added statements.
@@ -740,8 +853,8 @@ def merge_sbom_cve_check(sbom, vex, report, config, log=None):
     refs_by_cpe = {}
     refs_by_pn = {}
     for component in sbom.get("components", []):
-        if component.get("cpe"):
-            refs_by_cpe.setdefault(component["cpe"], []).append(component["bom-ref"])
+        for cpe in sorted(component_correlation_cpes(component)):
+            refs_by_cpe.setdefault(cpe, []).append(component["bom-ref"])
         purl = component.get("purl", "")
         if purl.startswith("pkg:yocto/"):
             refs_by_pn.setdefault(purl.split("/")[-1].split("@")[0], []).append(component["bom-ref"])
