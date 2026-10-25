@@ -20,7 +20,135 @@ meta-cyclonedx uses this to produce an alignment report; it never labels an
 SBOM, product or manufacturer conformant with TR-03183-2 or the CRA.
 """
 
+import importlib
+import importlib.util
+import os
+import re
+import sys
 import urllib.parse
+
+# Identifier syntax rules, generous per ecosystem but strict about the
+# envelopes downstream vulnerability tooling parses:
+# - Package URL: pkg:<type>/[<namespace>/]<name>[@<version>][?<quals>][#<subpath>]
+#   with percent-encoded segments (purl-spec).
+_PURL = re.compile(
+    r"^pkg:[A-Za-z][A-Za-z0-9.+-]*"
+    r"(?:/(?:[A-Za-z0-9._~+-]|%[0-9A-Fa-f]{2})+)+"
+    r"(?:@[^/?#]*)?(?:\?[^#]*)?(?:#.*)?$")
+# - CPE 2.3 formatted binding: cpe:2.3: followed by exactly eleven
+#   colon-separated fields, escapes allowed, no whitespace.
+_CPE_23 = re.compile(r"^cpe:2\.3(?::[^:\s]*){11}$")
+# - SHA-512: 512 bits of lowercase hexadecimal.
+_SHA512_HEX = re.compile(r"^[0-9a-f]{128}$")
+ALIAS_CPE_PROPERTY = "yocto:cve:cpe"
+SHA512_ALGORITHM = "SHA-512"
+
+
+def _hash_occurrences(sbom):
+    """(holder ref or None, hash dict, misplaced) for every hash object
+    naming SHA-512; misplaced means outside component/properties-holding
+    components, i.e. not riding components[].hashes[]."""
+    holders = {id(component): ref
+               for ref, component in _taxonomy_property_holders(sbom)}
+    occurrences = []
+
+    def walk(node, holder_ref):
+        if isinstance(node, dict):
+            own_ref = holders.get(id(node))
+            if own_ref is not None:
+                holder_ref = own_ref
+            if node.get("alg") == SHA512_ALGORITHM:
+                occurrences.append((holder_ref, node, holder_ref is None))
+            for value in node.values():
+                walk(value, holder_ref)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, holder_ref)
+
+    walk(sbom, None)
+    return occurrences
+
+
+def _check_purl_syntax(context):
+    invalid = sorted({
+        ref for ref, component in _taxonomy_property_holders(
+            context["sbom"])
+        if component.get("purl")
+        and not _PURL.match(str(component["purl"]))})
+    if invalid:
+        return ("unmet", "component purls are not valid Package URLs "
+                         "(pkg:<type>/[<namespace>/]<name>[@<version>])",
+                invalid)
+    return ("verified", "every emitted purl parses as a Package URL")
+
+
+def _check_cpe_syntax(context):
+    invalid = set()
+    for ref, component in _taxonomy_property_holders(context["sbom"]):
+        cpe = component.get("cpe")
+        if cpe and not _CPE_23.match(str(cpe)):
+            invalid.add(ref)
+        for prop in component.get("properties") or []:
+            if (prop.get("name") == ALIAS_CPE_PROPERTY
+                    and not _CPE_23.match(str(prop.get("value") or ""))):
+                invalid.add(ref)
+    named = sorted(ref for ref in invalid if ref)
+    if invalid:
+        return ("unmet", "CPE identifiers are not formatted CPE 2.3 "
+                         "strings (cpe:2.3: with eleven fields)", named)
+    return ("verified", "every emitted CPE is a formatted CPE 2.3 string")
+
+
+def _check_sha512_syntax(context):
+    misplaced = set()
+    malformed = set()
+    for ref, entry, is_misplaced in _hash_occurrences(context["sbom"]):
+        if is_misplaced:
+            misplaced.add(ref)
+        elif not _SHA512_HEX.match(str(entry.get("content") or "")):
+            malformed.add(ref)
+    if misplaced or malformed:
+        message = ("SHA-512 artifacts are not lowercase hex of 512 bits "
+                   "riding components[].hashes[] under the SHA-512 "
+                   "algorithm")
+        if misplaced:
+            message += ("; some occur outside components[]/hashes[] where "
+                        "the TR places them")
+        refs = sorted({ref for ref in (misplaced | malformed) if ref})
+        return "unmet", message, refs
+    return ("verified", "every SHA-512 is lowercase hex of 512 bits in "
+                        "components[].hashes[] under the SHA-512 "
+                        "algorithm")
+import importlib.util
+import os
+import sys
+import urllib.parse
+
+
+def _schema_validation():
+    """
+    Load the shared CycloneDX schema-validation module that sits next to
+    this file. Under BitBake the layer's lib directory is not on the
+    worker's module search path, so fall back to loading by path, the way
+    this module itself is loaded. That module feature-detects the optional
+    jsonschema dependency and the vendored schemas: a validator that
+    cannot run yields `unverifiable` verdicts, never a silent pass.
+    """
+    module = sys.modules.get("cyclonedx_schema_validation")
+    if module is not None:
+        return module
+    try:
+        return importlib.import_module("schema_validation")
+    except ImportError:
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "schema_validation.py")
+        spec = importlib.util.spec_from_file_location(
+            "cyclonedx_schema_validation", path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules["cyclonedx_schema_validation"] = module
+        spec.loader.exec_module(module)
+        return module
+
 
 # Evaluation rules return a verdict for one requirement against one
 # rendered document set; they live next to the rows they evaluate.
@@ -35,6 +163,200 @@ def _check_cyclonedx_format(context):
     return "unmet", (f"the SBOM is not a CycloneDX JSON document at spec "
                      f"version 1.6 or later (bomFormat {sbom.get('bomFormat')!r}, "
                      f"specVersion {version!r})")
+
+
+# Every emitted SBOM and VEX is validated against the official schema of
+# the selected CycloneDX version before publication.
+def _document_schema_check(kind_label, document_key):
+    def check(context):
+        status, diagnostics = _schema_validation().check(
+            context[document_key], context["spec_version"])
+        if status == "valid":
+            return ("verified",
+                    f"the emitted {kind_label} validates against the "
+                    f"official CycloneDX {context['spec_version']} JSON "
+                    "schema")
+        if status == "unavailable":
+            return ("unverifiable",
+                    f"schema validation of the {kind_label} cannot run "
+                    f"({diagnostics}); the document is not assumed valid")
+        return ("unmet",
+                f"the emitted {kind_label} violates the official "
+                f"CycloneDX {context['spec_version']} JSON schema: "
+                f"{diagnostics}")
+    return check
+
+
+def _check_sbom_schema(context):
+    return _document_schema_check("SBOM", "sbom")(context)
+
+
+def _check_vex_schema(context):
+    return _document_schema_check("VEX", "vex")(context)
+
+
+# The pinned BSI CycloneDX property taxonomy registry (v0.1.2,
+# https://github.com/tr-03183/tr-03183-cyclonedx-property-taxonomy tag
+# 0.1.2), vendored verbatim under lib/data/ for provenance; the drift
+# guard in tests/test_taxonomy_validation.py keeps this registry and
+# that document naming exactly the same properties. The registry only
+# allows these properties in components[]/properties and
+# metadata/component/properties; per-component presence rules are the
+# registry's own wording ("MUST occur exactly once per component" when
+# the property is used, filename "at most once").
+BSI_TAXONOMY_VERSION = "0.1.2"
+BSI_TAXONOMY_NAMESPACE = "bsi:"
+BSI_TAXONOMY = {
+    "bsi:component:executable":
+        {"values": ("executable", "non-executable")},
+    "bsi:component:archive":
+        {"values": ("archive", "no archive")},
+    "bsi:component:structured":
+        {"values": ("structured", "unstructured")},
+    "bsi:component:filename":
+        {"values": None, "atMostOnce": True, "bareFilename": True},
+    "bsi:component:effectiveLicence":
+        {"values": None, "atMostOnce": True},
+    # Registered in v0.1.2 but deprecated (spelled for TR v2.0.0).
+    "bsi:component:associatedLicences":
+        {"values": None, "atMostOnce": True},
+}
+# The classifiable-file triple: when one of these applies to a
+# component, the registry expects all three, exactly once each.
+BSI_TAXONOMY_CLASSIFIABLE_TRIPLE = ("bsi:component:executable",
+                                    "bsi:component:archive",
+                                    "bsi:component:structured")
+
+
+def _taxonomy_property_holders(sbom):
+    """Every component property holder the registry allows: the primary
+    component and every components[] entry (recursively). The primary
+    component's bom-ref is document-random and never named in findings."""
+    holders = [(None, (sbom.get("metadata") or {}).get("component") or {})]
+    stack = list(sbom.get("components") or [])
+    while stack:
+        component = stack.pop()
+        if not isinstance(component, dict):
+            continue
+        holders.append((component.get("bom-ref"), component))
+        stack.extend(entry for entry in component.get("components") or []
+                     if isinstance(entry, dict))
+    return holders
+
+
+def _taxonomy_property_occurrences(sbom):
+    """(holder ref or None, property dict, misplaced) for every bsi:
+    property entry in the document, misplaced ones named by their
+    containing location instead of a component."""
+    occurrences = []
+    holders = {id(component): ref
+               for ref, component in _taxonomy_property_holders(sbom)}
+
+    def walk(node, holder_ref):
+        if isinstance(node, dict):
+            own_ref = holders.get(id(node))
+            if own_ref is not None:
+                holder_ref = own_ref
+            for key, value in node.items():
+                if key == "properties" and isinstance(value, list):
+                    for prop in value:
+                        if (isinstance(prop, dict) and str(
+                                prop.get("name") or "").startswith(
+                                    BSI_TAXONOMY_NAMESPACE)):
+                            occurrences.append(
+                                (holder_ref, prop, holder_ref is None))
+                else:
+                    walk(value, holder_ref)
+        elif isinstance(node, list):
+            for item in node:
+                walk(item, holder_ref)
+
+    walk(sbom, None)
+    return occurrences
+
+
+def _check_taxonomy_registry(context):
+    occurrences = _taxonomy_property_occurrences(context["sbom"])
+    offending = [(ref, str(prop.get("name")), misplaced)
+                 for ref, prop, misplaced in occurrences
+                 if misplaced or prop.get("name") not in BSI_TAXONOMY]
+    if offending:
+        names = sorted({name for _ref, name, _misplaced in offending})
+        message = ("the document carries bsi: properties the pinned "
+                   f"v{BSI_TAXONOMY_VERSION} taxonomy does not register "
+                   "here: " + ", ".join(names))
+        if any(misplaced for _ref, _name, misplaced in offending):
+            message += ("; registered properties may only appear in "
+                        "components[]/properties or "
+                        "metadata/component/properties")
+        refs = sorted({ref for ref, _name, _misplaced in offending if ref})
+        return "unmet", message, refs
+    return ("verified",
+            f"every bsi: property in the document is registered in the "
+            f"pinned v{BSI_TAXONOMY_VERSION} taxonomy and placed where "
+            "the registry allows")
+
+
+def _check_taxonomy_values(context):
+    violations = []
+    for ref, prop, misplaced in _taxonomy_property_occurrences(
+            context["sbom"]):
+        if misplaced:
+            continue  # placement is REQ-TAX-001's verdict
+        spec = BSI_TAXONOMY.get(prop.get("name"))
+        if spec is None:
+            continue  # unknown properties are REQ-TAX-001's verdict
+        value = prop.get("value")
+        bad = not isinstance(value, str) or not value.strip()
+        if not bad and spec["values"] and value not in spec["values"]:
+            bad = True
+        if (not bad and spec.get("bareFilename")
+                and ("/" in value or "\\" in value)):
+            bad = True
+        if bad:
+            violations.append((ref, prop.get("name"), value))
+    if violations:
+        detail = sorted({f"{name}={value!r}"
+                         for _ref, name, value in violations})
+        refs = sorted({ref for ref, _name, _value in violations if ref})
+        return ("unmet", "the document carries taxonomy property values "
+                         "outside the pinned registry's value domains: "
+                         + ", ".join(detail), refs)
+    return ("verified", "every registered taxonomy property value is a "
+                        "non-empty string inside the registry's value "
+                        "domain")
+
+
+def _check_taxonomy_cardinality(context):
+    violations = []
+    for ref, component in _taxonomy_property_holders(context["sbom"]):
+        names = [prop.get("name")
+                 for prop in component.get("properties") or []
+                 if prop.get("name") in BSI_TAXONOMY]
+        if not names:
+            continue
+        counts = {name: names.count(name) for name in set(names)}
+        violated = any(count > 1 for name, count in counts.items()
+                       if BSI_TAXONOMY[name].get("atMostOnce"))
+        triple_present = [name for name in BSI_TAXONOMY_CLASSIFIABLE_TRIPLE
+                          if counts.get(name, 0)]
+        if triple_present:
+            violated = violated or any(counts.get(name, 0) != 1
+                                       for name
+                                       in BSI_TAXONOMY_CLASSIFIABLE_TRIPLE)
+        if violated:
+            violations.append(ref)
+    if violations:
+        named = sorted({ref for ref in violations if ref})
+        message = ("taxonomy properties violate the pinned registry's "
+                   "cardinality: properties that must occur at most once "
+                   "per component repeat, or a partial executable/archive/"
+                   "structured triple occurs where one of them applies")
+        return "unmet", message, named
+    return ("verified", "every component's registered taxonomy properties "
+                        "obey the pinned registry's cardinality: the "
+                        "classifiable triple occurs complete exactly once, "
+                        "filename and licence properties at most once")
 
 
 def _check_sbom_creator(context):
@@ -349,7 +671,7 @@ _applies_deployable_uris, _check_deployable_uris = _uri_field(
 
 def _check_primary_component_creator(context):
     primary = (context["sbom"].get("metadata") or {}).get("component") or {}
-    if primary.get("author") or primary.get("contact"):
+    if primary.get("author") or primary.get("authors"):
         return "asserted", ("the product integration asserts the primary "
                             "component creator; meta-cyclonedx cannot "
                             "independently verify the manufacturer's "
@@ -427,7 +749,7 @@ def _check_component_creators(context):
                   for component in context["sbom"].get("components") or []
                   if component.get("type") != "file"]
     missing = [component["bom-ref"] for component in components
-               if not component.get("author") and not component.get("contact")]
+               if not component.get("author") and not component.get("authors")]
     if missing:
         return ("unverifiable",
                 ("components carry no creator identifiable by email address "
@@ -553,11 +875,77 @@ def _check_effective_licences(context):
 
 
 def _check_no_vulnerability_data_in_sbom(context):
-    if "vulnerabilities" in context["sbom"]:
-        return "unmet", ("the SBOM embeds vulnerability records; vulnerability "
-                         "status belongs in the separate VEX document")
-    return "verified", ("the SBOM carries no vulnerability data; status lives "
-                        "in the separate VEX document")
+    """Vulnerability data may hide at any depth: a top-level key, an
+    embedded image subtree copied verbatim into a component, a nested
+    components[] entry. The renderer copies foreign subtrees verbatim
+    (never repairs them), so the scan is document-wide."""
+    occurrences = _vulnerability_nodes(context["sbom"])
+    offenders = sorted({ref for ref, _node in occurrences if ref})
+    if offenders or any(ref is None for ref, _node in occurrences):
+        message = ("the SBOM embeds vulnerability records at one or more "
+                   "places; vulnerability status belongs in the separate "
+                   "VEX document")
+        if offenders:
+            message += " - within components " + ", ".join(offenders)
+        return "unmet", message, offenders
+    return ("verified", "the SBOM carries no vulnerability data at any "
+                        "depth; status lives in the separate VEX document")
+
+
+def _vulnerability_nodes(node, current_ref=None, seen=None):
+    """(owning bom-ref, value) for every `vulnerabilities` subtree in
+    the document, at any depth."""
+    if seen is None:
+        seen = set()
+    found = []
+    if id(node) in seen:
+        return found
+    seen.add(id(node))
+    if isinstance(node, dict):
+        ref = node.get("bom-ref") or current_ref
+        if "vulnerabilities" in node:
+            found.append((ref, node["vulnerabilities"]))
+        for value in node.values():
+            found.extend(_vulnerability_nodes(value, ref, seen))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_vulnerability_nodes(item, current_ref, seen))
+    return found
+
+
+def _check_vex_targets_logical_components(context):
+    """Every VEX assertion must resolve to a logical component of the
+    product SBOM; files are delivery detail, never vulnerability
+    subjects."""
+    components = {ref: component
+                  for ref, component in _taxonomy_property_holders(
+                      context["sbom"]) if ref}
+    dangling = set()
+    file_targets = set()
+    for statement in (context.get("vex") or {}).get(
+            "vulnerabilities") or []:
+        for affect in statement.get("affects") or []:
+            ref = affect.get("ref")
+            if not isinstance(ref, str) or not ref:
+                continue
+            ref = ref.rpartition("#")[2] or ref
+            component = components.get(ref)
+            if component is None:
+                dangling.add(ref)
+            elif component.get("type") == "file":
+                file_targets.add(ref)
+    if dangling or file_targets:
+        problems = []
+        if dangling:
+            problems.append("reference(s) that the SBOM does not define")
+        if file_targets:
+            problems.append("assertion(s) against file components, which "
+                            "are delivery detail and not vulnerability "
+                            "subjects")
+        return ("unmet", "the VEX carries " + " and ".join(problems),
+                sorted(dangling | file_targets))
+    return ("verified", "every VEX assertion resolves to a logical "
+                        "component of the product SBOM")
 
 
 def _check_logical_identity_collisions(context):
@@ -635,14 +1023,62 @@ def _check_scope_of_delivery_resolution(context):
 
 
 def _check_static_link_coverage(context):
-    unknown = (context.get("graph") or {}).get("staticUnknownRefs") or []
-    if unknown:
-        return "unverifiable", ("debug-source records are missing or "
-                                "inhibited for these components, so static "
-                                "linking is unknown coverage, never an "
-                                "absence-of-dependencies claim"), unknown
+    """Coverage state of the pkgdata debug-source evidence lane; per
+    component, missing records already yield unverifiable compositions
+    (CycloneDX aggregate `unknown`), never absent claims (ADR-0004)."""
+    graph = context.get("graph") or {}
+    coverage = ((graph.get("dependencyEvidence") or {})
+                .get("pkgdataDebugSources") or {}).get("coverage")
+    unknown = graph.get("staticUnknownRefs") or []
+    if coverage == "partial" or unknown:
+        return ("unverifiable",
+                "pkgdata debug-source records cover only part of the "
+                "delivered recipes, so static linking for the rest is "
+                "unknown coverage, never an absence-of-dependencies "
+                "claim", unknown)
+    if coverage != "complete":
+        return ("unverifiable",
+                "the build recorded no usable pkgdata debug-source "
+                "records for the delivered recipes; static linking is "
+                "unknown coverage, never an absence-of-dependencies "
+                "claim")
     return "verified", ("every delivered recipe's pkgdata debug-source "
                         "records were consumed for static-link attribution")
+
+
+def _dependency_evidence_source(lane, verdict_of):
+    def check(context):
+        evidence = ((context.get("graph") or {}).get("dependencyEvidence")
+                    or {}).get(lane) or {}
+        return verdict_of(evidence.get("coverage"), evidence)
+    return check
+
+
+def _runtime_evidence_verdict(coverage, _evidence):
+    if coverage == "observed":
+        return ("verified", "Yocto runtime dependency metadata supplied "
+                            "observed installed-package edges for the "
+                            "dependency graph")
+    return ("unverifiable", "the build recorded no runtime dependency "
+                            "metadata; edges from that source are unknown "
+                            "coverage, never assumed")
+
+
+def _imported_evidence_verdict(coverage, evidence):
+    defects = evidence.get("defects") or 0
+    if coverage == "used":
+        message = ("imported ecosystem BOM graphs contributed their "
+                   "authored dependency structure to the graph")
+        if defects:
+            message += (f"; {defects} defective imported input(s) are "
+                        "judged by the composition finding, not hidden")
+        return "verified", message
+    message = ("no usable ecosystem BOM dependency graphs were imported "
+               "for this build; that source contributed no coverage")
+    if defects:
+        message += (f"; {defects} defective imported input(s) are judged "
+                    "by the composition finding, not hidden")
+    return "unverifiable", message
 
 
 def _check_reference_integrity(context):
@@ -699,6 +1135,59 @@ TR03183_2_REQUIREMENTS = [
         "check": _check_cyclonedx_format,
     },
     {
+        "id": "REQ-FMT-002",
+        "source": ("BSI TR-03183-2 v2.1.0 §4 (CycloneDX format: schema-"
+                   "valid documents)"),
+        "representation": ("the SBOM validates against the official "
+                           "CycloneDX JSON schema of the selected version"),
+        "origin": "generated-document",
+        "check": _check_sbom_schema,
+    },
+    {
+        "id": "REQ-FMT-003",
+        "source": ("BSI TR-03183-2 v2.1.0 §4 (CycloneDX format: schema-"
+                   "valid documents)"),
+        "representation": ("the VEX validates against the official "
+                           "CycloneDX JSON schema of the selected version"),
+        "origin": "generated-document",
+        "check": _check_vex_schema,
+    },
+    {
+        "id": "REQ-TAX-001",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a78.1 (property taxonomy "
+                   "v0.1.2: registered properties and allowed locations)"),
+        "representation": ("every bsi: property is registered in the "
+                           "pinned taxonomy and appears only in "
+                           "components[]/properties or "
+                           "metadata/component/properties"),
+        "origin": "generated-document",
+        "check": _check_taxonomy_registry,
+    },
+    {
+        "id": "REQ-TAX-002",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a78.1 (property taxonomy "
+                   "v0.1.2: property value domains)"),
+        "representation": ("registered property values are non-empty "
+                           "strings inside the registry's value domains "
+                           "(executable/non-executable, archive/no "
+                           "archive, structured/unstructured, bare "
+                           "filenames, licence expressions)"),
+        "origin": "generated-document",
+        "check": _check_taxonomy_values,
+    },
+    {
+        "id": "REQ-TAX-003",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a78.1 (property taxonomy "
+                   "v0.1.2: per-component cardinality)"),
+        "representation": ("per component: the executable/archive/"
+                           "structured triple occurs complete exactly "
+                           "once when it applies; filename, effective"
+                           "Licence and associatedLicences occur at most "
+                           "once"),
+        "origin": "generated-document",
+        "check": _check_taxonomy_cardinality,
+    },
+    {
         "id": "REQ-SBOM-001",
         "source": ("BSI TR-03183-2 v2.1.0 §5.2.1 (SBOM-level data fields: "
                    "creator of SBOM)"),
@@ -735,8 +1224,8 @@ TR03183_2_REQUIREMENTS = [
         "id": "REQ-COMP-012",
         "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.2 (component-level data "
                    "fields: primary component creator)"),
-        "representation": ("metadata.component author or contact with an "
-                           "email address or URL"),
+        "representation": ("metadata.component authors contacts (or the "
+                           "author name) with an email address or URL"),
         "origin": "caller-assertion",
         "check": _check_primary_component_creator,
     },
@@ -782,8 +1271,31 @@ TR03183_2_REQUIREMENTS = [
                    "dependencies)"),
         "representation": ("dependency edges derived from pkgdata "
                            "debug-source records, with evidence origin"),
-        "origin": "generated-document",
+        "origin": "recipe-metadata",
         "check": _check_static_link_coverage,
+    },
+    {
+        "id": "REQ-DEPS-006",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a74 (dependency graph) and "
+                   "\u00a75.2.2 (dependency evidence from the build)"),
+        "representation": ("the runtime dependency metadata source of the "
+                           "build reports its coverage of the dependency "
+                           "graph"),
+        "origin": "recipe-metadata",
+        "check": _dependency_evidence_source("yoctoRuntimeMetadata",
+                                             _runtime_evidence_verdict),
+    },
+    {
+        "id": "REQ-DEPS-007",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a74 (dependency graph) and "
+                   "\u00a75.2.2 (dependency evidence from imported "
+                   "ecosystem documents)"),
+        "representation": ("imported ecosystem BOM graphs report their "
+                           "coverage of the dependency graph; defective "
+                           "inputs stay visible"),
+        "origin": "upstream-metadata",
+        "check": _dependency_evidence_source("importedBomGraphs",
+                                             _imported_evidence_verdict),
     },
     {
         "id": "REQ-REF-001",
@@ -955,9 +1467,10 @@ TR03183_2_REQUIREMENTS = [
         "id": "REQ-COMP-010",
         "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.2 (component-level data "
                    "fields: component creator)"),
-        "representation": ("component author or contact with an email "
-                           "address or URL, from an explicit override or "
-                           "trustworthy upstream identity metadata"),
+        "representation": ("component authors contacts with an email "
+                           "address or URL (organizationalContact), or "
+                           "the author name, from an explicit override "
+                           "or trustworthy upstream identity metadata"),
         "origin": "generated-document",
         "check": _check_component_creators,
     },
@@ -1005,12 +1518,53 @@ TR03183_2_REQUIREMENTS = [
         "check": _check_logical_identity_collisions,
     },
     {
+        "id": "REQ-IDEN-002",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.2 (component-level "
+                   "data fields: Package URL)"),
+        "representation": ("every emitted purl parses as a Package URL "
+                           "(pkg:<type>/[<namespace>/]<name>[@<version>]"
+                           "[?<qualifiers>][#<subpath>])"),
+        "origin": "generated-document",
+        "check": _check_purl_syntax,
+    },
+    {
+        "id": "REQ-IDEN-003",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.2 (component-level "
+                   "data fields: CPE) and \u00a73.2.1 (CPE 2.3)"),
+        "representation": ("every emitted CPE - component field or "
+                           "correlation alias - is a formatted CPE 2.3 "
+                           "string"),
+        "origin": "generated-document",
+        "check": _check_cpe_syntax,
+    },
+    {
+        "id": "REQ-IDEN-004",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.2 (hash of the "
+                   "deployable artifact) and \u00a73.2.1 (SHA-512)"),
+        "representation": ("every SHA-512 digest is lowercase hex of 512 "
+                           "bits riding components[].hashes[] under the "
+                           "SHA-512 algorithm"),
+        "origin": "generated-document",
+        "check": _check_sha512_syntax,
+    },
+    {
         "id": "REQ-VULN-001",
         "source": "BSI TR-03183-2 v2.1.0 \u00a73.1 (no vulnerability data in the SBOM)",
         "representation": ("vulnerability status in the separate VEX document "
                            "only"),
         "origin": "generated-document",
         "check": _check_no_vulnerability_data_in_sbom,
+    },
+    {
+        "id": "REQ-VULN-002",
+        "source": ("BSI TR-03183-2 v2.1.0 \u00a73.1 (vulnerability status "
+                   "assessed against the product's logical components) and "
+                   "\u00a75.2.2 (file components as delivery detail)"),
+        "representation": ("every VEX affects reference resolves to a "
+                           "logical (non-file) component of the product "
+                           "SBOM"),
+        "origin": "generated-document",
+        "check": _check_vex_targets_logical_components,
     },
 ]
 
@@ -1023,7 +1577,7 @@ PROFILES = {
         "guideline": "BSI TR-03183-2",
         "guidelineVersion": "2.1.0",
         "propertyTaxonomyVersion": "0.1.2",
-        "requirementsMatrixVersion": "2.1.0-r7",
+        "requirementsMatrixVersion": "2.1.0-r8",
         "specVersions": ["1.6", "1.7"],
         "requirements": TR03183_2_REQUIREMENTS,
     },

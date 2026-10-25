@@ -142,19 +142,17 @@ def test_signature_mutation_regenerates_with_new_serial_numbers(
 
 
 def test_mutated_documents_remain_schema_valid(
-    mutation_runs, cyclonedx_17_validator
+    mutation_runs, schema_validation
 ):
-    from tests.integration import schema_validation
-
     _record_guard(mutation_runs.mutated, "signature-mutation")
     for label, document in (
         ("SBOM", mutation_runs.mutated.documents.sbom),
         ("VEX", mutation_runs.mutated.documents.vex),
     ):
-        violations = list(cyclonedx_17_validator.iter_errors(document))
-        assert not violations, (
+        status, diagnostics = schema_validation.check(document, "1.7")
+        assert status == "valid", (
             f"the regenerated {label} violates the vendored CycloneDX "
-            f"1.7 schema:\n{schema_validation.describe_errors(violations)}\n"
+            f"1.7 schema:\n{diagnostics}\n"
             f"build-log tail:\n{mutation_runs.mutated.output_tail}"
         )
 
@@ -299,18 +297,16 @@ def test_image_extra_package_appears_as_component_with_dependency_edge(
 
 
 def test_image_change_documents_stay_schema_valid(
-    image_change, cyclonedx_17_validator
+    image_change, schema_validation
 ):
-    from tests.integration import schema_validation
-
     _record_guard(image_change, "image-change")
     for label, document in (
         ("SBOM", image_change.documents.sbom),
         ("VEX", image_change.documents.vex),
     ):
-        violations = list(cyclonedx_17_validator.iter_errors(document))
-        assert not violations, (
+        status, diagnostics = schema_validation.check(document, "1.7")
+        assert status == "valid", (
             f"the image-change {label} violates the vendored CycloneDX 1.7 "
-            f"schema:\n{schema_validation.describe_errors(violations)}\n"
+            f"schema:\n{diagnostics}\n"
             f"build-log tail:\n{image_change.output_tail}"
         )

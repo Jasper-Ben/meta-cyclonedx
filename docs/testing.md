@@ -24,13 +24,25 @@ tools/kas`), and the wrapper's container-image version stays in
   lockstep with the pin; a missing-or-unfetchable checkout or a pin
   mismatch skips the matrix with the reason rather than erroring.
 - Network access (upstream clones + source downloads).
-- The `jsonschema` Python package, used only by the integration layer to
-  validate the deployed documents against the CycloneDX 1.7 JSON schema
-  vendored under `tests/integration/vendor/cyclonedx/` (attribution and
-  pin in its README). Unit runs never import it; if it is missing, the
-  schema-validation tests skip with an install hint, e.g.
-  `sudo apt-get install python3-jsonschema` or
+- The `jsonschema` Python package, an optional dependency used to
+  validate documents against the official CycloneDX JSON schemas
+  vendored under `lib/data/cyclonedx/` (attribution and pin in its
+  README). The renderer feature-detects it: the unit suite runs and
+  stays green without it, and without an alignment profile never
+  imports it. Under an alignment profile without the library the
+  schema requirements report `unverifiable`, never a silent pass. The
+  integration tier asserts real deployed-document verdicts, so its
+  schema-validation tests skip with an install hint when the package
+  is missing, e.g. `sudo apt-get install python3-jsonschema` or
   `python3 -m pip install jsonschema`.
+
+Additionally, `tests/integration/test_sbomqs_differential.py` is a
+maintainer-only differential check: when the external `sbomqs`
+validator binary is on PATH it compares sbomqs' structural verdict
+against the requirements matrix on representative documents; without
+the binary the tests skip. Disagreement fails only those
+differential-marked tests - the matrix owns our verdicts; a failure
+prompts review of the affected rows, never a silent verdict change.
 
 ## Invocation modes
 

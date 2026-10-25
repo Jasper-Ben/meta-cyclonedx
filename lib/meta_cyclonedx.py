@@ -1005,12 +1005,14 @@ def _valid_uri(uri):
 
 
 def _parse_contacts(spec, log=None):
-    """Parse creator-contact grammar into sorted organizationalEntities.
+    """Parse creator-contact grammar into sorted organizationalContacts.
 
-    One entity per ';'-separated entry; each entry is
+    One contact per machine-actionable email address or URL, shaped the
+    way the CycloneDX schema's organizationalContact expects it (both
+    supported versions name the same `authors` fields); an entry is
     "NAME <EMAIL-or-URL>", "<URL>", a bare email address or a bare URL.
     An entry without a machine-actionable email or URL is rejected with a
-    warning and never emitted as contact data. Entities come back sorted
+    warning and never emitted as contact data. Contacts come back sorted
     so equivalent evidence always renders identical bytes.
     """
     entities = {}
@@ -1038,38 +1040,31 @@ def _parse_contacts(spec, log=None):
         entity[kind].add(value)
     contacts = []
     for name, found in entities.items():
-        entity = {}
-        if name:
-            entity["name"] = name
         for kind in ("email", "url"):
-            if found[kind]:
-                entity[kind] = sorted(found[kind])
-        contacts.append(entity)
-    contacts.sort(key=lambda entity: (entity.get("name", ""),
-                                      entity.get("email", []),
-                                      entity.get("url", [])))
+            contacts.extend({**({"name": name} if name else {}), kind: value}
+                            for value in sorted(found[kind]))
+    contacts.sort(key=lambda contact: (
+        contact.get("name", ""), contact.get("email", contact.get("url", ""))))
     return contacts
 
 
-def _creator_fields(entities):
-    """author and contact strings for a component from parsed contacts."""
-    author = next((entity["name"] for entity in entities if entity.get("name")),
-                  "")
-    component_contacts = sorted({contact
-                                 for entity in entities
-                                 for contact in entity.get("email", [])
-                                 + entity.get("url", [])})
-    return author, component_contacts
+def _apply_creator_identity(component, contacts):
+    """Stamp creator contacts onto a component; never overwrite claims.
 
-
-def _apply_creator_identity(component, entities):
-    """Stamp creator contacts onto a component; never overwrite claims."""
-    author, contacts = _creator_fields(entities)
-    if not contacts or component.get("author") or component.get("contact"):
+    Components carry creator contacts through the schema's `authors`
+    field (an organizationalContact array); the deprecated `author`
+    string is kept alongside for the name so readers of either field
+    find the same identity. A component that already names an author or
+    carries authors of its own keeps what it states (ADR-0006: creator
+    claims are never silently rewritten).
+    """
+    if not contacts or component.get("author") or component.get("authors"):
         return False
+    author = next((contact["name"] for contact in contacts
+                   if contact.get("name")), "")
     if author:
         component["author"] = author
-    component["contact"] = contacts
+    component["authors"] = [dict(contact) for contact in contacts]
     return True
 
 
@@ -1107,7 +1102,7 @@ def _upstream_creator_entities(component):
         host = match.group("host")
         owner, project = match.group("owner"), match.group("project")
     project = re.sub(r"\.git$", "", project)
-    return [{"name": owner, "url": [f"https://{host}/{owner}/{project}"]}]
+    return [{"name": owner, "url": f"https://{host}/{owner}/{project}"}]
 
 
 def _compatible_component_records(existing, candidate):
@@ -1299,7 +1294,7 @@ def render(facts):
             creator_override = _parse_contacts(pn_list.get("creator"), log)
             if creator_override:
                 _apply_creator_identity(pn_pkg, creator_override)
-            elif not pn_pkg.get("author") and not pn_pkg.get("contact"):
+            elif not pn_pkg.get("author") and not pn_pkg.get("authors"):
                 _apply_creator_identity(
                     pn_pkg, _upstream_creator_entities(pn_pkg))
 
@@ -1737,6 +1732,28 @@ def render(facts):
 
     graph = _graph_evidence(sbom, metadata_component_ref, ref_recipes,
                             debug_evidence_recipes, merge_defects, log)
+    # Which dependency-evidence sources fed the graph, as coverage
+    # states the requirements matrix turns into verdicts: an absent
+    # source is unknown coverage, never a silent assumption that the
+    # dependency picture is complete (ADR-0004).
+    fragment_rows = [f for f in fragments.values() if isinstance(f, dict)]
+    imported_used = any(
+        f.get("extra_components") or f.get("extra_dependencies")
+        or f.get("extra_roots") for f in fragment_rows)
+    delivered_recipes = {r for r in ref_recipes.values() if r}
+    debug_covered = delivered_recipes & debug_evidence_recipes
+    graph["dependencyEvidence"] = {
+        "yoctoRuntimeMetadata": {
+            "coverage": "observed" if runtime_edges else "unavailable"},
+        "importedBomGraphs": {
+            "coverage": "used" if imported_used else "unavailable",
+            "defects": sum(len(f.get("extra_bom_errors") or [])
+                           for f in fragment_rows)},
+        "pkgdataDebugSources": {
+            "coverage": ("unavailable" if not debug_covered else
+                         "complete" if debug_covered == delivered_recipes
+                         else "partial")},
+    }
     if file_facts:
         graph["fileInventory"] = {"entries": [
             {key: artifact.get(key)
@@ -1835,13 +1852,25 @@ def render(facts):
         "findings": findings,
     }
     if enforcement == "strict":
-        unmet = sorted(finding["requirementId"] for finding in findings
-                       if finding["verdict"] == "unmet"
-                       and finding["applicability"] == "applicable")
+        # The gate reports EVERY machine-detectable violation, not just
+        # the first: the same findings a report-mode build publishes,
+        # aggregated deterministically by requirement identifier.
+        violations = sorted(
+            (dict(
+                {"requirementId": finding["requirementId"],
+                 "diagnosticMessage": finding["diagnosticMessage"]},
+                **({"bomRefs": finding["bomRefs"]}
+                   if finding.get("bomRefs") else {}))
+             for finding in findings
+             if finding["verdict"] == "unmet"
+             and finding["applicability"] == "applicable"),
+            key=lambda violation: violation["requirementId"])
+        unmet = [violation["requirementId"] for violation in violations]
         if unmet:
             return {"failure": {
                 "alignmentEnforcement": "strict",
                 "unmetRequirementIds": unmet,
+                "violations": violations,
                 "diagnosticMessage": (
                     f"Alignment profile {profile} with strict enforcement "
                     f"rejects the output over {len(unmet)} unmet requirement(s): "

@@ -645,6 +645,59 @@ where applicable and a diagnostic message. Caller assertions can only ever
 produce `asserted` findings, never `verified` ones, and `unverifiable`
 findings never block the output.
 
+#### Validation Before Publication
+
+With a profile selected, every emitted document is validated before
+publication. Every check is a requirements-matrix row, so its verdict
+rides the alignment report and gates strict enforcement exactly like
+every other finding:
+
+- **Official CycloneDX schema.** Every emitted SBOM and VEX validates
+  against the official JSON schema of the selected CycloneDX version
+  (`REQ-FMT-002`, `REQ-FMT-003`). The official schemas are vendored
+  with the layer under `lib/data/cyclonedx/` (provenance and pin in
+  the README there); the `jsonschema` library is feature-detected. A
+  build host without it records `unverifiable` schema findings - a
+  validator that cannot run never reports a silent pass, and
+  `unverifiable` never blocks `strict` enforcement.
+- **BSI property taxonomy.** Every `bsi:` property is validated against
+  the pinned registry of the profile baseline (property taxonomy
+  v0.1.2, vendored verbatim under `lib/data/` and mirrored as the
+  matrix's own registry): only registered names count and only in the
+  locations the registry allows (`REQ-TAX-001`), values must sit in the
+  registry's value domains (`REQ-TAX-002`), and per-component
+  cardinality must hold - the executable/archive/structured triple
+  complete exactly once when it applies, filename and licence
+  properties at most once (`REQ-TAX-003`). Drift away from the pinned
+  registry is an `unmet` finding in report mode and a
+  strict-enforcement rejection.
+- **Identifier syntax.** Emitted identifiers stay parseable downstream:
+  every purl parses as a Package URL (`REQ-IDEN-002`), every CPE -
+  component field or correlation alias - is a formatted CPE 2.3 string
+  (`REQ-IDEN-003`), and every SHA-512 is lowercase hex of 512 bits
+  riding `components[].hashes[]` under the `SHA-512` algorithm
+  (`REQ-IDEN-004`).
+- **Vulnerability separation.** No vulnerability data hides anywhere in
+  the SBOM - a document-wide scan catches embedded or nested records
+  the renderer copied verbatim (`REQ-VULN-001`) - and every VEX
+  assertion resolves to a logical, non-file component of the product:
+  files are delivery detail, never vulnerability subjects
+  (`REQ-VULN-002`).
+- **Enforcement equivalence.** A defect that yields an `unmet` finding
+  in report mode rejects the same input under `strict` enforcement -
+  there is one requirements matrix and one verdict path. The structured
+  strict failure lists every machine-detectable violation at once
+  (`violations`, ordered by requirement identifier, each with its
+  diagnostic message and affected bom-refs), so one build reports the
+  complete repair list.
+- **Report enforcement publishes documents with findings** - that
+  includes a schema-invalid document: it is published with loud
+  `unmet` findings naming the violated schema locations, and the
+  finding keeps the alignment report honest about the defect. **Strict
+  enforcement refuses publication** of the same document before any
+  artifact is deployed. This split is deliberate: report mode exists
+  to make gaps visible in CI, strict mode to gate them.
+
 #### Creator and URI Evidence
 
 With a profile selected, the product integration supplies the creator

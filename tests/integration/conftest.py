@@ -336,15 +336,21 @@ def cold_run(kas_build, kas_runs):
 
 
 @pytest.fixture(scope="session")
-def cyclonedx_17_validator():
-    """Validator over the vendored CycloneDX 1.7 JSON schema.
+def schema_validation():
+    """The layer's shared feature-detected CycloneDX schema-validation
+    module (`lib/schema_validation.py`), the same one the renderer's
+    requirements matrix evaluates through.
 
-    `jsonschema` is an integration-layer-only dependency: the module
-    carrying it is imported here, lazily, never at collection time, so the
-    deselected unit suite never requires it.
+    Deployed-document checks assert real verdicts, and `jsonschema` is an
+    optional dependency: the module is imported here lazily, never at
+    collection time, and this tier skips with a hint when validation
+    cannot run.
     """
     try:
-        from tests.integration import schema_validation
+        import schema_validation
     except ImportError:
         pytest.skip(kas_env.JSONSCHEMA_HINT)
-    return schema_validation.bom_validator()
+    reason = schema_validation.availability("1.7")
+    if reason is not None:
+        pytest.skip(f"{kas_env.JSONSCHEMA_HINT}\nreason: {reason}")
+    return schema_validation
