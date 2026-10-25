@@ -54,3 +54,45 @@ def test_one_identified_component_per_out_of_scope_recipe():
     assert len(ghosts) == 1
     assert dep_entry(sbom, "ref-app")["dependsOn"] == [ghosts[0]["bom-ref"]]
     assert dep_entry(sbom, "ref-tool")["dependsOn"] == [ghosts[0]["bom-ref"]]
+
+
+def test_debug_source_records_make_static_links_dependency_edges():
+    # pkgdata debug-source records written by BitBake's own do_package:
+    # a debug-source prefix /usr/src/debug/<BPN>/<PV>/ of another recipe
+    # identifies the recipe whose code was linked in.
+    facts = default_facts(fragments={
+        "app": fragment(pkgs=[pkg("app", "1", "ref-app")]),
+        "libother": fragment(pkgs=[pkg("libother", "2", "ref-lib")]),
+    }, image_install_recipes=["app"], debug_sources={
+        "app": {"/usr/bin/app": [
+            "/usr/src/debug/app/1.0-r0/src/main.c",
+            "/usr/src/debug/libother/2.0-r1/libother.c",
+        ]},
+        "libother": {"/usr/lib/libother.so.2": [
+            "/usr/src/debug/libother/2.0-r1/libother.c"]},
+    })
+    sbom, _vex, _logs = render_docs(facts)
+
+    assert dep_entry(sbom, "ref-app")["dependsOn"] == ["ref-lib"]
+    app = component_by_name(sbom, "app")
+    assert {"name": "yocto:dependency:evidence", "value": "debugsrc"} in app["properties"]
+
+
+def test_own_and_unrepresented_debug_prefixes_add_no_edges_or_evidence():
+    # Own-prefix paths are the recipe compiling itself; a prefix belonging
+    # to no represented recipe carries no claim. Binaries are never parsed.
+    facts = default_facts(fragments={
+        "app": fragment(pkgs=[pkg("app", "1", "ref-app")]),
+    }, image_install_recipes=["app"], debug_sources={
+        "app": {"/usr/bin/app": [
+            "/usr/src/debug/app/1.0-r0/src/main.c",
+            "/usr/src/debug/elsewhere/3.0-r0/foreign.c",
+        ]},
+    })
+    sbom, _vex, _logs = render_docs(facts)
+
+    assert dep_entry(sbom, "ref-app")["dependsOn"] == []
+    app = component_by_name(sbom, "app")
+    assert not [p for p in app.get("properties") or []
+                if p["name"] == "yocto:dependency:evidence"]
+    assert "elsewhere" not in [c["name"] for c in sbom["components"]]

@@ -178,6 +178,13 @@ ALIAS_PRODUCT_PROPERTY = "yocto:cve:product"
 ALIAS_VERSION_PROPERTY = "yocto:cve:version"
 ALIAS_CPE_PROPERTY = "yocto:cve:cpe"
 
+# Statically linked code is attributed only from the debugsrc lists BitBake's
+# own do_package records in pkgdata; delivered binaries are never parsed
+# (ADR-0002). A debug-source prefix /usr/src/debug/<BPN>/<PV>/ identifies the
+# recipe that compiled the file it names.
+DEBUG_SRC_RECIPE_PREFIX = re.compile(r"^/usr/src/debug/([^/]+)/[^/]+(?:/|$)")
+DEPENDENCY_EVIDENCE_PROPERTY = "yocto:dependency:evidence"
+
 
 # The dependency graph crosses the scope of delivery exactly once per
 # known path: the first external component is represented as identified —
@@ -203,6 +210,37 @@ def _identified_component(recipe_name, add_scope):
         "value": "external",
     }]
     return component
+
+
+def _debugsrc_targets(debug_sources, represented_recipes):
+    """
+    Map each recipe to the represented recipes whose code its debug-source
+    records show was statically linked in. Own-prefix paths are the recipe
+    compiling itself and prefixes of unrepresented recipes carry no claim;
+    both are ignored.
+    """
+    targets = {}
+    for recipe in sorted(debug_sources):
+        found = set()
+        for paths in (debug_sources[recipe] or {}).values():
+            if isinstance(paths, str):
+                paths = paths.split()
+            for path in paths:
+                match = DEBUG_SRC_RECIPE_PREFIX.match(path)
+                if (match and match.group(1) != recipe
+                        and match.group(1) in represented_recipes):
+                    found.add(match.group(1))
+        if found:
+            targets[recipe] = sorted(found)
+    return targets
+
+
+def _add_dependency_evidence(component, origin):
+    """Record where a component's dependency evidence came from."""
+    properties = component.setdefault("properties", [])
+    entry = {"name": DEPENDENCY_EVIDENCE_PROPERTY, "value": origin}
+    if entry not in properties:
+        properties.append(entry)
 
 
 def _short_version(version):
@@ -761,6 +799,30 @@ def render(facts):
     _merge_included_images(sbom, vex, copy.deepcopy(facts.get("included_images")) or (),
                            config, spec_version, sbom_serial_number,
                            add_scopes, directly_installed_component_refs, log)
+
+    # Statically linked edges observed from pkgdata debug-source records:
+    # another recipe's debug-source prefix in this recipe's file list proves
+    # that recipe's code was linked in. The edge rides the dependency graph;
+    # its evidence origin rides the depending component's properties.
+    static_targets = _debugsrc_targets(facts.get("debug_sources") or {},
+                                       set(fragments))
+    components_by_ref = {c["bom-ref"]: c for c in sbom["components"]
+                         if c.get("bom-ref")}
+    for owner in sorted(static_targets):
+        for owner_ref in recipe_refs.get(owner, []):
+            owner_entry = next((entry for entry in sbom["dependencies"]
+                                if entry["ref"] == owner_ref), None)
+            for target in static_targets[owner]:
+                for target_ref in recipe_refs.get(target, []):
+                    if target_ref == owner_ref:
+                        continue
+                    if owner_entry is None:
+                        owner_entry = {"ref": owner_ref, "dependsOn": []}
+                        sbom["dependencies"].append(owner_entry)
+                    if target_ref not in owner_entry["dependsOn"]:
+                        owner_entry["dependsOn"].append(target_ref)
+                    _add_dependency_evidence(components_by_ref[owner_ref],
+                                             "debugsrc")
 
     # Every represented component participates in the dependency graph.
     # A leaf gets a dependency entry with an empty list, so a machine can
