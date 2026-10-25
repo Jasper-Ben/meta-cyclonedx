@@ -174,6 +174,20 @@ CYCLONEDX_PROFILE ??= ""
 # makes a conformance claim. Requires CYCLONEDX_PROFILE to be set.
 CYCLONEDX_PROFILE_ENFORCEMENT ??= "report"
 
+# Explicitly selected additional deployed files (alignment profile
+# only): whitespace-separated shell-style globs (fnmatch; `*` crosses
+# directory boundaries) matched against paths relative to the image
+# deploy directory ${IMGDEPLOYDIR} - the staged ${DEPLOY_DIR_IMAGE}
+# content; a leading "/" anchors at that directory too. For kernel,
+# bootloader, firmware, TEE, initramfs, embedded-image and other
+# product payloads that package manifests do not cover.
+# Selected files become file components under the same classification,
+# SHA-512 identity and graph rules as root-filesystem files; a
+# selection that resolves to nothing is an alignment finding, never
+# silently skipped. The primary deployable artifact is inventoried
+# under the profile regardless of this setting (ADR-0005).
+CYCLONEDX_ADDITIONAL_FILES ??= ""
+
 CYCLONEDX_TMP_EXPORT_DIR = "${WORKDIR}/cyclonedx-export"
 CYCLONEDX_EXPORT_DIR ??= "${DEPLOY_DIR_IMAGE}"
 # Try to set meaningful default filenames for both image and non-image recipes
@@ -1436,11 +1450,138 @@ def collect_file_inventory(d, recipes):
             for pn, entries in sorted(inventory.items())}
 
 
-def export_cyclonedx(d):
+def collect_deploy_files(d):
+    """
+    Collect the deploy-directory artifact facts for the alignment
+    profile (ticket #10): the image's primary deployable artifact(s) -
+    the deployed files of the declared IMAGE_FSTYPES under the stable
+    ${IMAGE_LINK_NAME}, the same name lineage the export basename
+    follows - plus the files explicitly selected through
+    CYCLONEDX_ADDITIONAL_FILES (kernel, bootloader, firmware, TEE,
+    initramfs, embedded images and other product payloads that package
+    manifests do not cover). Selection semantics live in the renderer's
+    pure plan_deploy_file_selection(); this function only enumerates
+    and hashes.
+
+    Determinism: entries record the stable link name, never the
+    DATETIME-stamped real filename, and hashes cover content only, so
+    equivalent rebuilds - including runs where the image artifacts come
+    from sstate under a fresh build stamp - reproduce identical
+    inventories. Call it only from the deploy phase (do_deploy_cyclonedx
+    runs after do_image): inside do_rootfs the artifact bytes are not
+    final yet and hashing there would chase a moving target. Inclusion
+    is by mandate or explicit selection, not by the classifier: the
+    classifier only records the BSI properties (a raw filesystem image
+    is inventoried even when no archive signature makes it mandatory
+    inventory on its own). Symlinks record the artifact under the
+    stable link name; the content identity is the target's. Our own
+    deployed documents are never inventory artifacts. Missing or
+    unreadable selections stay reported (ADR-0004).
+    """
+    import hashlib
+    import os
+    import stat
+
+    renderer = _cyclonedx_renderer(d)
+    deploy_dir = d.getVar("IMGDEPLOYDIR") or d.getVar("DEPLOY_DIR_IMAGE")
+    if not deploy_dir or not os.path.isdir(deploy_dir):
+        bb.note("CycloneDX deploy inventory: no deploy directory; no "
+                "deployable artifact or selected files for this export")
+        return []
+
+    own_paths = set()
+    export_dir = d.getVar("CYCLONEDX_EXPORT_DIR") or ""
+    for var in ("CYCLONEDX_EXPORT_SBOM", "CYCLONEDX_EXPORT_VEX",
+                "CYCLONEDX_EXPORT_SBOM_LINK", "CYCLONEDX_EXPORT_VEX_LINK",
+                "CYCLONEDX_EXPORT_ALIGNMENT_REPORT",
+                "CYCLONEDX_EXPORT_ALIGNMENT_REPORT_LINK",
+                "CYCLONEDX_EXPORT_SBOM_CVE_CHECK_VEX"):
+        path = d.getVar(var) or ""
+        if not path or not export_dir:
+            continue
+        absolute = path if os.path.isabs(path) else os.path.join(export_dir, path)
+        absolute = os.path.normpath(absolute)
+        if absolute.startswith(os.path.normpath(deploy_dir) + os.sep):
+            own_paths.add(os.path.relpath(absolute, deploy_dir))
+
+    deploy_files = {}
+    for root, dirs, names in os.walk(deploy_dir):
+        dirs.sort()
+        for name in sorted(names):
+            full = os.path.join(root, name)
+            rel = os.path.relpath(full, deploy_dir)
+            if rel in own_paths:
+                continue
+            entry_stat = os.lstat(full)
+            if stat.S_ISLNK(entry_stat.st_mode):
+                target = os.path.realpath(full)
+                if not os.path.exists(full):
+                    target = None
+                elif os.path.normpath(target).startswith(
+                        os.path.normpath(deploy_dir) + os.sep):
+                    target = os.path.relpath(target, deploy_dir)
+                deploy_files[rel] = {"kind": "symlink", "target": target}
+            elif stat.S_ISREG(entry_stat.st_mode):
+                deploy_files[rel] = {"kind": "file", "target": None}
+
+    link_name = d.getVar("IMAGE_LINK_NAME") or ""
+    if not link_name:
+        # No stable link name: derive one from IMAGE_NAME by stripping
+        # the build stamp, the same name lineage as the export basename.
+        link_name = d.getVar("IMAGE_NAME") or ""
+        stamp = d.getVar("DATETIME") or ""
+        if stamp and link_name.endswith("-" + stamp):
+            link_name = link_name[:-len(stamp) - 1]
+    candidates = []
+    for fstype in (d.getVar("IMAGE_FSTYPES") or "").split():
+        for sub in (fstype, *(d.getVarFlag("IMAGE_TYPEDEP", fstype)
+                              or "").split()):
+            name = f"{link_name}.{sub}" if link_name else ""
+            if name and name not in candidates:
+                candidates.append(name)
+
+    entries = []
+    for item in renderer.plan_deploy_file_selection(
+            d.getVar("CYCLONEDX_ADDITIONAL_FILES") or "",
+            deploy_files, candidates):
+        entry = {"path": item["path"], "source": item["source"]}
+        if item.get("error"):
+            bb.warn(f"CycloneDX deploy inventory: selected artifact "
+                    f"{item['path']} is {item['error']}")
+            entry["error"] = item["error"]
+            entries.append(entry)
+            continue
+        full = os.path.join(deploy_dir, item["path"])
+        try:
+            mode = os.stat(full).st_mode  # symlinks: the target's bytes
+            with open(full, "rb") as artifact:
+                data = artifact.read()
+        except OSError:
+            bb.warn(f"CycloneDX deploy inventory: artifact {item['path']} "
+                    f"is unreadable")
+            entry["error"] = "unreadable"
+            entries.append(entry)
+            continue
+        verdict = renderer.classify_delivered_file(item["path"], mode, data)
+        for key in ("executable", "archive", "structured"):
+            entry[key] = verdict[key]
+        if verdict.get("error"):
+            bb.warn(f"CycloneDX deploy inventory: artifact {item['path']} "
+                    f"is {verdict['error']}")
+            entry["error"] = verdict["error"]
+        else:
+            entry["sha512"] = hashlib.sha512(data).hexdigest()
+        entries.append(entry)
+    return entries
+
+def export_cyclonedx(d, deploy_phase=False):
     """
     Collect normalized build facts and artifact facts, hand them to the
     renderer and deploy the SBOM, VEX and (for a selected alignment
-    profile) alignment report it returns.
+    profile) alignment report it returns. deploy_phase marks the final
+    generation in do_deploy_cyclonedx - after image assembly - where the
+    primary deployable artifact and the selected additional files are
+    complete (ticket #10).
     """
     import os
     from pathlib import Path
@@ -1516,9 +1657,33 @@ def export_cyclonedx(d):
 
     # The mandatory delivered-file inventory belongs to the alignment
     # profile (ADR-0005); without one, no file is read or hashed at all.
+    # Image recipes generate twice under a profile: once inside
+    # do_rootfs (intermediate documents for embedded-image consumers,
+    # gated by do_cyclonedx_complete), and finally in
+    # do_deploy_cyclonedx - after do_image - where the primary
+    # deployable artifact's bytes are final (ticket #10; hashing them
+    # inside do_rootfs would chase a moving target). The final
+    # generation reuses the root-filesystem inventory persisted by the
+    # rootfs phase instead of re-walking the rootfs outside its pseudo
+    # environment.
     file_inventory = {}
+    inventory_file = os.path.join(d.getVar("WORKDIR"),
+                                  "cyclonedx-file-inventory.json")
+    is_image = bb.data.inherits_class("image", d)
     if (d.getVar("CYCLONEDX_PROFILE") or ""):
-        file_inventory = collect_file_inventory(d, sorted(fragments))
+        if deploy_phase and is_image:
+            if os.path.exists(inventory_file):
+                file_inventory = read_json(inventory_file)
+            else:
+                file_inventory = collect_file_inventory(d,
+                                                        sorted(fragments))
+            deploy_entries = collect_deploy_files(d)
+            if deploy_entries:
+                file_inventory[""] = deploy_entries
+        else:
+            file_inventory = collect_file_inventory(d, sorted(fragments))
+            if is_image and not deploy_phase:
+                write_json(inventory_file, file_inventory)
 
     primary = {
         "type": d.getVar("CYCLONEDX_IMAGE_TYPE") or "firmware",
@@ -1668,6 +1833,8 @@ export_cyclonedx[vardeps] += "CYCLONEDX_EXPORT_SBOM CYCLONEDX_EXPORT_VEX \
     CYCLONEDX_EXPORT_SBOM_LINK CYCLONEDX_EXPORT_VEX_LINK \
     CYCLONEDX_EXPORT_ALIGNMENT_REPORT CYCLONEDX_EXPORT_ALIGNMENT_REPORT_LINK \
     CYCLONEDX_PROFILE CYCLONEDX_PROFILE_ENFORCEMENT"
+export_cyclonedx[vardeps] += "CYCLONEDX_ADDITIONAL_FILES"
+export_cyclonedx[vardepsexclude] += "DATETIME IMAGE_NAME"
 export_cyclonedx[vardeps] += "CYCLONEDX_SBOM_CREATOR"
 export_cyclonedx[vardeps] += "CYCLONEDX_PRIMARY_COMPONENT_CREATOR \
     CYCLONEDX_PRIMARY_COMPONENT_SOURCE_URI \
@@ -1687,17 +1854,21 @@ python do_deploy_cyclonedx_setscene() {
 addtask do_deploy_cyclonedx_setscene
 python do_deploy_cyclonedx() {
     if bb.data.inherits_class("image", d):
-       bb.note("Deploying CycloneDX SBOM and VEX files generated by do_rootfs")
-       return
+        if (d.getVar("CYCLONEDX_PROFILE") or ""):
+            bb.note("Regenerating CycloneDX output with the complete "
+                    "deployable-artifact inventory")
+            export_cyclonedx(d, deploy_phase=True)
+        else:
+            bb.note("Deploying CycloneDX SBOM and VEX files generated by do_rootfs")
     else:
-       export_cyclonedx(d)
+        export_cyclonedx(d)
 }
 # Synchronize consumers with the final document producer, including its setscene
 # task. This task has no output of its own.
 do_cyclonedx_complete[noexec] = "1"
 python () {
     if bb.data.inherits_class("image", d):
-        bb.build.addtask("do_deploy_cyclonedx", "do_image_complete", "do_rootfs", d)
+        bb.build.addtask("do_deploy_cyclonedx", "do_image_complete", "do_image", d)
         complete_after = "do_deploy_cyclonedx"
         if cyclonedx_sbom_cve_check_enabled(d):
             complete_after = "do_cyclonedx_sbom_cve_check"
