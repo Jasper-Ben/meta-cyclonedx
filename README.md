@@ -639,6 +639,47 @@ where applicable and a diagnostic message. Caller assertions can only ever
 produce `asserted` findings, never `verified` ones, and `unverifiable`
 findings never block the output.
 
+#### Creator and URI Evidence
+
+With a profile selected, the product integration supplies the creator
+metadata explicitly; meta-cyclonedx never infers creators from free-form
+text and never names the product manufacturer as the creator of bundled
+third-party software.
+
+```sh
+# Entity responsible for compiling this SBOM (metadata.authors).
+# Entries are separated by ';' and each entry is
+#   "NAME <email-or-url>", "<URL>", a bare email address or a bare URL.
+CYCLONEDX_SBOM_CREATOR = "Acme SBOM Team <sbom@acme.example>; https://acme.example"
+
+# Creator of the delivered product (metadata.component); same grammar.
+CYCLONEDX_PRIMARY_COMPONENT_CREATOR = "Acme GmbH <product@acme.example>"
+
+# Per-recipe creator override for third-party components; takes
+# precedence over trustworthy upstream metadata (see below).
+CYCLONEDX_COMPONENT_CREATOR = ""
+```
+
+For third-party components the creator precedence is: the explicit
+`CYCLONEDX_COMPONENT_CREATOR` override, then **semantically trustworthy
+upstream metadata** — only the machine-readable upstream repository
+identity already recorded for the component: an upstream repository purl
+(`pkg:github|gitlab|bitbucket/...`, whose namespace is the upstream
+organization) or a fetcher-derived `vcs` external reference, from which
+the upstream organization and repository URL are derived — then
+unresolved, which the alignment report records as `unverifiable`
+(never `verified`, never fabricated).
+
+Source and deployable URIs follow the same trust rule: they are emitted
+only from the explicit override variables
+(`CYCLONEDX_COMPONENT_SOURCE_URI`, `CYCLONEDX_COMPONENT_DEPLOYABLE_URI`,
+`CYCLONEDX_PRIMARY_COMPONENT_SOURCE_URI`,
+`CYCLONEDX_PRIMARY_COMPONENT_DEPLOYABLE_URI`) or from metadata the layer
+already records (SRC_URI-derived references, layer revisions), and every
+emitted URI is syntax-validated; recorded URIs that fail validation are
+not emitted and are reported as `unmet`. Equivalent normalized evidence
+always produces identical creator, URI and report output.
+
 The versioned mapping from each baseline requirement to its CycloneDX
 representation and evaluation rule is project-owned data in
 `lib/alignment_profile.py`; an existing profile never floats to a newer
@@ -750,6 +791,20 @@ CYCLONEDX_COMPONENT_PROPERTIES = ""
 # Explicit logical component identity overrides (default: "" = BPN/PV).
 CYCLONEDX_COMPONENT_NAME = ""
 CYCLONEDX_COMPONENT_VERSION = ""
+
+# Creator evidence (contact grammar "NAME <email-or-url>", "<URL>",
+# a bare email address or a bare URL; ';' separates multiple contacts).
+# The product manufacturer is never the creator of third-party components.
+CYCLONEDX_SBOM_CREATOR = ""
+CYCLONEDX_PRIMARY_COMPONENT_CREATOR = ""
+CYCLONEDX_COMPONENT_CREATOR = ""
+
+# Explicit source/deployable URIs; the only sources besides recorded
+# metadata are these overrides, and URIs are syntax-validated (default: "").
+CYCLONEDX_COMPONENT_SOURCE_URI = ""
+CYCLONEDX_COMPONENT_DEPLOYABLE_URI = ""
+CYCLONEDX_PRIMARY_COMPONENT_SOURCE_URI = ""
+CYCLONEDX_PRIMARY_COMPONENT_DEPLOYABLE_URI = ""
 
 # CycloneDX 1.7 optional features
 CYCLONEDX_ADD_LICENSE_DETAILS = "1"  # Include license text for custom licenses

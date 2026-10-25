@@ -34,10 +34,23 @@ primary               the delivered product:
     type / name / version         primary component metadata
     external_references           optional list; when the key is absent the
                                   primary component carries none
+    creator                       optional creator-contact grammar string
+                                  naming the product manufacturer as the
+                                  creator of the delivered product
+    source_uri / deployable_uri   optional explicit URIs for the primary
+                                  component (source and deployable form)
+sbom_creator            creator-contact grammar string naming the entity
+                        responsible for compiling this SBOM; entries are
+                        separated by ';' and each entry is
+                        "NAME <EMAIL-or-URL>", "<URL>", a bare email
+                        address or a bare URL
 fragments             per-recipe normalized facts, keyed by recipe name, in
                       the on-disk partial-SBOM format written by
                       do_populate_cyclonedx: "pkgs", "cves", "dependencies",
-                      "extra_components", "extra_dependencies", "extra_roots"
+                      "extra_components", "extra_dependencies", "extra_roots",
+                      plus creator and URI evidence keys "creator",
+                      "source_uri" and "deployable_uri" (grammar strings /
+                      URIs; explicit overrides above recorded metadata)
 runtime_recipes       recipe names whose components are "required"
 image_install_recipes recipe names installed by image author intent; their
                       components hang directly off the graph root
@@ -60,6 +73,7 @@ import importlib.util
 import json
 import os
 import re
+import urllib.parse
 import uuid
 from datetime import datetime, timezone
 
@@ -536,6 +550,142 @@ def kernel_vex_statement(cve_id, bom_refs, placeholder, detail):
     }
 
 
+
+# Creator evidence uses a small document grammar; every contact must be
+# machine-actionable through an email address or URL, mirroring the BSI
+# requirement that a creator be identifiable by contact data.
+CREATOR_CONTACT_SEPARATOR = ";"
+_CREDITED_CONTACT = re.compile(r"^\s*(?P<name>[^<>]*?)\s*<(?P<contact>[^<>]+)>\s*$")
+_EMAIL_ADDRESS = re.compile(r"^[^@\s<>(),:;]+@[^@\s<>(),:;]+\.[^@\s<>(),:;]+$")
+
+# URI reference categories that carry the BSI source or deployable URIs.
+# Only these are filtered for trustworthy evidence and syntax-validated;
+# other external-reference types are documentation, not URIs the
+# profile requires.
+SOURCE_URI_TYPES = {"vcs", "source-distribution"}
+DEPLOYABLE_URI_TYPES = {"distribution"}
+URI_REFERENCE_TYPES = SOURCE_URI_TYPES | DEPLOYABLE_URI_TYPES | {"website"}
+
+
+def _valid_uri(uri):
+    """True when the string parses as a URI with a usable location."""
+    if not isinstance(uri, str) or not uri.strip():
+        return False
+    try:
+        parsed = urllib.parse.urlparse(uri.strip())
+    except ValueError:
+        return False
+    if parsed.scheme.lower() == "mailto":
+        return bool(_EMAIL_ADDRESS.match(parsed.path))
+    return bool(parsed.scheme and parsed.netloc)
+
+
+def _parse_contacts(spec, log=None):
+    """Parse creator-contact grammar into sorted organizationalEntities.
+
+    One entity per ';'-separated entry; each entry is
+    "NAME <EMAIL-or-URL>", "<URL>", a bare email address or a bare URL.
+    An entry without a machine-actionable email or URL is rejected with a
+    warning and never emitted as contact data. Entities come back sorted
+    so equivalent evidence always renders identical bytes.
+    """
+    entities = {}
+    for entry in (spec or "").split(CREATOR_CONTACT_SEPARATOR):
+        entry = entry.strip()
+        if not entry:
+            continue
+        name, contact = "", entry
+        credited = _CREDITED_CONTACT.match(entry)
+        if credited:
+            name = credited.group("name").strip()
+            contact = credited.group("contact").strip()
+        if _EMAIL_ADDRESS.match(contact):
+            kind, value = "email", contact
+        elif _valid_uri(contact):
+            if contact.lower().startswith("mailto:"):
+                kind, value = "email", contact[len("mailto:"):]
+            else:
+                kind, value = "url", contact
+        else:
+            _log(log, "warn", f"creator contact {entry!r} carries no usable "
+                              f"email address or URL; not emitted")
+            continue
+        entity = entities.setdefault(name, {"email": set(), "url": set()})
+        entity[kind].add(value)
+    contacts = []
+    for name, found in entities.items():
+        entity = {}
+        if name:
+            entity["name"] = name
+        for kind in ("email", "url"):
+            if found[kind]:
+                entity[kind] = sorted(found[kind])
+        contacts.append(entity)
+    contacts.sort(key=lambda entity: (entity.get("name", ""),
+                                      entity.get("email", []),
+                                      entity.get("url", [])))
+    return contacts
+
+
+def _creator_fields(entities):
+    """author and contact strings for a component from parsed contacts."""
+    author = next((entity["name"] for entity in entities if entity.get("name")),
+                  "")
+    component_contacts = sorted({contact
+                                 for entity in entities
+                                 for contact in entity.get("email", [])
+                                 + entity.get("url", [])})
+    return author, component_contacts
+
+
+def _apply_creator_identity(component, entities):
+    """Stamp creator contacts onto a component; never overwrite claims."""
+    author, contacts = _creator_fields(entities)
+    if not contacts or component.get("author") or component.get("contact"):
+        return False
+    if author:
+        component["author"] = author
+    component["contact"] = contacts
+    return True
+
+
+# "Semantically trustworthy upstream metadata" for creator evidence is
+# defined narrowly: only machine-readable upstream identity fields --
+# repository-type upstream purls, whose namespace is the upstream
+# organization, and fetcher-derived vcs references recorded on the
+# component. Free-form author names are never scraped into contacts.
+_UPSTREAM_PURL = re.compile(r"^pkg:(?P<type>github|gitlab|bitbucket)/"
+                            r"(?P<owner>[^/@?#]+)/(?P<project>[^/?#]+)")
+_UPSTREAM_VCS = re.compile(
+    r"^(?:(?:https?|ssh|git)://|git@)"
+    r"(?P<host>github\.com|gitlab\.com|bitbucket\.org)"
+    r"[:/]+(?P<owner>[^/@:;]+)/(?P<project>[^;?#]+?)(?:\.git)?(?:[;/?#].*)?$")
+
+
+def _upstream_creator_entities(component):
+    """Upstream creator contacts derived from recorded upstream identity."""
+    match = _UPSTREAM_PURL.match(component.get("purl") or "")
+    if match:
+        purl_type = match.group("type")
+        host = ("bitbucket.org" if purl_type == "bitbucket"
+                else f"{purl_type}.com")
+        owner, project = match.group("owner"), match.group("project")
+    else:
+        match = None
+        for reference in component.get("externalReferences") or ():
+            if reference.get("type") not in SOURCE_URI_TYPES:
+                continue
+            match = _UPSTREAM_VCS.match(reference.get("url") or "")
+            if match:
+                break
+        if not match:
+            return []
+        host = match.group("host")
+        owner, project = match.group("owner"), match.group("project")
+    project = re.sub(r"\.git$", "", project)
+    return [{"name": owner, "url": [f"https://{host}/{owner}/{project}"]}]
+
+
 def render(facts):
     """
     Render the SBOM and VEX documents from normalized build facts.
@@ -576,6 +726,9 @@ def render(facts):
         "timestamp": timestamp,
         "tools": _create_tools_metadata()
     }
+    sbom_creators = _parse_contacts(facts.get("sbom_creator"), log)
+    if sbom_creators:
+        sbom_metadata["authors"] = sbom_creators
     sbom_metadata["component"] = {
         "type": image_type,
         "name": image_name,
@@ -584,6 +737,14 @@ def render(facts):
     }
     if "external_references" in primary:
         sbom_metadata["component"]["externalReferences"] = primary["external_references"]
+    _apply_creator_identity(
+        sbom_metadata["component"], _parse_contacts(primary.get("creator"), log))
+    for reference_key, reference_type in (("source_uri", "vcs"),
+                                          ("deployable_uri", "distribution")):
+        if primary.get(reference_key):
+            sbom_metadata["component"].setdefault(
+                "externalReferences", []).append(
+                    {"type": reference_type, "url": primary[reference_key]})
 
     sbom = {
         "bomFormat": "CycloneDX",
@@ -664,6 +825,25 @@ def render(facts):
             # Can be disabled for certain SBOM profiles or tool compatibility
             if add_scopes:
                 pn_pkg["scope"] = "required" if pkg in runtime_recipes else "excluded"
+
+            # Third-party creator precedence: explicit per-recipe
+            # override, then trustworthy upstream identity metadata,
+            # then unresolved. The product manufacturer is never stamped
+            # onto bundled third-party software.
+            creator_override = _parse_contacts(pn_list.get("creator"), log)
+            if creator_override:
+                _apply_creator_identity(pn_pkg, creator_override)
+            elif not pn_pkg.get("author") and not pn_pkg.get("contact"):
+                _apply_creator_identity(
+                    pn_pkg, _upstream_creator_entities(pn_pkg))
+
+            for reference_key, reference_type in (("source_uri", "vcs"),
+                                                  ("deployable_uri",
+                                                   "distribution")):
+                if pn_list.get(reference_key):
+                    pn_pkg.setdefault("externalReferences", []).append(
+                        {"type": reference_type,
+                         "url": pn_list[reference_key]})
 
             if pkg in image_install_recipes and pn_pkg.get("bom-ref"):
                 directly_installed_component_refs.add(pn_pkg["bom-ref"])
@@ -962,6 +1142,23 @@ def render(facts):
                               f"artifact, build, dependency, licence and "
                               f"vulnerability evidence; kept separate, never "
                               f"deduplicated")
+
+    # Source and deployable URIs are emitted only from trustworthy
+    # metadata, and only when the URI is syntactically valid; an
+    # unparseable URI is dropped with a warning instead of entering the
+    # document, and the URI requirement rows report the gap.
+    for holder in [sbom_metadata["component"], *sbom["components"]]:
+        references = holder.get("externalReferences") or []
+        kept = [reference for reference in references
+                if reference.get("type") not in URI_REFERENCE_TYPES
+                or _valid_uri(reference.get("url"))]
+        if len(kept) != len(references):
+            _log(log, "warn", f"{holder.get('name') or 'metadata.component'}: "
+                              f"dropped "
+                              f"{len(references) - len(kept)} external "
+                              f"reference(s) with a syntactically invalid "
+                              f"URI")
+            holder["externalReferences"] = kept
 
     if not profile:
         return {"sbom": sbom, "vex": vex}
