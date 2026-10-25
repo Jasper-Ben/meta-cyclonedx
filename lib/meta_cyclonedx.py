@@ -91,6 +91,7 @@ import importlib
 import importlib.util
 import json
 import os
+import posixpath
 import re
 import urllib.parse
 import uuid
@@ -221,6 +222,22 @@ ALIAS_CPE_PROPERTY = "yocto:cve:cpe"
 # recipe that compiled the file it names.
 DEBUG_SRC_RECIPE_PREFIX = re.compile(r"^/usr/src/debug/([^/]+)/[^/]+(?:/|$)")
 DEPENDENCY_EVIDENCE_PROPERTY = "yocto:dependency:evidence"
+
+# File inventory (BSI TR-03183-2 v2.1.0 §3.2.1 and §5.2.2): delivered
+# executables and archives arrive as normalized artifact facts and compose
+# into exact file components. The bom-ref is derived from the delivering
+# recipe and the delivered path, so reruns mint stable references without
+# randomness; file components carry artifact identity only and never a
+# purl, CPE or licence (ADR-0006).
+BSI_FILENAME_PROPERTY = "bsi:component:filename"
+BSI_EXECUTABLE_PROPERTY = "bsi:component:executable"
+BSI_ARCHIVE_PROPERTY = "bsi:component:archive"
+BSI_STRUCTURED_PROPERTY = "bsi:component:structured"
+
+
+def _file_bom_ref(recipe, path):
+    """The deterministic bom-ref of one inventoried delivered file."""
+    return f"yocto-file:{recipe}:{path}"
 
 
 # The dependency graph crosses the scope of delivery exactly once per
@@ -1274,6 +1291,51 @@ def render(facts):
                         owner_entry["dependsOn"].append(target_ref)
                     _add_dependency_evidence(components_by_ref[owner_ref],
                                              "debugsrc")
+
+
+    # Compose the file inventory: every delivered mandatory file becomes
+    # an exact file component owned by the recipe's logical component,
+    # whose graph entry gains the file reference. Active only with a
+    # selected alignment profile; ordinary output stays a logical-component
+    # SBOM (ADR-0005), and the renderer never inspects files itself -
+    # classification and hashing stay artifact facts (ADR-0002).
+    file_inventory = facts.get("file_inventory") or {}
+    if profile and file_inventory:
+        for recipe in sorted(file_inventory):
+            owner_refs = recipe_refs.get(recipe) or []
+            version = next((component.get("version")
+                            for component in
+                            (fragments.get(recipe) or {}).get("pkgs", ())
+                            if component.get("version")), "unknown")
+            for entry in file_inventory[recipe]:
+                ref = _file_bom_ref(recipe, entry["path"])
+                name = posixpath.basename(entry["path"])
+                sbom["components"].append({
+                    "type": "file",
+                    "name": name,
+                    "version": version,
+                    "bom-ref": ref,
+                    "hashes": [{"alg": "SHA-512",
+                                "content": entry["sha512"]}],
+                    "properties": [
+                        {"name": BSI_FILENAME_PROPERTY, "value": name},
+                        {"name": BSI_EXECUTABLE_PROPERTY,
+                         "value": entry["executable"]},
+                        {"name": BSI_ARCHIVE_PROPERTY,
+                         "value": entry["archive"]},
+                        {"name": BSI_STRUCTURED_PROPERTY,
+                         "value": entry["structured"]},
+                    ],
+                })
+                owner_ref = owner_refs[0] if owner_refs else None
+                if owner_ref:
+                    owner_entry = next((dep for dep in sbom["dependencies"]
+                                        if dep["ref"] == owner_ref), None)
+                    if owner_entry is None:
+                        owner_entry = {"ref": owner_ref, "dependsOn": []}
+                        sbom["dependencies"].append(owner_entry)
+                    if ref not in owner_entry["dependsOn"]:
+                        owner_entry["dependsOn"].append(ref)
 
     # The component declaration order is fixed here, after EVERY append:
     # the recipe set above is unordered, boundary, contributed and
