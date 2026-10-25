@@ -43,6 +43,10 @@ image_install_recipes recipe names installed by image author intent; their
                       components hang directly off the graph root
 runtime_edges         recipe -> dependency recipe edges observed from the
                       installed packages (empty when unresolved by design)
+debug_sources         recipe -> delivered file -> debug-source paths recorded
+                      in pkgdata; prefixes of other recipes become statically
+                      linked dependency edges (missing/empty = unknown
+                      static coverage, never absent dependencies)
 included_images       ordered embedded-image documents:
     name                          recipe name of the included image
     sbom                          its completed SBOM document
@@ -541,10 +545,6 @@ def render(facts):
     at least one machine-detectable violation the renderer returns no
     documents but {"failure": ...}. Everything depends only on the facts;
     diagnostics are reported through the facts["log"] callback.
-
-    Optional fact keys: "debug_sources" maps each recipe to its delivered
-    files and the debug-source paths pkgdata records for them, from where
-    the renderer derives statically linked dependency edges.
     """
     timestamp = facts.get("timestamp")
     log = facts.get("log")
