@@ -404,3 +404,23 @@ def test_the_adapter_inventories_the_final_deploy_directory(tmp_path):
         {"path": "tee/bl31.elf", "source": "selected", "error": "missing"},
     ]
     assert not any("bom.json" in message for _level, message in events)
+
+
+def test_the_link_name_fallback_strips_the_build_stamp_without_reading_it(tmp_path):
+    # IMAGE_LINK_NAME is empty for some configurations: the stable name
+    # is then derived from IMAGE_NAME by shape - the collector must not
+    # read DATETIME, whose value changes every build and would make the
+    # generation task signatures non-deterministic.
+    import hashlib
+
+    image_bytes = b"rootfs-image-bytes"
+    (tmp_path / "core-image-minimal-qemux86-64-20261013120000.ext4").write_bytes(image_bytes)
+    (tmp_path / "core-image-minimal-qemux86-64.ext4").symlink_to(
+        "core-image-minimal-qemux86-64-20261013120000.ext4")
+    entries, _events = run_collect_deploy_files(
+        tmp_path,
+        {"IMAGE_NAME": "core-image-minimal-qemux86-64-20261013120000",
+         "IMAGE_FSTYPES": "ext4"},
+    )
+    assert [e["path"] for e in entries] == ["core-image-minimal-qemux86-64.ext4"]
+    assert entries[0]["sha512"] == hashlib.sha512(image_bytes).hexdigest()
