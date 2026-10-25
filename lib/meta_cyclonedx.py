@@ -34,6 +34,16 @@ primary               the delivered product:
     type / name / version         primary component metadata
     external_references           optional list; when the key is absent the
                                   primary component carries none
+    creator                       optional creator-contact grammar string
+                                  naming the product manufacturer as the
+                                  creator of the delivered product
+    source_uri / deployable_uri   optional explicit URIs for the primary
+                                  component (source and deployable form)
+sbom_creator            creator-contact grammar string naming the entity
+                        responsible for compiling this SBOM; entries are
+                        separated by ';' and each entry is
+                        "NAME <EMAIL-or-URL>", "<URL>", a bare email
+                        address or a bare URL
 fragments             per-recipe normalized facts, keyed by recipe name, in
                       the on-disk partial-SBOM format written by
                       do_populate_cyclonedx: "pkgs", "cves", "dependencies",
@@ -60,6 +70,7 @@ import importlib.util
 import json
 import os
 import re
+import urllib.parse
 import uuid
 from datetime import datetime, timezone
 
@@ -536,6 +547,105 @@ def kernel_vex_statement(cve_id, bom_refs, placeholder, detail):
     }
 
 
+
+# Creator evidence uses a small document grammar; every contact must be
+# machine-actionable through an email address or URL, mirroring the BSI
+# requirement that a creator be identifiable by contact data.
+CREATOR_CONTACT_SEPARATOR = ";"
+_CREDITED_CONTACT = re.compile(r"^\s*(?P<name>[^<>]*?)\s*<(?P<contact>[^<>]+)>\s*$")
+_EMAIL_ADDRESS = re.compile(r"^[^@\s<>(),:;]+@[^@\s<>(),:;]+\.[^@\s<>(),:;]+$")
+
+# URI reference categories that carry the BSI source or deployable URIs.
+# Only these are filtered for trustworthy evidence and syntax-validated;
+# other external-reference types are documentation, not URIs the
+# profile requires.
+SOURCE_URI_TYPES = {"vcs", "source-distribution"}
+DEPLOYABLE_URI_TYPES = {"distribution"}
+URI_REFERENCE_TYPES = SOURCE_URI_TYPES | DEPLOYABLE_URI_TYPES | {"website"}
+
+
+def _valid_uri(uri):
+    """True when the string parses as a URI with a usable location."""
+    if not isinstance(uri, str) or not uri.strip():
+        return False
+    try:
+        parsed = urllib.parse.urlparse(uri.strip())
+    except ValueError:
+        return False
+    if parsed.scheme.lower() == "mailto":
+        return bool(_EMAIL_ADDRESS.match(parsed.path))
+    return bool(parsed.scheme and parsed.netloc)
+
+
+def _parse_contacts(spec, log=None):
+    """Parse creator-contact grammar into sorted organizationalEntities.
+
+    One entity per ';'-separated entry; each entry is
+    "NAME <EMAIL-or-URL>", "<URL>", a bare email address or a bare URL.
+    An entry without a machine-actionable email or URL is rejected with a
+    warning and never emitted as contact data. Entities come back sorted
+    so equivalent evidence always renders identical bytes.
+    """
+    entities = {}
+    for entry in (spec or "").split(CREATOR_CONTACT_SEPARATOR):
+        entry = entry.strip()
+        if not entry:
+            continue
+        name, contact = "", entry
+        credited = _CREDITED_CONTACT.match(entry)
+        if credited:
+            name = credited.group("name").strip()
+            contact = credited.group("contact").strip()
+        if _EMAIL_ADDRESS.match(contact):
+            kind, value = "email", contact
+        elif _valid_uri(contact):
+            if contact.lower().startswith("mailto:"):
+                kind, value = "email", contact[len("mailto:"):]
+            else:
+                kind, value = "url", contact
+        else:
+            _log(log, "warn", f"creator contact {entry!r} carries no usable "
+                              f"email address or URL; not emitted")
+            continue
+        entity = entities.setdefault(name, {"email": set(), "url": set()})
+        entity[kind].add(value)
+    contacts = []
+    for name, found in entities.items():
+        entity = {}
+        if name:
+            entity["name"] = name
+        for kind in ("email", "url"):
+            if found[kind]:
+                entity[kind] = sorted(found[kind])
+        contacts.append(entity)
+    contacts.sort(key=lambda entity: (entity.get("name", ""),
+                                      entity.get("email", []),
+                                      entity.get("url", [])))
+    return contacts
+
+
+def _creator_fields(entities):
+    """author and contact strings for a component from parsed contacts."""
+    author = next((entity["name"] for entity in entities if entity.get("name")),
+                  "")
+    component_contacts = sorted({contact
+                                 for entity in entities
+                                 for contact in entity.get("email", [])
+                                 + entity.get("url", [])})
+    return author, component_contacts
+
+
+def _apply_creator_identity(component, entities):
+    """Stamp creator contacts onto a component; never overwrite claims."""
+    author, contacts = _creator_fields(entities)
+    if not contacts or component.get("author") or component.get("contact"):
+        return False
+    if author:
+        component["author"] = author
+    component["contact"] = contacts
+    return True
+
+
 def render(facts):
     """
     Render the SBOM and VEX documents from normalized build facts.
@@ -576,6 +686,9 @@ def render(facts):
         "timestamp": timestamp,
         "tools": _create_tools_metadata()
     }
+    sbom_creators = _parse_contacts(facts.get("sbom_creator"), log)
+    if sbom_creators:
+        sbom_metadata["authors"] = sbom_creators
     sbom_metadata["component"] = {
         "type": image_type,
         "name": image_name,

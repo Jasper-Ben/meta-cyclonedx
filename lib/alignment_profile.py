@@ -38,7 +38,10 @@ def _check_cyclonedx_format(context):
 def _check_sbom_creator(context):
     metadata = context["sbom"].get("metadata") or {}
     if metadata.get("authors"):
-        return "verified", "the SBOM names its creator through metadata.authors"
+        return "asserted", ("the product integration asserts the SBOM "
+                            "creator through metadata.authors; the contact "
+                            "of the asserting party cannot be independently "
+                            "checked by meta-cyclonedx")
     return "unmet", ("the SBOM does not identify an SBOM creator with an "
                      "email address or URL")
 
@@ -334,7 +337,7 @@ TR03183_2_REQUIREMENTS = [
         "source": ("BSI TR-03183-2 v2.1.0 §5.2.1 (SBOM-level data fields: "
                    "creator of SBOM)"),
         "representation": "metadata.authors entry with an email address or URL",
-        "origin": "generated-document",
+        "origin": "caller-assertion",
         "check": _check_sbom_creator,
     },
     {
