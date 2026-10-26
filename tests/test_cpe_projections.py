@@ -12,6 +12,27 @@ from helpers import (default_config, default_facts, dep, fragment, pkg,
 CPE = "cpe:2.3:*:*:gcc:13:*:*:*:*:*:*:*"
 ALIAS_CPE = "cpe:2.3:*:*:linux_kernel:6.6:*:*:*:*:*:*:*"
 PRIMARY_CPE = "cpe:2.3:*:*:linux:6.6:*:*:*:*:*:*:*"
+BRIDGE_CPE = "cpe:2.3:*:*:gcc_bridge:13:*:*:*:*:*:*:*"
+THIRD_CPE = "cpe:2.3:*:*:gcc_third:13:*:*:*:*:*:*:*"
+SECOND_CPE = "cpe:2.3:*:*:runtime:2:*:*:*:*:*:*:*"
+UNRESOLVED_CPE = "cpe:2.3:*:*:unresolved:1:*:*:*:*:*:*:*"
+
+
+def assert_no_removed_references(sbom, vex, removed):
+    """Check projected graph owners/targets, assemblies, and VEX targets."""
+    assert not removed & {component["bom-ref"] for component in sbom["components"]}
+    assert not removed & {
+        ref for entry in sbom["dependencies"]
+        for ref in [entry["ref"], *(entry.get("dependsOn") or [])]}
+    assert not removed & {
+        ref for composition in sbom["compositions"]
+        for ref in composition.get("assemblies") or []}
+    assert not removed & {
+        affect["ref"].rpartition("#")[2]
+        for statement in vex["vulnerabilities"]
+        for affect in statement.get("affects") or []}
+
+
 
 
 def alias_facts(**config):
@@ -250,6 +271,190 @@ def test_indistinguishable_twins_are_not_merged():
     sbom, _vex, logs = render_docs(facts)
     assert len([c for c in sbom["components"] if c["cpe"] == CPE]) == 2
     assert any("Unexplained component identity collision" in message
+               for _, message in logs)
+
+
+def test_transitive_group_keeps_every_alias_and_rewrites_file_owners():
+    file_component = {"type": "file", "name": "libbridge.so",
+                      "bom-ref": "file:libbridge.so"}
+    facts = default_facts(
+        config=default_config(deduplicate_cpe_collisions=True),
+        fragments={
+            "alpha": fragment(pkgs=[pkg(
+                "alpha", "13", "ref-a", cpe=CPE,
+                properties=[{"name": "yocto:cve:product", "value": "alpha"}])],
+                dependencies=[dep("ref-a", ["beta"])]),
+            "beta": fragment(pkgs=[pkg(
+                "beta", "13", "ref-b", cpe=CPE,
+                properties=[{"name": "yocto:cve:product", "value": "beta"},
+                            {"name": "yocto:cve:cpe", "value": BRIDGE_CPE}])],
+                dependencies=[dep("ref-b", ["gamma"])]),
+            "gamma": fragment(pkgs=[pkg(
+                "gamma", "13", "ref-c", cpe=BRIDGE_CPE,
+                properties=[{"name": "yocto:cve:product", "value": "gamma"},
+                            {"name": "yocto:cve:version", "value": "13"},
+                            {"name": "yocto:cve:cpe", "value": THIRD_CPE}])],
+                cves=[vuln("CVE-2025-3", "ref-c")],
+                extra_components=[file_component],
+                extra_roots=["file:libbridge.so"]),
+        },
+        image_install_recipes=["alpha", "beta", "gamma"])
+
+    sbom, vex, _logs = render_docs(facts)
+
+    assert {component["bom-ref"] for component in sbom["components"]} == {
+        "ref-a", "file:libbridge.so"}
+    survivor = next(c for c in sbom["components"] if c["bom-ref"] == "ref-a")
+    assert {(prop["name"], prop["value"]) for prop in survivor["properties"]} == {
+        ("yocto:cve:product", "alpha"),
+        ("yocto:cve:product", "beta"),
+        ("yocto:cve:product", "gamma"),
+        ("yocto:cve:version", "13"),
+        ("yocto:cve:cpe", BRIDGE_CPE),
+        ("yocto:cve:cpe", THIRD_CPE)}
+    assert next(entry for entry in sbom["dependencies"]
+                if entry["ref"] == "ref-a")["dependsOn"] == ["file:libbridge.so"]
+    assert_no_removed_references(sbom, vex, {"ref-b", "ref-c"})
+    serial = sbom["serialNumber"].removeprefix("urn:uuid:")
+    assert vex["vulnerabilities"][0]["affects"] == [
+        {"ref": f"urn:cdx:{serial}/1#ref-a"}]
+
+    added = meta_cyclonedx.merge_sbom_cve_check(
+        sbom, vex, {"package": [
+            {"name": alias, "cpes": [cpe],
+             "issue": [{"id": cve, "status": "Patched", "detail": "fixed"}]}
+            for alias, cpe, cve in (
+                ("alpha", CPE, "CVE-2025-11"),
+                ("beta", BRIDGE_CPE, "CVE-2025-12"),
+                ("gamma", THIRD_CPE, "CVE-2025-13"))]},
+        default_config())
+    assert added == 3
+    assert {statement["id"] for statement in vex["vulnerabilities"]} == {
+        "CVE-2025-3", "CVE-2025-11", "CVE-2025-12", "CVE-2025-13"}
+    assert all(statement["affects"] == [
+        {"ref": f"urn:cdx:{serial}/1#ref-a"}]
+        for statement in vex["vulnerabilities"])
+
+
+def test_independent_groups_merge_without_absorbing_unexplained_twins():
+    fragments = {
+        "alpha": fragment(pkgs=[pkg("alpha", "13", "ref-a", cpe=CPE)]),
+        "beta": fragment(
+            pkgs=[pkg("beta", "13", "ref-b", cpe=CPE)],
+            extra_components=[{"type": "file", "name": "beta.so",
+                               "bom-ref": "file:beta.so"}],
+            extra_roots=["file:beta.so"]),
+        "charlie": fragment(pkgs=[pkg(
+            "charlie", "2", "ref-c", cpe=SECOND_CPE)]),
+        "delta": fragment(
+            pkgs=[pkg("delta", "2", "ref-d", cpe=SECOND_CPE)],
+            cves=[vuln("CVE-2025-22", "ref-d")]),
+        "echo": fragment(pkgs=[pkg(
+            "unresolved", "1", "ref-e", cpe=UNRESOLVED_CPE)]),
+        "foxtrot": fragment(pkgs=[pkg(
+            "unresolved", "1", "ref-f", cpe=UNRESOLVED_CPE)]),
+        "helper": fragment(
+            pkgs=[pkg("helper", "1", "ref-h")],
+            dependencies=[dep("ref-h", ["beta", "delta", "echo"])]),
+    }
+    for rows in (fragments, dict(reversed(list(fragments.items())))):
+        facts = default_facts(
+            config=default_config(deduplicate_cpe_collisions=True),
+            fragments=rows,
+            image_install_recipes=list(rows))
+        sbom, vex, logs = render_docs(facts)
+
+        assert {c["bom-ref"] for c in sbom["components"]} == {
+            "ref-a", "ref-c", "ref-e", "ref-f", "ref-h", "file:beta.so"}
+        assert next(entry for entry in sbom["dependencies"]
+                    if entry["ref"] == "ref-a")["dependsOn"] == ["file:beta.so"]
+        assert set(next(entry for entry in sbom["dependencies"]
+                        if entry["ref"] == "ref-h")["dependsOn"]) == {
+            "ref-a", "ref-c", "ref-e"}
+        assert_no_removed_references(sbom, vex, {"ref-b", "ref-d"})
+        serial = sbom["serialNumber"].removeprefix("urn:uuid:")
+        assert vex["vulnerabilities"][0]["affects"] == [
+            {"ref": f"urn:cdx:{serial}/1#ref-c"}]
+        assert sum("merged " in message for _, message in logs) == 2
+        assert any("Unexplained component identity collision" in message
+                   and "ref-e" in message and "ref-f" in message
+                   for _, message in logs)
+
+
+def test_vex_only_difference_with_equal_purls_chooses_stable_recipe():
+    for first_ref, second_ref in (("ref-z", "ref-a"), ("ref-a", "ref-z")):
+        facts = default_facts(
+            config=default_config(deduplicate_cpe_collisions=True),
+            fragments={
+                "alpha": fragment(
+                    pkgs=[pkg("runtime", "13", first_ref, cpe=CPE)],
+                    cves=[vuln("CVE-2025-41", first_ref)]),
+                "beta": fragment(pkgs=[pkg("runtime", "13", second_ref, cpe=CPE)]),
+            },
+            image_install_recipes=["alpha", "beta"])
+        sbom, vex, _logs = render_docs(facts)
+
+        assert {component["bom-ref"] for component in sbom["components"]} == {
+            first_ref}
+        assert_no_removed_references(sbom, vex, {second_ref})
+
+
+def test_different_purls_without_distinct_instance_evidence_do_not_merge():
+    facts = default_facts(
+        config=default_config(deduplicate_cpe_collisions=True),
+        fragments={
+            "alpha": fragment(pkgs=[pkg("alpha", "13", "ref-a", cpe=CPE)]),
+            "beta": fragment(pkgs=[pkg("beta", "13", "ref-b", cpe=CPE)]),
+        },
+        image_install_recipes=["alpha", "beta"])
+
+    sbom, _vex, _logs = render_docs(facts)
+
+    assert {component["bom-ref"] for component in sbom["components"]} == {
+        "ref-a", "ref-b"}
+
+
+def test_same_package_coordinates_with_distinct_artifacts_are_explained():
+    shared_purl = "pkg:yocto/runtime@13"
+    facts = default_facts(
+        config=default_config(deduplicate_cpe_collisions=True),
+        fragments={
+            "runtime-a": fragment(pkgs=[pkg(
+                "runtime", "13", "ref-a", cpe=CPE, purl=shared_purl,
+                hashes=[{"alg": "SHA-512", "content": "a" * 128}])]),
+            "runtime-b": fragment(pkgs=[pkg(
+                "runtime", "13", "ref-b", cpe=CPE, purl=shared_purl,
+                hashes=[{"alg": "SHA-512", "content": "b" * 128}])]),
+        },
+        image_install_recipes=["runtime-a", "runtime-b"],
+        runtime_recipes=["runtime-a", "runtime-b"])
+
+    sbom, _vex, logs = render_docs(facts)
+
+    assert len([component for component in sbom["components"]
+                if component.get("cpe") == CPE]) == 1
+    assert not any("kept separate" in message for _, message in logs)
+
+
+def test_correlation_aliases_alone_do_not_explain_identical_instances():
+    facts = default_facts(
+        config=default_config(deduplicate_cpe_collisions=True),
+        fragments={
+            "runtime-a": fragment(pkgs=[pkg(
+                "runtime", "13", "ref-a", cpe=CPE,
+                properties=[{"name": "yocto:cve:product", "value": "first"}])]),
+            "runtime-b": fragment(pkgs=[pkg(
+                "runtime", "13", "ref-b", cpe=CPE,
+                properties=[{"name": "yocto:cve:product", "value": "second"}])]),
+        },
+        image_install_recipes=["runtime-a", "runtime-b"])
+
+    sbom, _vex, logs = render_docs(facts)
+
+    assert {component["bom-ref"] for component in sbom["components"]} == {
+        "ref-a", "ref-b"}
+    assert any("Unexplained component identity collision" in message
+               and "ref-a" in message and "ref-b" in message
                for _, message in logs)
 
 

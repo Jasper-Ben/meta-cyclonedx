@@ -832,7 +832,7 @@ def component_correlation_cpes(component):
     return cpes
 
 
-def identity_collisions(sbom, vex=None):
+def identity_collisions(sbom, vex=None, require_instance_evidence=False):
     """
     Group the components whose CPE correlation identifiers collide.
 
@@ -840,9 +840,11 @@ def identity_collisions(sbom, vex=None):
     group. A group is explained when every member carries observable
     evidence that distinguishes it from all others — package purl,
     artifact hashes, build properties, licences, dependency targets or VEX
-    analysis. Any two members indistinguishable on
-    all these axes are an unresolved identity collision. Returns a list
-    of dicts with keys bomRefs and correlationCpes (both sorted) and bool
+    analysis. Any two members indistinguishable on all these axes are an
+    unresolved identity collision. For the opt-in tooling projection,
+    require_instance_evidence excludes package coordinates alone: different
+    names do not establish differing build instances. Returns a list of
+    dicts with keys bomRefs and correlationCpes (both sorted) and bool
     explained, ordered by the first bomRef.
     """
     components_by_ref = {}
@@ -868,9 +870,13 @@ def identity_collisions(sbom, vex=None):
     def distinguishable_evidence(component):
         ref = component.get("bom-ref")
         return (
-            component.get("purl"),
+            None if require_instance_evidence else component.get("purl"),
             json.dumps(_canonical_evidence(component.get("hashes")), sort_keys=True),
-            json.dumps(_canonical_evidence(component.get("properties")), sort_keys=True),
+            json.dumps(_canonical_evidence([
+                prop for prop in component.get("properties") or []
+                if prop.get("name") not in (ALIAS_PRODUCT_PROPERTY,
+                                            ALIAS_VERSION_PROPERTY,
+                                            ALIAS_CPE_PROPERTY)]), sort_keys=True),
             json.dumps(component.get("licenses"), sort_keys=True),
             tuple(dep_targets.get(ref, [])),
             tuple(sorted(vex_status.get(ref, []))))
@@ -1322,25 +1328,33 @@ def _expand_cve_product_aliases(sbom, recipe_refs):
 def _deduplicate_cpe_collisions(sbom, vex, recipe_refs, log):
     """Project only explained collisions of native recipe components."""
     native_refs = {ref for refs in recipe_refs.values() for ref in refs}
+    recipe_by_ref = {ref: recipe for recipe, refs in recipe_refs.items()
+                     for ref in refs}
     native_components = [c for c in sbom["components"]
                          if c.get("bom-ref") in native_refs]
     collisions = identity_collisions(
         {"components": native_components, "dependencies": sbom["dependencies"]},
-        vex)
+        vex, require_instance_evidence=True)
     components_by_ref = {c["bom-ref"]: c for c in native_components}
     remap = {}
     for group in collisions:
         if not group["explained"]:
             continue
         members = [components_by_ref[ref] for ref in group["bomRefs"]]
-        # Missing/ambiguous package coordinates must not make a random
-        # bom-ref the tie breaker.
-        purls = [member.get("purl") for member in members]
-        if not all(purls) or len(set(purls)) != len(purls):
-            _log(log, "warn", "CPE collision has no distinct package purls; "
-                 "kept separate")
-            continue
-        survivor = min(members, key=lambda member: member["purl"])
+        # A shared package coordinate does not erase differing artifact or
+        # build evidence. Prefer stable component evidence over minted refs
+        # when choosing a survivor within one explained group.
+        survivor = min(
+            members,
+            key=lambda member: (
+                member.get("purl") or "",
+                member.get("name") or "",
+                member.get("version") or "",
+                json.dumps(_canonical_evidence({
+                    key: value for key, value in member.items()
+                    if key != "bom-ref"}), sort_keys=True),
+                recipe_by_ref.get(member["bom-ref"], ""),
+                member["bom-ref"]))
         for member in members:
             if member is survivor:
                 continue
@@ -1352,7 +1366,7 @@ def _deduplicate_cpe_collisions(sbom, vex, recipe_refs, log):
                                         ALIAS_CPE_PROPERTY) and prop not in existing:
                     existing.append(prop)
             _log(log, "note", "CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS: "
-                 f"merged {member.get('purl')} into {survivor['purl']}")
+                 f"merged {member.get('purl')} into {survivor.get('purl')}")
 
     if not remap:
         return
