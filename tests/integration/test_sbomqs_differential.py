@@ -12,7 +12,10 @@ rows - never silently moves a verdict.
 
 The v2 JSON structural features are explicit checks, not the aggregate
 quality score. Unsupported output or tool failures fail the job rather
-than silently skipping the comparison.
+than silently skipping the comparison. The defect class compared is
+the official-schema violation: identifier-syntax rows (purl/CPE
+syntax) are schema-valid by construction and remain matrix-only
+assertions, outside sbomqs' structural coverage.
 
 Run explicitly with:
     pytest -m integration tests/integration/test_sbomqs_differential.py
@@ -101,23 +104,24 @@ def test_matrix_and_sbomqs_agree_on_a_clean_representative_document(tmp_path):
 
 @pytest.mark.skipif(SBOMQS is None, reason="sbomqs binary not on PATH")
 def test_matrix_and_sbomqs_both_reject_a_structurally_defective_document(tmp_path):
-    facts = default_facts(
-        config=profile_config(),
-        fragments={"busybox": fragment_defective()},
-    )
-    sbom, _vex, _logs = render_docs(facts)
+    """The shared structural ground is the official CycloneDX JSON
+    schema: the matrix validates against the vendored copy
+    (REQ-FMT-002), sbomqs against its own (sbom_schema_valid). The
+    defect therefore violates the schema itself. Malformed purl/CPE
+    tokens (REQ-IDEN-002/003) are schema-valid by construction - the
+    matrix's identifier-syntax rows deliberately exceed sbomqs'
+    structural coverage - so they are asserted at unit level in
+    tests/test_identifier_syntax.py and never enter this
+    differential."""
+    sbom = _profile_document()
+    sbom["components"][0]["type"] = "not-a-component-type"
     verdicts = _structural_verdicts(sbom)
     unmet = sorted(rid for rid, verdict in verdicts.items()
                    if verdict == "unmet")
-    assert unmet, "fixture must produce a matrix-detected defect"
-    passes = _sbomqs_passes(tmp_path, sbom)
-    if passes:
-        pytest.fail("differential disagreement: matrix flags "
-                    f"{unmet} but sbomqs' structural checks all pass; review "
-                    "the affected matrix rows")
+    assert "REQ-FMT-002" in unmet, (
+        "the matrix must flag a schema violation via REQ-FMT-002; "
+        f"verdicts: {verdicts}")
+    assert not _sbomqs_passes(tmp_path, sbom), (
+        "sbomqs accepted a document that violates the official "
+        "CycloneDX JSON schema")
 
-
-def fragment_defective():
-    from helpers import fragment, pkg
-    return fragment(pkgs=[pkg("busybox", "1.36", "ref-busybox",
-                               purl="not-a-purl")])
