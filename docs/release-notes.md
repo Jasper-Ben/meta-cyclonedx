@@ -50,6 +50,12 @@ carry only what the
   references. Enabled output is a lossy projection, not a truthful
   per-instance inventory; alignment profiles reject the flag at parse time.
   The default output remains unchanged.
+- **Opt-in CVE product alias expansion**
+  (`CYCLONEDX_EXPAND_CVE_PRODUCT_ALIASES = "1"`): project secondary
+  recipe CVE product tokens as marked, CPE-carrying components linked to
+  their logical component. These tooling-only rows own no files or VEX
+  statements; alignment profiles reject the flag at parse time. Default
+  output remains unchanged.
 - **File inventory**: delivered executables, archives and the primary
   deployable artifact are represented as file components with SHA-512
   artifact identities; `CYCLONEDX_ADDITIONAL_FILES` selects further

@@ -69,9 +69,10 @@ and alignment-profile output share the corrected model.
    build warning, and strict enforcement rejects them.
    Ordinary output retains this model by default. Integrators targeting
    CPE-keyed tools may explicitly opt into the lossy
-   `CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS` projection described in the
-   [configuration reference](../../README.md#cpe-collision-deduplication-opt-in);
-   alignment-profile output never accepts that flag.
+   [`CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS`](../../README.md#cpe-collision-deduplication-opt-in)
+   projection or the view-only
+   [`CYCLONEDX_EXPAND_CVE_PRODUCT_ALIASES`](../../README.md#cve-product-alias-expansion-opt-in)
+   projection. Alignment-profile output accepts neither flag.
 
 
 7. **Winning correlation alias.** For multi-alias recipes the component
