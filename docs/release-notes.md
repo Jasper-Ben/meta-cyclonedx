@@ -46,3 +46,28 @@ carry only what the
   component creator inputs, recipe `LICENSE` as original-licence
   evidence only, and syntax-validated URIs from trustworthy sources
   only.
+
+### Fixes
+
+- Keep imported and embedded component instances separate when hashes,
+  build metadata, licences, dependency graphs or VEX analyses differ,
+  even if name, version and purl match. Compatible partial records may
+  still enrich an existing instance without discarding evidence.
+- Record missing or malformed optional imported BOMs without crashing
+  or reusing the previous successfully read document.
+- Validate explicit licence expressions in the renderer against the
+  selected SPDX licence and exception lists; support `WITH` exceptions
+  and normalize OE `&`/`|` operators.
+- Preserve both licence roles in schema-valid CycloneDX 1.6 output:
+  original declarations in `evidence.licenses`, distribution expression
+  in `licenses`. The requirements matrix revision is `2.1.0-r9`.
+- Inventory executables and archives from the final rootfs, including
+  generated files without package ownership, and select additional
+  deployables from `${DEPLOY_DIR_IMAGE}` after `do_image_complete`.
+- Preserve dangling VEX targets for report findings and strict
+  rejection. Merge statements only when their substantive analysis
+  agrees, not merely their CVE ID or analysis state.
+- Read sbomqs v2 structural feature results instead of an obsolete JSON
+  layout and aggregate quality score. Installed-tool errors no longer
+  become skips; actual matrix/tool disagreements remain visible.
+

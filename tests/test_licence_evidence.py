@@ -7,6 +7,8 @@ product integration explicitly supplies it. The generator performs no
 legal analysis and never converts one licence role into another.
 """
 
+import pytest
+
 import meta_cyclonedx
 from helpers import (default_facts, finding_by_id, fragment, pkg,
                      profile_config, render_all, render_docs)
@@ -201,9 +203,10 @@ def test_identified_boundary_components_are_exempt_from_licence_rows():
         assert "bomRefs" not in finding
 
 
-def test_strict_enforcement_passes_with_complete_licence_evidence():
+@pytest.mark.parametrize("spec_version", ["1.6", "1.7"])
+def test_strict_enforcement_passes_with_complete_licence_evidence(spec_version):
     facts = default_facts(
-        config=profile_config(enforcement="strict"),
+        config=profile_config(enforcement="strict", spec_version=spec_version),
         fragments={"busybox": fragment(
             distribution_licence="MIT",
             pkgs=[pkg("busybox", "1.36", "ref-busybox",
@@ -222,6 +225,17 @@ def test_strict_enforcement_passes_with_complete_licence_evidence():
         == "asserted"
     assert finding_by_id(docs["report"], "REQ-COMP-013")["verdict"] \
         == "verified"
+    import schema_validation
+    if schema_validation.availability(spec_version) is None:
+        assert schema_validation.check(docs["sbom"], spec_version) == ("valid", "")
+    if spec_version == "1.6":
+        component = docs["sbom"]["components"][0]
+        assert component["licenses"] == [
+            {"expression": "MIT", "acknowledgement": "concluded"}]
+        assert component["evidence"]["licenses"] == [
+            {"license": {"id": "MIT", "acknowledgement": "declared"}}]
+        assert docs["sbom"]["metadata"]["component"]["evidence"]["licenses"] == [
+            {"expression": "MIT", "acknowledgement": "declared"}]
 
 
 def test_effective_licence_cardinality_is_enforced_per_component():
@@ -238,3 +252,48 @@ def test_effective_licence_cardinality_is_enforced_per_component():
     finding = finding_by_id(docs["report"], "REQ-COMP-014")
     assert finding["verdict"] == "unmet"
     assert finding["bomRefs"] == ["ref-busybox"]
+
+
+@pytest.mark.parametrize("spec_version", ["1.6", "1.7"])
+@pytest.mark.parametrize("expression,normalized", [
+    ("GPL-2.0-only WITH Linux-syscall-note",
+     "GPL-2.0-only WITH Linux-syscall-note"),
+    ("MIT&(BSD-2-Clause|Apache-2.0)",
+     "MIT AND (BSD-2-Clause OR Apache-2.0)"),
+    ("LicenseRef-Product", "LicenseRef-Product"),
+])
+def test_explicit_licence_roles_use_the_selected_spdx_vocabulary(
+        spec_version, expression, normalized):
+    docs, _logs = render_all(default_facts(
+        config=profile_config(spec_version=spec_version),
+        fragments={"busybox": fragment(
+            pkgs=[pkg("busybox", "1.36", "ref-busybox")],
+            distribution_licence=expression, effective_licence=expression)}))
+    component = docs["sbom"]["components"][0]
+    assert component["licenses"] == [
+        {"expression": normalized, "acknowledgement": "concluded"}]
+    assert {"name": "bsi:component:effectiveLicence",
+            "value": normalized} in component["properties"]
+    assert finding_by_id(docs["report"], "REQ-FMT-002")["verdict"] \
+        in ("verified", "unverifiable")
+
+
+@pytest.mark.parametrize("expression", [
+    "Not-An-SPDX-License",
+    "MIT WITH Not-An-SPDX-Exception",
+    "MIT WITH BSD-2-Clause",
+    "MIT WITH Linux-syscall-note WITH Linux-syscall-note",
+    "(MIT OR BSD-2-Clause) WITH Linux-syscall-note",
+    "MIT AND",
+    "MIT OR ()",
+])
+def test_invalid_licence_assertions_are_not_emitted(expression):
+    sbom, _vex, logs = render_docs(default_facts(
+        fragments={"busybox": fragment(
+            pkgs=[pkg("busybox", "1.36", "ref-busybox")],
+            distribution_licence=expression, effective_licence=expression)}))
+    component = sbom["components"][0]
+    assert "licenses" not in component
+    assert not any(p["name"] == "bsi:component:effectiveLicence"
+                   for p in component.get("properties", []))
+    assert any(expression in message for _level, message in logs)

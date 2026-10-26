@@ -46,7 +46,7 @@ CYCLONEDX_PROFILE_ENFORCEMENT = "report"
 plus the BSI CycloneDX property taxonomy v0.1.2, evaluated on CycloneDX
 specification 1.6 or 1.7 (`CYCLONEDX_SPEC_VERSION`, default 1.7). The
 requirements matrix that turns baseline requirements into verdicts is
-project-owned, versioned data (currently 2.1.0-r8) in
+project-owned, versioned data (currently 2.1.0-r9) in
 `lib/alignment_profile.py`; no third-party validator decides the
 verdict.
 
@@ -153,6 +153,9 @@ should supply; full grammar is in the README.
   terms are authoritative, and `CYCLONEDX_EFFECTIVE_LICENCE` only when
   genuinely determined. The generator performs no legal or licence
   composition analysis and never converts one role into another.
+  The renderer validates SPDX licence and exception identifiers. With both
+  original and distribution roles present, CycloneDX 1.6 preserves original
+  declarations in `evidence.licenses`; 1.7 supports both roles in `licenses`.
 - **Trusted URIs.** Source and deployable URIs are emitted only from
   the explicit overrides (`CYCLONEDX_COMPONENT_SOURCE_URI`,
   `CYCLONEDX_COMPONENT_DEPLOYABLE_URI`,
@@ -164,15 +167,21 @@ should supply; full grammar is in the README.
   image bytes are hashed and joined to the file inventory. No
   configuration is required; `${IMAGE_LINK_NAME}`-lineage names keep
   the entries stable across rebuilds.
+- **Delivered rootfs files.** The final rootfs is walked after rootfs
+  customization. Package metadata attributes known files; executables
+  and archives without a package owner attach to the primary component.
 - **Additional files.** Select product payloads (kernel, bootloader,
   firmware, TEE, initramfs, embedded images) with
-  `CYCLONEDX_ADDITIONAL_FILES` globs against `${IMGDEPLOYDIR}`. A
+  `CYCLONEDX_ADDITIONAL_FILES` globs against `${DEPLOY_DIR_IMAGE}`. A
   selection that resolves to nothing is a `REQ-FILE-005` finding,
   never a silent skip.
 - **Separate VEX handling.** The SBOM contains no vulnerability data.
   VEX statements address logical component instances - never file
   components - and backported fixes are expressed as VEX status without
   changing the upstream component version.
+  Dangling targets remain visible in report enforcement and fail strict
+  enforcement. Equal analysis states do not merge distinct justifications,
+  details or responses.
 
 ## What the build cannot see
 

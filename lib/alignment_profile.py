@@ -798,8 +798,9 @@ def _licences_with_acknowledgement(component, acknowledgement):
         return (isinstance(license_field, dict)
                 and license_field.get("acknowledgement") == acknowledgement)
 
-    return any(has_acknowledgement(entry)
-               for entry in component.get("licenses") or [])
+    entries = list(component.get("licenses") or [])
+    entries.extend((component.get("evidence") or {}).get("licenses") or [])
+    return any(has_acknowledgement(entry) for entry in entries)
 
 
 def _check_original_licences(context):
@@ -1489,9 +1490,9 @@ TR03183_2_REQUIREMENTS = [
         "id": "REQ-COMP-013",
         "source": ("BSI TR-03183-2 v2.1.0 \u00a75.2.4 (original licences), "
                    "\u00a73.2.8 and \u00a78.1.13 (licence information)"),
-        "representation": ("components[].licenses entries with CycloneDX "
-                           "acknowledgement \"declared\"; recipe LICENSE is "
-                           "original licence evidence only"),
+        "representation": ("component licenses or evidence.licenses entries "
+                           "with CycloneDX acknowledgement \"declared\"; "
+                           "recipe LICENSE is original licence evidence only"),
         "origin": "recipe-metadata",
         "check": _check_original_licences,
     },
@@ -1577,7 +1578,7 @@ PROFILES = {
         "guideline": "BSI TR-03183-2",
         "guidelineVersion": "2.1.0",
         "propertyTaxonomyVersion": "0.1.2",
-        "requirementsMatrixVersion": "2.1.0-r8",
+        "requirementsMatrixVersion": "2.1.0-r9",
         "specVersions": ["1.6", "1.7"],
         "requirements": TR03183_2_REQUIREMENTS,
     },

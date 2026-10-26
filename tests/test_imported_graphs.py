@@ -6,6 +6,15 @@ independently assessable component instances, or silently truncating
 malformed input (ticket #6, ADR-0004, ADR-0006).
 """
 
+import ast
+import json
+import os
+import sys
+import types
+
+import meta_cyclonedx
+import pytest
+
 from helpers import (component_by_name, default_facts, dep_entry,
                      finding_by_id, fragment, pkg, profile_config,
                      render_all, render_docs)
@@ -50,12 +59,8 @@ def test_imported_component_with_colliding_ref_and_different_evidence_is_kept():
     assert "cargo://shared" in finding["bomRefs"]
 
 
-def test_one_imported_instance_reconciles_across_contributed_graphs():
-    # Two recipes' ecosystem BOMs both link serde 1.0 (same name, version
-    # and purl: the very same component instance) and each resolves it to
-    # its own copy of the module graph. The instances reconcile onto one
-    # node with both graphs' edges intact — no duplicate instance and no
-    # flattened graph.
+def test_imported_instances_with_different_dependency_builds_stay_separate():
+    # Equal package coordinates cannot collapse different resolved builds.
     serde_a = {"bom-ref": "cargo://a/serde", "type": "library",
                "name": "serde", "version": "1.0",
                "purl": "pkg:cargo/serde@1.0"}
@@ -83,13 +88,12 @@ def test_one_imported_instance_reconciles_across_contributed_graphs():
     sbom, _vex, _logs = render_docs(facts)
 
     serdes = [c for c in sbom["components"] if c["name"] == "serde"]
-    assert len(serdes) == 1, "one serde instance, not one per contributing BOM"
-    shared = serdes[0]["bom-ref"]
-    assert sorted(dep_entry(sbom, shared)["dependsOn"]) == \
-        ["cargo://a/libc", "cargo://b/libc"]
-    # Both consuming recipes still reach the shared instance.
-    assert dep_entry(sbom, "ref-r")["dependsOn"] == [shared]
-    assert dep_entry(sbom, "ref-o")["dependsOn"] == [shared]
+    assert sorted(c["bom-ref"] for c in serdes) == [
+        "cargo://a/serde", "cargo://b/serde"]
+    assert dep_entry(sbom, "cargo://a/serde")["dependsOn"] == ["cargo://a/libc"]
+    assert dep_entry(sbom, "cargo://b/serde")["dependsOn"] == ["cargo://b/libc"]
+    assert dep_entry(sbom, "ref-r")["dependsOn"] == ["cargo://a/serde"]
+    assert dep_entry(sbom, "ref-o")["dependsOn"] == ["cargo://b/serde"]
 
 
 def test_missing_imported_root_produces_a_finding_not_truncated_output():
@@ -222,3 +226,108 @@ def test_imported_subtree_composition_is_unknown_not_complete():
 
     assert composition_for(sbom, "cargo://m0")["aggregate"] == "unknown"
     assert composition_for(sbom, "cargo://m2")["aggregate"] == "unknown"
+
+
+@pytest.mark.parametrize("inputs", [
+    ("missing",),
+    ("malformed",),
+    ("valid", "missing", "malformed"),
+])
+def test_permissive_recipe_import_publishes_defects_without_reusing_a_bom(
+        tmp_path, monkeypatch, inputs):
+    from test_deploy_phase_facts import BBCLASS, _Data, class_function
+
+    (tmp_path / "malformed").write_text("{")
+    (tmp_path / "valid").write_text(json.dumps({
+        "metadata": {"component": {
+            "bom-ref": "imported-root", "name": "module",
+            "version": "1", "type": "library"}},
+        "dependencies": [{"ref": "imported-root", "dependsOn": []}],
+    }))
+    oe = types.ModuleType("oe")
+    oe.purl = types.ModuleType("oe.purl")
+    oe.purl.get_base_purl = lambda d: "pkg:yocto/app@1"
+    oe.cve_check = types.ModuleType("oe.cve_check")
+    oe.cve_check.get_patched_cves = lambda d: {}
+    for name, module in (("oe", oe), ("oe.purl", oe.purl),
+                         ("oe.cve_check", oe.cve_check)):
+        monkeypatch.setitem(sys.modules, name, module)
+    namespace = {
+        "os": os,
+        "bb": types.SimpleNamespace(
+            debug=lambda *args: None, warn=lambda message: None),
+        "_cyclonedx_renderer": lambda d: meta_cyclonedx,
+        "get_custom_properties": lambda d: [],
+        "get_recipe_dependencies": lambda d: [],
+    }
+    tree = ast.Module(body=[class_function(name) for name in
+                           ("read_json", "write_json", "do_populate_cyclonedx")],
+                      type_ignores=[])
+    exec(compile(tree, BBCLASS, "exec"), namespace)
+    namespace["do_populate_cyclonedx"](_Data({
+        "PN": "app", "BPN": "app", "PV": "1",
+        "CYCLONEDX_EXTRA_BOM_FILES":
+            " ".join(str(tmp_path / name) for name in inputs),
+        "CYCLONEDX_EXTRA_BOM_FILES_FAIL_ON_BROKEN_BOM_FILES": "0",
+        "CYCLONEDX_PNDATA_WORKDIR": str(tmp_path),
+    }))
+    collected = json.loads((tmp_path / "app.json").read_text())
+    assert collected.get("extra_roots", []) == (
+        ["imported-root"] if "valid" in inputs else [])
+    assert len(collected.get("extra_components", [])) == (
+        1 if "valid" in inputs else 0)
+    assert {os.path.basename(entry["file"])
+            for entry in collected["extra_bom_errors"]} == set(inputs) - {"valid"}
+    docs, _logs = render_all(default_facts(
+        config=profile_config(), fragments={"app": collected},
+        image_install_recipes=["app"]))
+    assert finding_by_id(docs["report"], "REQ-MERGE-001")["verdict"] == "unmet"
+
+
+@pytest.mark.parametrize("left,right", [
+    ({"hashes": [{"alg": "SHA-512", "content": "a" * 128}]},
+     {"hashes": [{"alg": "SHA-512", "content": "b" * 128}]}),
+    ({"licenses": [{"license": {"id": "MIT"}}]},
+     {"licenses": [{"license": {"id": "BSD-2-Clause"}}]}),
+    ({"properties": [{"name": "build:variant", "value": "production"}]},
+     {"properties": [{"name": "build:variant", "value": "recovery"}]}),
+])
+def test_imported_package_coordinates_do_not_override_instance_evidence(
+        left, right):
+    modules = [pkg("module", "1", "module-a", **left),
+               pkg("module", "1", "module-b", **right)]
+    docs, _logs = render_all(default_facts(
+        config=profile_config(),
+        fragments={"busybox": fragment(
+            pkgs=[pkg("busybox", "1.36", "ref-busybox")],
+            **contributed(modules, [], ["module-a", "module-b"]))}))
+    represented = {c["bom-ref"]: c for c in docs["sbom"]["components"]}
+    assert all(represented["module-a"][key] == value
+               for key, value in left.items())
+    assert all(represented["module-b"][key] == value
+               for key, value in right.items())
+    assert dep_entry(docs["sbom"], "ref-busybox")["dependsOn"] == [
+        "module-a", "module-b"]
+    assert finding_by_id(docs["report"], "REQ-IDEN-001")["verdict"] == "verified"
+
+
+def test_equivalent_recursive_instances_reconcile_without_losing_edges():
+    fragments = {}
+    for owner in ("a", "b"):
+        refs = [f"{owner}-{name}" for name in ("module", "dependency")]
+        modules = [pkg("module", "1", refs[0]),
+                   pkg("dependency", "2", refs[1])]
+        fragments[owner] = fragment(
+            pkgs=[pkg(f"app-{owner}", "1", f"app-{owner}")],
+            **contributed(modules, [
+                {"ref": refs[0], "dependsOn": [refs[1]]},
+                {"ref": refs[1], "dependsOn": [refs[0]]},
+            ], [refs[0]]))
+    sbom, _vex, _logs = render_docs(default_facts(
+        fragments=fragments, image_install_recipes=["a", "b"]))
+    module = component_by_name(sbom, "module")["bom-ref"]
+    dependency = component_by_name(sbom, "dependency")["bom-ref"]
+    assert dep_entry(sbom, module)["dependsOn"] == [dependency]
+    assert dep_entry(sbom, dependency)["dependsOn"] == [module]
+    assert dep_entry(sbom, "app-a")["dependsOn"] == [module]
+    assert dep_entry(sbom, "app-b")["dependsOn"] == [module]

@@ -46,9 +46,11 @@ def class_function(name):
         lines = class_file.read().splitlines(keepends=True)
     body = []
     wanted = f"def {name}("
+    task_header = f"python {name}() {{"
     for index, line in enumerate(lines):
-        if line.startswith(wanted):
-            body.append(line)
+        if line.startswith(wanted) or line.rstrip() == task_header:
+            body.append(f"def {name}(d):\n" if line.rstrip() == task_header
+                        else line)
             for following in lines[index + 1:]:
                 if following.strip() and not following[0].isspace():
                     break
@@ -205,8 +207,6 @@ def run_export(tmp_path, variables, deploy_phase=False,
     module.collect_file_inventory = collect_file_inventory
     module.collect_deploy_files = collect_deploy_files
     module.resolve_license_data = _stub("resolve_license_data", [])
-    module.validated_licence_expression = _stub(
-        "validated_licence_expression", "")
     module.generate_layer_references = _stub("generate_layer_references", [])
     module.resolve_extra_image_sbom_paths = _stub(
         "resolve_extra_image_sbom_paths", [])

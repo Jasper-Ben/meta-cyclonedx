@@ -189,10 +189,9 @@ CYCLONEDX_PROFILE_ENFORCEMENT ??= "report"
 # Explicitly selected additional deployed files (alignment profile
 # only): whitespace-separated shell-style globs (fnmatch; `*` crosses
 # directory boundaries) matched against paths relative to the image
-# deploy directory ${IMGDEPLOYDIR} - the staged ${DEPLOY_DIR_IMAGE}
-# content; a leading "/" anchors at that directory too. For kernel,
-# bootloader, firmware, TEE, initramfs, embedded-image and other
-# product payloads that package manifests do not cover.
+# deploy directory ${DEPLOY_DIR_IMAGE}; a leading "/" anchors there too.
+# For kernel, bootloader, firmware, TEE, initramfs, embedded-image and
+# other product payloads that package manifests do not cover.
 # Selected files become file components under the same classification,
 # SHA-512 identity and graph rules as root-filesystem files; a
 # selection that resolves to nothing is an alignment finding, never
@@ -404,6 +403,7 @@ python do_populate_cyclonedx() {
                 bb.warn(f"CYCLONEDX_EXTRA_BOM_FILES: {pn}: no such file, skipping: {bom_path}")
                 extra_bom_errors.append({"file": bom_path,
                                          "error": "no such file"})
+                continue
             else:
                 bb.fatal(f"CYCLONEDX_EXTRA_BOM_FILES: {pn}: no such file: {bom_path}")
         try:
@@ -412,6 +412,7 @@ python do_populate_cyclonedx() {
             if d.getVar("CYCLONEDX_EXTRA_BOM_FILES_FAIL_ON_BROKEN_BOM_FILES") == "0":
                 bb.warn(f"CYCLONEDX_EXTRA_BOM_FILES: {pn}: cannot parse {bom_path}, skipping: {e}")
                 extra_bom_errors.append({"file": bom_path, "error": str(e)})
+                continue
             else:
                 bb.fatal(f"CYCLONEDX_EXTRA_BOM_FILES: {pn}: cannot parse {bom_path}: {e}")
         components = extra_bom.get("components") or []
@@ -455,14 +456,12 @@ python do_populate_cyclonedx() {
         if value:
             pn_list[fact_key] = value
 
-    # Licence-role evidence: the distribution and effective licence
-    # variables are the explicitly identified authoritative sources; an
-    # expression that is not SPDX-authoritative is dropped with a
-    # warning and its absence surfaces as an alignment finding instead.
+    # The renderer validates explicit licence-role assertions against its
+    # pinned SPDX vocabulary; the adapter forwards the source verbatim.
     for fact_key, variable in (
             ("distribution_licence", "CYCLONEDX_DISTRIBUTION_LICENCE"),
             ("effective_licence", "CYCLONEDX_EFFECTIVE_LICENCE")):
-        expression = validated_licence_expression(d, variable)
+        expression = d.getVar(variable)
         if expression:
             pn_list[fact_key] = expression
 
@@ -709,42 +708,6 @@ def extract_license_details(d, expression):
         details.append(detail)
 
     return details if details else None
-
-def validated_licence_expression(d, variable):
-    """
-    Validate a licence-role variable's value as a semantically
-    authoritative SPDX licence expression. OE-style '&'/'|' spellings are
-    normalized to SPDX operators and every identifier token must already
-    be a known SPDX licence identifier or a LicenseRef-* invention;
-    SPDXLICENSEMAP rewriting or composition is never applied: an
-    authoritative source must state the normative vocabulary. An invalid
-    value is dropped with a warning, and the missing licence evidence
-    surfaces as an alignment finding instead.
-    """
-    value = (d.getVar(variable) or "").strip()
-    if not value:
-        return None
-    spec_version = d.getVar("CYCLONEDX_SPEC_VERSION")
-    layerdir = d.getVar("CYCLONEDX_LAYERDIR")
-    licenses_file_path = (
-        f"{layerdir}/meta/files/spdx-license-list-data/"
-        f"licenses-{spec_version}.json")
-    spdx_license_ids = {entry["licenseId"]
-                        for entry in read_json(licenses_file_path)["licenses"]}
-    tokens = re.findall(
-        r"\(|\)|\S+",
-        value.replace("(", " ( ").replace(")", " ) ")
-             .replace("&", " & ").replace("|", " | "))
-    for token in tokens:
-        if token in ("(", ")", "&", "|", "AND", "OR", "WITH"):
-            continue
-        if token in spdx_license_ids or token.startswith("LicenseRef-"):
-            continue
-        bb.warn(f"{variable}: '{token}' is not a known SPDX licence "
-                f"identifier; ignoring the expression as licence-role "
-                f"evidence")
-        return None
-    return " ".join(tokens)
 
 
 def resolve_license_data(d):
@@ -1391,16 +1354,6 @@ def collect_debug_sources(d, recipes):
     return sources
 
 
-def _file_mode_is_executable(mode):
-    """True when a pkgdata files_info mode says executable."""
-    if mode is None:
-        return False
-    try:
-        return bool(int(str(mode), 8) & 0o111)
-    except ValueError:
-        return False
-
-
 def collect_file_inventory(d, recipes):
     """
     Collect the mandatory-file artifact facts of the assembled root
@@ -1410,26 +1363,16 @@ def collect_file_inventory(d, recipes):
     binary analysis, debug extraction or dependency inference from file
     contents ever happens (ADR-0002).
 
-    Discovery reuses the pkgdata files_info records that
-    collect_debug_sources() already consumes: they name the files the
-    packages deliver, keyed by delivered path. The rootfs existence
-    check is the delivery ground truth - files of packages that were not
-    installed (e.g. -dbg, -src) never enter the inventory - and a path
-    claimed by several recipes is attributed to the first in sorted
-    recipe order. Classification lives in the renderer's pure
-    classify_delivered_file(); the delivered lstat mode decides, so the
-    always-executable bits of symlinks never count: a symlink is a second
-    name for the regular file it resolves to, not an artifact of its own.
-    Hashes mix in no mode, path or timestamp, and the adapter reads the
-    rootfs inside the task's pseudo environment during do_rootfs.
-    Entries that are missing, unreadable or not decidable from the
-    signature carry an error kind instead of vanishing (ADR-0004).
+    Walk the delivered rootfs; pkgdata attributes known paths but is not
+    the discovery boundary. Executables and archives created by postinst
+    scripts or image customization belong to the primary component when
+    no recipe claims them. A path claimed by several recipes is attributed
+    to the first in sorted recipe order. Symlinks and special entries are
+    not separate content artifacts.
 
-    Cost: one pkgdata extended-record pass (same files debug-source
-    collection already reads), the first 64 KiB of every claimed file
-    for signature checks, plus a full read and SHA-512 of each mandatory
-    file. A core-image-minimal rootfs is tens of megabytes, so hashing
-    adds well under a second; non-mandatory content is never hashed.
+    Read signatures of regular files, then hash mandatory content only.
+    This runs in do_rootfs's pseudo environment after rootfs processing.
+    Unreadable or unclassifiable files stay explicit evidence (ADR-0004).
     """
     import hashlib
     import os
@@ -1451,9 +1394,8 @@ def collect_file_inventory(d, recipes):
             extended = oe.packagedata.read_subpkgdata_extended(pkg, d)
             if not extended:
                 continue
-            for fpath, info in (extended.get("files_info") or {}).items():
-                claims.setdefault(fpath,
-                                  (pn, (info or {}).get("mode")))
+            for fpath in (extended.get("files_info") or {}):
+                claims.setdefault(fpath, pn)
 
     def defective(pn, fpath, kind):
         bb.warn(f"CycloneDX file inventory: {pn}: delivered mandatory file "
@@ -1461,17 +1403,22 @@ def collect_file_inventory(d, recipes):
         inventory.setdefault(pn, []).append({"path": fpath, "error": kind})
 
     inventory = {}
-    for fpath, (pn, mode_hint) in sorted(claims.items()):
+    def delivered_paths():
+        for root, dirs, names in os.walk(rootfs):
+            dirs.sort()
+            for name in sorted(names):
+                yield "/" + os.path.relpath(os.path.join(root, name), rootfs)
+
+    for fpath in delivered_paths():
+        pn = claims.get(fpath, "")
         delivered = os.path.join(rootfs, fpath.lstrip("/"))
         try:
             mode = os.lstat(delivered).st_mode
         except FileNotFoundError:
-            if _file_mode_is_executable(mode_hint):
-                defective(pn, fpath, "missing")
+            defective(pn, fpath, "missing")
             continue
         except OSError:
-            if _file_mode_is_executable(mode_hint):
-                defective(pn, fpath, "unreadable")
+            defective(pn, fpath, "unreadable")
             continue
         if not stat.S_ISREG(mode):
             continue  # symlinks and special entries: not artifacts
@@ -1479,9 +1426,7 @@ def collect_file_inventory(d, recipes):
             with open(delivered, "rb") as artifact:
                 head = artifact.read(renderer.ARTIFACT_HEAD_SIZE)
         except OSError:
-            if (renderer.classify_delivered_file(
-                    fpath, mode, b"")["executable"] == "executable"):
-                defective(pn, fpath, "unreadable")
+            defective(pn, fpath, "unreadable")
             continue
         if not renderer.classify_delivered_file(fpath, mode,
                                                 head)["mandatory"]:
@@ -1526,7 +1471,7 @@ def collect_deploy_files(d):
     equivalent rebuilds - including runs where the image artifacts come
     from sstate under a fresh build stamp - reproduce identical
     inventories. Call it only from the deploy phase (do_deploy_cyclonedx
-    runs after do_image): inside do_rootfs the artifact bytes are not
+    runs after do_image_complete): inside do_rootfs the artifact bytes are not
     final yet and hashing there would chase a moving target. Inclusion
     is by mandate or explicit selection, not by the classifier: the
     classifier only records the BSI properties (a raw filesystem image
@@ -1542,7 +1487,7 @@ def collect_deploy_files(d):
     import stat
 
     renderer = _cyclonedx_renderer(d)
-    deploy_dir = d.getVar("IMGDEPLOYDIR") or d.getVar("DEPLOY_DIR_IMAGE")
+    deploy_dir = d.getVar("DEPLOY_DIR_IMAGE")
     if not deploy_dir or not os.path.isdir(deploy_dir):
         bb.note("CycloneDX deploy inventory: no deploy directory; no "
                 "deployable artifact or selected files for this export")
@@ -1754,32 +1699,25 @@ def export_cyclonedx(d, deploy_phase=False):
 
     # The mandatory delivered-file inventory belongs to the alignment
     # profile (ADR-0005); without one, no file is read or hashed at all.
-    # Image recipes generate twice under a profile: once inside
-    # do_rootfs (intermediate documents for embedded-image consumers,
-    # gated by do_cyclonedx_complete), and finally in
-    # do_deploy_cyclonedx - after do_image - where the primary
-    # deployable artifact's bytes are final (ticket #10; hashing them
-    # inside do_rootfs would chase a moving target). The final
-    # generation reuses the root-filesystem inventory persisted by the
-    # rootfs phase (like the recipe facts above) instead of re-walking
-    # the rootfs outside its pseudo environment.
+    # Image recipes publish final documents after do_image_complete.
+    # Their final rootfs inventory is collected in do_rootfs's postfunc,
+    # after postinst and rootfs customization, while pseudo is active.
+    # Deploy regeneration reuses that snapshot rather than inspecting the
+    # rootfs or asking the package manager outside its task environment.
     file_inventory = {}
     inventory_file = os.path.join(d.getVar("WORKDIR"),
                                   "cyclonedx-file-inventory.json")
     if profile:
         if deploy_phase and is_image:
-            if os.path.exists(inventory_file):
-                file_inventory = read_json(inventory_file)
-            else:
-                file_inventory = collect_file_inventory(d,
-                                                        sorted(fragments))
+            if not os.path.exists(inventory_file):
+                bb.fatal(f"CycloneDX final rootfs inventory {inventory_file} "
+                         "missing; run do_rootfs with the profile")
+            file_inventory = read_json(inventory_file)
             deploy_entries = collect_deploy_files(d)
             if deploy_entries:
-                file_inventory[""] = deploy_entries
-        else:
+                file_inventory.setdefault("", []).extend(deploy_entries)
+        elif not is_image:
             file_inventory = collect_file_inventory(d, sorted(fragments))
-            if is_image and not deploy_phase:
-                write_json(inventory_file, file_inventory)
 
     primary = {
         "type": d.getVar("CYCLONEDX_IMAGE_TYPE") or "firmware",
@@ -1814,7 +1752,7 @@ def export_cyclonedx(d, deploy_phase=False):
     for variable, fact_key in (
             ("CYCLONEDX_DISTRIBUTION_LICENCE", "distribution_licence"),
             ("CYCLONEDX_EFFECTIVE_LICENCE", "effective_licence")):
-        expression = validated_licence_expression(d, variable)
+        expression = d.getVar(variable)
         if expression:
             primary[fact_key] = expression
     if d.getVar("CYCLONEDX_ADD_LAYER_REFERENCES") == "1":
@@ -1935,10 +1873,22 @@ python do_export_cyclonedx() {
     export_cyclonedx(d)
 }
 
-# We use ROOTFS_POSTUNINSTALL_COMMAND to make sure this function runs exactly once
-# after the build process has been completed
-# see https://docs.yoctoproject.org/ref-manual/variables.html#term-ROOTFS_POSTUNINSTALL_COMMAND
+# Capture package-manager facts before its database is removed.
 ROOTFS_POSTUNINSTALL_COMMAND =+ "do_export_cyclonedx"
+
+python collect_cyclonedx_file_inventory() {
+    if not d.getVar("CYCLONEDX_PROFILE") or not bb.data.inherits_class("image", d):
+        return
+    facts = read_json(os.path.join(d.getVar("WORKDIR"),
+                                   "cyclonedx-rootfs-facts.json"))
+    inventory = collect_file_inventory(d, sorted(facts["fragments"]))
+    write_json(os.path.join(d.getVar("WORKDIR"),
+                            "cyclonedx-file-inventory.json"), inventory)
+}
+# Observe the final rootfs, including ROOTFS_POSTPROCESS_COMMAND changes,
+# without re-querying its removed package-manager database.
+do_rootfs[postfuncs] += "collect_cyclonedx_file_inventory"
+
 # Looked up through a variable name argument, invisible to the signature
 export_cyclonedx[vardeps] += "CYCLONEDX_EXPORT_SBOM CYCLONEDX_EXPORT_VEX \
     CYCLONEDX_EXPORT_SBOM_LINK CYCLONEDX_EXPORT_VEX_LINK \
@@ -2075,6 +2025,10 @@ do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx
 do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx/spdx.schema.json:True"
 do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx/jsf-0.82.schema.json:True"
 do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx/cryptography-defs.schema.json:True"
+do_rootfs[file-checksums] += "${CYCLONEDX_LAYERDIR}/meta/files/spdx-license-list-data/licenses-${CYCLONEDX_SPEC_VERSION}.json:True"
+do_rootfs[file-checksums] += "${CYCLONEDX_LAYERDIR}/meta/files/spdx-license-list-data/exceptions-${CYCLONEDX_SPEC_VERSION}.json:True"
+do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/meta/files/spdx-license-list-data/licenses-${CYCLONEDX_SPEC_VERSION}.json:True"
+do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/meta/files/spdx-license-list-data/exceptions-${CYCLONEDX_SPEC_VERSION}.json:True"
 python do_cyclonedx_sbom_cve_check_setscene() {
     sstate_setscene(d)
 }

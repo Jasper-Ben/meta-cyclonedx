@@ -268,3 +268,74 @@ def test_files_of_recipes_without_a_logical_component_have_no_owner():
     assert finding["verdict"] == "unmet"
     assert finding["bomRefs"] == [file_ref("ghostly", "/usr/bin/phantom")]
     assert finding_by_id(docs["report"], "REQ-FILE-001")["verdict"] == "verified"
+
+
+def test_final_rootfs_inventory_includes_unowned_executables_and_archives(
+        tmp_path, monkeypatch):
+    import ast
+    import hashlib
+    import io
+    import json
+    import os
+    import sys
+    import tarfile
+    import types
+
+    from test_deploy_phase_facts import BBCLASS, _Data, class_function
+
+    rootfs = tmp_path / "rootfs"
+    (rootfs / "usr/bin").mkdir(parents=True)
+    (rootfs / "opt").mkdir()
+    script = b"#!/bin/sh\nexit 0\n"
+    for name in ("packaged", "generated"):
+        path = rootfs / "usr/bin" / name
+        path.write_bytes(script)
+        path.chmod(0o755)
+    (rootfs / "usr/bin/alias").symlink_to("generated")
+    (rootfs / "opt/settings.conf").write_text("enabled=true\n")
+    archive = rootfs / "opt/generated.tar"
+    with tarfile.open(archive, "w") as stream:
+        member = tarfile.TarInfo("payload")
+        member.size = 7
+        stream.addfile(member, io.BytesIO(b"payload"))
+    (tmp_path / "cyclonedx-rootfs-facts.json").write_text(json.dumps({
+        "fragments": {"busybox": {}}}))
+    oe = types.ModuleType("oe")
+    oe.packagedata = types.ModuleType("oe.packagedata")
+    oe.packagedata.read_pkgdata = lambda pn, d: {"PACKAGES": "busybox"}
+    oe.packagedata.read_subpkgdata_extended = lambda package, d: {
+        "files_info": {"/usr/bin/packaged": {"size": len(script)},
+                       "/usr/bin/not-installed": {"size": 42}}}
+    monkeypatch.setitem(sys.modules, "oe", oe)
+    monkeypatch.setitem(sys.modules, "oe.packagedata", oe.packagedata)
+    namespace = {
+        "os": os,
+        "bb": types.SimpleNamespace(
+            data=types.SimpleNamespace(inherits_class=lambda name, d: True),
+            warn=lambda message: None, note=lambda message: None),
+        "_cyclonedx_renderer": lambda d: meta_cyclonedx,
+    }
+    tree = ast.Module(body=[class_function(name) for name in (
+        "read_json", "write_json", "collect_file_inventory",
+        "collect_cyclonedx_file_inventory")], type_ignores=[])
+    exec(compile(tree, BBCLASS, "exec"), namespace)
+    namespace["collect_cyclonedx_file_inventory"](_Data({
+        "CYCLONEDX_PROFILE": "tr03183-2.1", "WORKDIR": str(tmp_path),
+        "IMAGE_ROOTFS": str(rootfs)}))
+    inventory = json.loads(
+        (tmp_path / "cyclonedx-file-inventory.json").read_text())
+    assert [entry["path"] for entry in inventory["busybox"]] == [
+        "/usr/bin/packaged"]
+    assert [entry["path"] for entry in inventory[""]] == [
+        "/opt/generated.tar", "/usr/bin/generated"]
+    assert inventory[""][1]["sha512"] == hashlib.sha512(script).hexdigest()
+    assert inventory[""][0]["sha512"] == hashlib.sha512(
+        archive.read_bytes()).hexdigest()
+    docs, _logs = render_all(default_facts(
+        config=profile_config(), file_inventory=inventory))
+    generated = file_component(docs["sbom"], "", "/usr/bin/generated")
+    assert generated["version"] == "1.0"
+    root = docs["sbom"]["metadata"]["component"]["bom-ref"]
+    assert generated["bom-ref"] in dep_entry(docs["sbom"], root)["dependsOn"]
+    assert finding_by_id(docs["report"], "REQ-FILE-001")["verdict"] == "verified"
+    assert finding_by_id(docs["report"], "REQ-FILE-003")["verdict"] == "verified"

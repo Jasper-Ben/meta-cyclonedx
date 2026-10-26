@@ -37,12 +37,26 @@ tools/kas`), and the wrapper's container-image version stays in
   `python3 -m pip install jsonschema`.
 
 Additionally, `tests/integration/test_sbomqs_differential.py` is a
-maintainer-only differential check: when the external `sbomqs`
-validator binary is on PATH it compares sbomqs' structural verdict
-against the requirements matrix on representative documents; without
-the binary the tests skip. Disagreement fails only those
-differential-marked tests - the matrix owns our verdicts; a failure
-prompts review of the affected rows, never a silent verdict change.
+maintainer-only differential check against `sbomqs` v2 JSON output
+(exercised with v2.1.3). It compares the tool's four `Structural`
+features—declared specification, supported version, file format and
+schema validity—with the project matrix's structural requirements.
+Each external feature must be evaluated and score 10/10; a positive
+overall quality score is not a validation verdict. Only an absent
+binary skips the tests; command failures or incompatible JSON fail.
+
+Run just these checks without rebuilding the image:
+
+```sh
+pytest -q -m integration tests/integration/test_sbomqs_differential.py -rs
+```
+
+Disagreements remain failures of the differential job, not changes to
+the project-owned release gate. With v2.1.3, the invalid-purl fixture
+exposes a coverage difference: the matrix rejects `not-a-purl` as
+`REQ-IDEN-002`, while sbomqs' structural features pass. Its structural
+category does not include a purl-syntax check. This failure is retained
+for maintainer review; identifier validation is not relaxed.
 
 ## Invocation modes
 
