@@ -1938,6 +1938,13 @@ python () {
         # do_image_complete's sstate installation, so the task runs
         # after it; hashing before that step records the previous
         # build's bytes for every artifact do_image_complete owns.
+        # The depends flag additionally puts do_image_complete's output
+        # hash into this task's sstate signature: task-graph ordering
+        # alone lets a cache hit restore documents that hashed an older
+        # build's artifact bytes while do_image_complete republishes
+        # fresh ones in the same run.
+        d.appendVarFlag("do_deploy_cyclonedx", "depends",
+                        f" {d.getVar('PN')}:do_image_complete")
         bb.build.addtask("do_deploy_cyclonedx", "do_build", "do_image_complete", d)
         complete_after = "do_deploy_cyclonedx"
         if cyclonedx_sbom_cve_check_enabled(d):
