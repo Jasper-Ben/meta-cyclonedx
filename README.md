@@ -380,6 +380,12 @@ so all aliases keep reaching CVE and VEX matching. The Yocto/package
 identity of the build stays in the component purl (`pkg:yocto/...`,
 OpenEmbedded's purl prefix) alongside the logical identity.
 
+The component's single `cpe` uses the first declared `CVE_PRODUCT` token
+crossed with the first declared `CVE_VERSION` token; repeated aliases are
+deduplicated without changing declaration order in the properties.
+Other aliases remain available for in-layer vulnerability matching, but
+CPE-keyed external tools match the selected `cpe` field only.
+
 Two component instances that share a CPE are never deduplicated: they
 remain separate while their artifact, build, dependency, licence or
 vulnerability evidence differs; indistinguishable duplicates produce a

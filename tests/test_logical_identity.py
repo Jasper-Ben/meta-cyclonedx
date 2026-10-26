@@ -3,6 +3,8 @@ identity instead of CVE aliases, one component per recipe, instances that
 share a CPE, and collision reporting. Ordinary output and the alignment
 profile are held to the same model (ADR-0006, ADR-0009)."""
 
+import json
+
 import meta_cyclonedx
 
 from helpers import (component_by_name, default_facts, finding_by_id, fragment,
@@ -35,6 +37,77 @@ def test_rendered_components_carry_creator_assigned_identity_not_aliases():
     products = [p["value"] for p in component["properties"]
                 if p["name"] == "yocto:cve:product"]
     assert products == ["libwidget", "widget"]
+
+
+def test_first_declared_aliases_select_cpe_and_keep_all_correlation_properties():
+    identity = meta_cyclonedx.component_identity(
+        "linux-yocto", "6.6", "pkg:yocto/linux-yocto@6.6",
+        cve_products="linux_kernel linux linux_kernel",
+        cve_versions="6.6 6.5 6.6+gitAUTOINC+abc 6.5")
+    identity["bom-ref"] = "ref-k"
+    sbom, _vex, _logs = render_docs(default_facts(
+        fragments={"linux-yocto": fragment(pkgs=[identity])}))
+
+    [component] = sbom["components"]
+    assert component["name"] == "linux-yocto"
+    assert component["cpe"] == "cpe:2.3:*:*:linux_kernel:6.6:-:*:*:*:*:*:*"
+    properties = component["properties"]
+    assert [p["value"] for p in properties if p["name"] == "yocto:cve:product"] == [
+        "linux_kernel", "linux"]
+    assert [p["value"] for p in properties if p["name"] == "yocto:cve:version"] == [
+        "6.6", "6.5"]
+    assert [p["value"] for p in properties if p["name"] == "yocto:cve:cpe"] == [
+        "cpe:2.3:*:*:linux_kernel:6.6:-:*:*:*:*:*:*",
+        "cpe:2.3:*:*:linux_kernel:6.5:-:*:*:*:*:*:*",
+        "cpe:2.3:*:*:linux:6.6:-:*:*:*:*:*:*",
+        "cpe:2.3:*:*:linux:6.5:-:*:*:*:*:*:*",
+    ]
+
+
+def test_alias_order_changes_only_the_primary_cpe_not_collisions_or_vex():
+    def render_with(products):
+        identity = meta_cyclonedx.component_identity(
+            "linux-yocto", "6.6", "pkg:yocto/linux-yocto@6.6",
+            cve_products=products)
+        identity["bom-ref"] = "ref-k"
+        other = meta_cyclonedx.component_identity(
+            "linux-other", "6.6", "pkg:yocto/linux-other@6.6",
+            cve_products="linux")
+        other["bom-ref"] = "ref-l"
+        return render_all(default_facts(
+            config=profile_config(),
+            fragments={
+                "linux-yocto": fragment(
+                    pkgs=[identity], cves=[vuln("CVE-2024-9", "ref-k")]),
+                "linux-other": fragment(
+                    pkgs=[other], cves=[vuln("CVE-2024-9", "ref-l")]),
+            }))
+
+    alphabetical, alphabetical_logs = render_with("linux linux_kernel")
+    declared, declared_logs = render_with("linux_kernel linux")
+    assert component_by_name(alphabetical["sbom"], "linux-yocto")["cpe"] == (
+        "cpe:2.3:*:*:linux:6.6:-:*:*:*:*:*:*")
+    assert component_by_name(declared["sbom"], "linux-yocto")["cpe"] == (
+        "cpe:2.3:*:*:linux_kernel:6.6:-:*:*:*:*:*:*")
+    assert finding_by_id(alphabetical["report"], "REQ-IDEN-001") == (
+        finding_by_id(declared["report"], "REQ-IDEN-001"))
+    assert [message for _level, message in alphabetical_logs
+            if "share CPE(s)" in message] == [
+                message for _level, message in declared_logs
+                if "share CPE(s)" in message]
+
+    for docs in (alphabetical, declared):
+        serial = docs["sbom"]["serialNumber"].removeprefix("urn:uuid:")
+        assert sorted(affect["ref"].removeprefix(f"urn:cdx:{serial}/1#")
+                      for statement in docs["vex"]["vulnerabilities"]
+                      for affect in statement["affects"]) == ["ref-k", "ref-l"]
+
+    def vex_bytes(docs):
+        serial = docs["sbom"]["serialNumber"].removeprefix("urn:uuid:")
+        return json.dumps(docs["vex"]["vulnerabilities"],
+                          sort_keys=True).replace(serial, "<serial>")
+
+    assert vex_bytes(alphabetical) == vex_bytes(declared)
 
 
 def test_identity_override_survives_rendering():

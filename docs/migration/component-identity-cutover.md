@@ -68,6 +68,13 @@ and alignment-profile output share the corrected model.
    `REQ-IDEN-001` alignment finding naming the affected bom-refs and a
    build warning, and strict enforcement rejects them.
 
+7. **Winning correlation alias.** For multi-alias recipes the component
+   `cpe` now uses the first declared `CVE_PRODUCT` token crossed with the
+   first declared `CVE_VERSION` token, not the alphabetically first.
+   CPE-keyed findings may re-key to that alias; no findings are lost
+   from in-layer matching because all aliases remain in `yocto:cve:*`
+   properties in declaration order.
+
 ## Consumer migration
 
 - Expect different component `name`/`version` values and different

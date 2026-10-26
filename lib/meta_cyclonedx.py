@@ -839,18 +839,20 @@ def component_identity(bpn, pv, purl, cve_products=None, cve_versions=None,
     create or rename the component, they carry a "vendor:" qualifier into
     the CPE, and every token stays available through yocto:cve:product,
     yocto:cve:version and yocto:cve:cpe properties for the VEX and CVE
-    matching inputs. The purl records the Yocto/package identity of the
-    build (pkg:yocto, OpenEmbedded's purl prefix) alongside, never
-    instead of, the logical identity.
+    matching inputs. The first declared product and version select the
+    component's CPE; repeated tokens keep only their first occurrence.
+    The purl records the Yocto/package identity of the build (pkg:yocto,
+    OpenEmbedded's purl prefix) alongside, never instead of, the
+    logical identity.
     """
     name, version = logical_identity(bpn, pv, name_override, version_override)
 
     # BitBake defaults CVE_PRODUCT to BPN and CVE_VERSION to PV; mirror
     # that so the function's own defaults carry complete correlation data.
-    products = sorted({token for token in (cve_products or "").split() if token}) \
+    products = list(dict.fromkeys((cve_products or "").split())) \
         or [token for token in [(bpn or "").strip()] if token]
-    versions = sorted({_short_version(token)
-                       for token in (cve_versions or "").split()} - {""}) \
+    versions = list(dict.fromkeys(filter(
+        None, map(_short_version, (cve_versions or "").split())))) \
         or [default_logical_version(pv)]
 
     cpes = []

@@ -20,6 +20,12 @@ carry only what the
   Expect different diff output against pre-upgrade documents; this is
   the identity correction, not data loss. See the
   [migration guidance](migration/tr-03183-alignment.md).
+- **Declaration-order CPE alias selection.** For multi-alias recipes, the
+  first declared `CVE_PRODUCT` token crossed with the first declared
+  `CVE_VERSION` token now wins the component `cpe` field instead of the
+  alphabetically first tokens. CPE-keyed tools may re-key findings to
+  that alias; no findings are lost from in-layer matching because the
+  full alias set remains in the `yocto:cve:*` properties.
 - **Dependency graph integrity.** Every component now carries a
   dependency entry (leaves included), dependencies outside the scope
   of delivery are published as identified boundary components instead

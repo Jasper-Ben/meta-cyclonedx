@@ -2,9 +2,10 @@
 
 import meta_cyclonedx
 
-from helpers import TIMESTAMP, default_config, document, fragment, pkg
+from helpers import (TIMESTAMP, default_config, default_facts, document, fragment,
+                     pkg, render_docs)
 
-CPE_A = "cpe:2.3:*:*:openssl:3.2:*:*:*:*:*:*:*"
+CPE_A = "cpe:2.3:*:*:openssl:3.2:-:*:*:*:*:*:*"
 
 
 def sbom_with(components):
@@ -41,17 +42,17 @@ def test_ignored_issue_attaches_to_cpe_matched_component():
 
 
 def test_issues_match_secondary_correlation_alias_cpes():
-    # CVE_PRODUCT aliases stay reachable: a report naming the recipe's
-    # secondary correlation CPE still attaches to the logical component.
-    secondary = "cpe:2.3:*:*:libopenssl:3.2:*:*:*:*:*:*:*"
-    sbom = sbom_with([pkg("openssl", "3.2", "ref-o", cpe=CPE_A,
-                          purl="pkg:yocto/meta/openssl3@3.2",
-                          properties=[{"name": "yocto:cve:cpe",
-                                       "value": secondary}])])
-    vex = {"vulnerabilities": []}
+    identity = meta_cyclonedx.component_identity(
+        "openssl", "3.2", "pkg:yocto/meta/openssl3@3.2",
+        cve_products="libopenssl openssl")
+    identity["bom-ref"] = "ref-o"
+    sbom, vex, _logs = render_docs(default_facts(
+        fragments={"openssl": fragment(pkgs=[identity])}))
+    assert identity["cpe"] == "cpe:2.3:*:*:libopenssl:3.2:-:*:*:*:*:*:*"
+
     added = meta_cyclonedx.merge_sbom_cve_check(
         sbom, vex,
-        report([{"name": "openssl", "cpes": [secondary],
+        report([{"name": "openssl", "cpes": [CPE_A],
                  "issue": [{"id": "CVE-2024-3", "status": "Patched",
                             "detail": "fixed"}]}]),
         base_config())
