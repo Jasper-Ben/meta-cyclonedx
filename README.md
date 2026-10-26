@@ -760,11 +760,13 @@ always produces identical creator, URI and report output.
 #### Licence Roles
 
 Recipe `LICENSE` metadata is **original licence** evidence - the
-licences assigned by a component's creator - and is represented as
-CycloneDX `licenses` entries with the `declared` acknowledgement. The
-other two licence roles exist only when the product integration
-supplies them explicitly and are never inferred from `LICENSE` or from
-each other:
+licences assigned by a component's creator - with the `declared`
+acknowledgement. CycloneDX 1.7 carries it in `licenses`; when a
+distribution expression is also supplied, CycloneDX 1.6 carries the
+original declarations in `evidence.licenses` and the distribution
+expression in `licenses`, respecting 1.6's single-expression constraint.
+Distribution and effective licences exist only when explicitly supplied;
+neither is inferred from `LICENSE` or from the other role:
 
 ```python
 # The licence under which recipients may use the component; an SPDX
@@ -779,13 +781,13 @@ CYCLONEDX_DISTRIBUTION_LICENCE = "MIT"
 CYCLONEDX_EFFECTIVE_LICENCE = ""
 ```
 
-The generator performs no legal or composition analysis: expressions
-are validated as SPDX licence syntax, licence roles are never converted
-into one another, and missing required original or distribution licence
-evidence is reported as `unmet` instead of relabelling available
-metadata (ADR-0003). Assertion-evidenced licence requirements stay
-`asserted` in the alignment report; they are never upgraded to
-`verified`.
+The renderer validates expressions against the SPDX licence and exception
+lists pinned to the selected CycloneDX version. `WITH` exceptions such as
+`GPL-2.0-only WITH Linux-syscall-note` are supported; OE `&` and `|`
+operators normalize to SPDX `AND` and `OR`. No legal or composition
+analysis is performed. Missing required original or distribution evidence
+is `unmet`, never filled by relabelling another role (ADR-0003).
+Caller-supplied licence assertions remain `asserted`, never `verified`.
 
 The versioned mapping from each baseline requirement to its CycloneDX
 representation and evaluation rule is project-owned data in
@@ -804,9 +806,10 @@ result that never blocks the output.
 With an alignment profile selected, the build additionally inventories
 the **mandatory delivered files** and represents each as a CycloneDX
 `type: file` component (ADR-0005): every delivered executable and
-archive owned by a package of the image, the image's **primary
-deployable artifact**, and the **additional files** the product
-integration explicitly selects below. Without a profile the inventory
+archive in the final root filesystem, the image's **primary deployable
+artifact**, and the **additional files** the product integration selects
+below. Files created by post-install scripts or image customization are
+included even without package ownership. Without a profile the inventory
 is fully inactive - no file is read, hashed or represented, and the
 SBOM is byte-comparable to earlier logical-component output. This
 default is intentional: ordinary configuration, documentation and data
@@ -816,8 +819,8 @@ Representation per inventoried file:
 
 - `name`: the delivered filename (path basename); the `version` is the
   creator-assigned version of the delivering recipe's logical
-  component - or, for deploy-directory artifacts, of the primary
-  component
+  component - or, for unowned rootfs files and deploy-directory artifacts,
+  of the primary component
 - `hashes`: one SHA-512 over the delivered bytes - the artifact
   identity; modes, paths and timestamps never enter the hash
 - `properties`: the pinned taxonomy's `bsi:component:filename`
@@ -825,13 +828,13 @@ Representation per inventoried file:
   (`archive|no archive`) and `bsi:component:structured`
   (`structured|unstructured`) values
 - `bom-ref`: the deterministic `yocto-file:<recipe>:<delivered path>`
-  (`yocto-file::<deploy-directory path>` for deploy-directory
-  artifacts), so reruns and findings reference the same artifact
+  (`yocto-file::<absolute rootfs path>` for unowned rootfs files,
+  `yocto-file::<relative deploy path>` for deploy-directory artifacts)
 - graph participation: the delivering logical component's dependency
-  entry gains the file reference; the file is a leaf with an empty
-  list. File components never copy the logical component's CPE, purl,
-  licences, creator or vulnerability findings (ADR-0006); VEX keeps
-  addressing logical component instances only.
+  entry gains the file reference; the primary component owns unclaimed
+  rootfs files and deploy-directory artifacts. Each file is a leaf with
+  an empty list and never copies its owner's CPE, purl, licences, creator
+  or vulnerability findings (ADR-0006). VEX targets logical instances only.
 
 Classification is deterministic artifact inspection (ADR-0002): mode
 exec bits, `#!` shebangs and ELF signatures decide executability;
@@ -844,13 +847,12 @@ inference, debug-info extraction or plugin/`dlopen()` discovery ever
 happens; static-link attribution comes from pkgdata debug-source
 records only. Symlinks are not inventoried as separate artifacts: a
 link is a second name for the regular file it resolves to, which is
-inventoried itself. Discovery reads the pkgdata `files_info` records
-and uses the root filesystem as delivery ground truth, and hashes are
-stable across rebuilds because they cover content only. Cost: one
-pkgdata pass, a 64 KiB signature read of claimed files, and a full
-read plus SHA-512 of each mandatory file - well under a second added
-to `do_rootfs` for a `core-image-minimal`, since non-mandatory files
-are never hashed.
+inventoried itself. Discovery walks the final root filesystem in a
+`do_rootfs` post-function, after rootfs customization and while pseudo
+is active. Pkgdata `files_info` records attribute known paths but do not
+limit discovery; uninstalled package paths do not become missing files.
+Only mandatory regular files are hashed. The final deployment reuses
+this inventory snapshot rather than reopening the rootfs outside pseudo.
 
 Mandatory artifacts that are missing, unreadable or too truncated to
 classify never vanish from the output: they produce `REQ-FILE-00x`
@@ -868,7 +870,7 @@ assembly finishes after `do_rootfs`, the artifact bytes are not final
 during the document generation inside `do_rootfs`; hashing them there
 would chase a moving target. Image recipes with a profile therefore
 generate the final documents once more in `do_deploy_cyclonedx`, which
-now runs after `do_image`: there the primary artifact's content is
+now runs after `do_image_complete`: there the primary artifact's content is
 final, its bytes are hashed, and the entry joins the same file-
 inventory facts (`source: deployable`, owned by the primary component
 under the recipe-less facts key). Names come from the stable
@@ -882,9 +884,9 @@ inventories.
 # Explicitly selected additional deployed files (default: "").
 # Whitespace-separated shell-style globs (fnmatch; `*` crosses
 # directory boundaries) matched against paths relative to the image
-# deploy directory ${IMGDEPLOYDIR}, the staging directory whose
-# content is deployed to ${DEPLOY_DIR_IMAGE}; a leading "/" anchors
-# there too.
+# deploy directory ${DEPLOY_DIR_IMAGE}; a leading "/" anchors there too.
+# This includes payloads deployed by kernel, bootloader and firmware
+# recipes, not just the image recipe's private staging directory.
 # A selection that resolves to nothing is a REQ-FILE-005 finding,
 # never silently skipped.
 CYCLONEDX_ADDITIONAL_FILES = "bzImage* *.efi firmware/*.bin initramfs-*.cpio.gz"
@@ -1029,8 +1031,8 @@ CYCLONEDX_EXPORT_ALIGNMENT_REPORT = "${CYCLONEDX_EXPORT_BASENAME}.alignment-repo
 
 # Profile-gated: explicitly selected additional deployed files.
 # Whitespace-separated globs relative to the image deploy directory
-# ${IMGDEPLOYDIR} (the content deployed to ${DEPLOY_DIR_IMAGE}); a
-# leading "/" anchors there too (default: ""). The primary deployable
+# ${DEPLOY_DIR_IMAGE}; a leading "/" anchors there too (default: "").
+# The primary deployable
 # artifact is always inventoried under a profile; ordinary data files
 # are not.
 CYCLONEDX_ADDITIONAL_FILES = ""

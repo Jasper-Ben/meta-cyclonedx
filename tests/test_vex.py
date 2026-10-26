@@ -26,16 +26,6 @@ def test_no_placeholder_survives_into_the_vex():
     assert "<SBOM_SERIAL>" not in str(vex)
 
 
-def test_statements_beyond_the_last_component_are_dropped():
-    facts = default_facts(fragments={
-        "openssl": fragment(pkgs=[pkg("openssl", "3.2", "ref-o")],
-                            cves=[vuln("CVE-2024-1", "ref-nonexistent")]),
-    })
-    _sbom, vex, _logs = render_docs(facts)
-
-    assert vex["vulnerabilities"] == []
-
-
 def test_colliding_instances_keep_their_own_statements():
     # CPE equality never merges statements: each independently assessable
     # instance keeps its own statement of the shared CVE.
@@ -82,3 +72,20 @@ def test_independently_assessable_instances_keep_disjoint_statements():
     assert len(statements) == 2
     assert [affect_refs(s) for s in statements] == [
         [f"urn:cdx:{serial}/1#ref-1"], [f"urn:cdx:{serial}/1#ref-2"]]
+
+
+def test_different_analyses_of_the_same_target_are_not_silently_discarded():
+    statements = [
+        vuln("CVE-2024-42", "ref-busybox", state="not_affected",
+             detail="code is absent"),
+        vuln("CVE-2024-42", "ref-busybox", state="not_affected",
+             detail="code is unreachable"),
+    ]
+    facts = default_facts()
+    facts["fragments"]["busybox"]["cves"] = statements
+    sbom, vex, _logs = render_docs(facts)
+    assert {v["analysis"]["detail"] for v in vex["vulnerabilities"]} == {
+        "code is absent", "code is unreachable"}
+    serial = sbom["serialNumber"].removeprefix("urn:uuid:")
+    assert all(affect_refs(v) == [f"urn:cdx:{serial}/1#ref-busybox"]
+               for v in vex["vulnerabilities"])

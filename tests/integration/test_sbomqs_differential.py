@@ -10,6 +10,10 @@ opinion on representative documents. A disagreement fails only this
 differential-marked test, prompting a review of the affected matrix
 rows - never silently moves a verdict.
 
+The v2 JSON structural features are explicit checks, not the aggregate
+quality score. Unsupported output or tool failures fail the job rather
+than silently skipping the comparison.
+
 Run explicitly with:
     pytest -m integration tests/integration/test_sbomqs_differential.py
 """
@@ -55,12 +59,29 @@ def _sbomqs_passes(tmp_path, sbom):
     document.write_text(json.dumps(sbom))
     result = subprocess.run([SBOMQS, "score", "--json", str(document)],
                             capture_output=True, text=True, timeout=120)
+    assert result.returncode == 0, (
+        f"sbomqs failed (exit {result.returncode}):\n"
+        f"{result.stderr}\n{result.stdout}"
+    )
     try:
         report = json.loads(result.stdout)
-        components = report["Results"][0]["Components"]
-        return components[0]["Quality"]["Score"] > 0
-    except (ValueError, KeyError, IndexError) as defect:
-        pytest.skip(f"sbomqs output not interpretable: {defect}")
+        files = report["files"]
+        assert len(files) == 1, "expected one scored SBOM"
+        structural = next(category for category in files[0]["comprehenssive"]
+                          if category["category"] == "Structural")
+        features = {feature["key"]: feature
+                    for feature in structural["features"]}
+        required = {"sbom_spec_declared", "sbom_spec_version",
+                    "sbom_file_format", "sbom_schema_valid"}
+        assert required <= features.keys(), "structural features are missing"
+        assert not any(features[key]["ignored"] for key in required), (
+            "structural checks were not evaluated"
+        )
+        return all(features[key]["score"] == 10 for key in required)
+    except (ValueError, KeyError, IndexError, TypeError, StopIteration,
+            AssertionError) as defect:
+        pytest.fail(f"sbomqs v2 output not interpretable: {defect}\n"
+                    f"stdout:\n{result.stdout}\nstderr:\n{result.stderr}")
 
 
 @pytest.mark.skipif(SBOMQS is None, reason="sbomqs binary not on PATH")
@@ -92,7 +113,7 @@ def test_matrix_and_sbomqs_both_reject_a_structurally_defective_document(tmp_pat
     passes = _sbomqs_passes(tmp_path, sbom)
     if passes:
         pytest.fail("differential disagreement: matrix flags "
-                    f"{unmet} but sbomqs passes the document; review "
+                    f"{unmet} but sbomqs' structural checks all pass; review "
                     "the affected matrix rows")
 
 

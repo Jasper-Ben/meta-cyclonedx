@@ -31,9 +31,10 @@ and alignment-profile output share the corrected model.
      through CPE-equality deduplication now each contribute their own
      component instance: counts **grow** where independently assessable
      instances had been silently merged.
-   - Embedded-image merging matches instances by identity (name,
-     version, package purl), no longer by CPE, so genuinely different
-     builds of the same upstream stay separate in composed SBOMs.
+   - Imported and embedded graphs use name, version and purl only to
+     nominate merge candidates. Conflicting artifact hashes, build
+     metadata, licences, dependency instances or VEX analyses keep
+     instances separate, even when all package coordinates match.
 
 3. **Component versions.** The version is the creator-assigned logical
    version: `CYCLONEDX_COMPONENT_VERSION` when set, otherwise the short
@@ -74,5 +75,6 @@ and alignment-profile output share the corrected model.
   correction, not data loss.
 - Correlate vulnerabilities through `purl`, the component `cpe` and the
   `yocto:cve:*` properties; do not key tooling on `name` alone.
-- Deduplicate or merge SBOM records by `purl` + version evidence, never
-  by CPE.
+- Matching `purl` and version alone does not establish instance identity.
+  Check artifact, build, licence, dependency and VEX evidence before
+  reconciling records; never deduplicate on CPE equality.

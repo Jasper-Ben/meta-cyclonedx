@@ -9,9 +9,9 @@ This module is the single production owner of SBOM and VEX document
 semantics: component identity, dependency graph construction, document
 mapping, configuration validation and rendering. It consumes normalized
 build facts and artifact facts (plain data structures) and never touches
-the BitBake data store, task state or the filesystem. The BitBake class
-in classes/ is a thin adapter that collects the facts and deploys the
-returned documents.
+the BitBake data store, task state or build-artifact filesystem. Only
+pinned normative data (schemas and SPDX vocabularies) is read by the
+renderer. The BitBake adapter collects facts and deploys returned documents.
 
 render(facts) is the primary behavioral seam of the layer.
 
@@ -81,13 +81,13 @@ file_inventory         recipe -> ordered delivered-file artifact facts,
                       selected and covering only mandatory files
                       (executables and archives, plus the deployable
                       artifact and selected payloads below); entries
-                      under the recipe-less key "" are deploy-directory
-                      evidence owned by the primary component (ticket
-                      #10); each entry:
+                      under the recipe-less key "" are owned by the primary
+                      component: unowned rootfs files and deploy-directory
+                      artifacts; each entry:
     path                        delivered path inside the root
-                                filesystem, or - for recipe-less
-                                entries - deploy-directory-relative
-                                path (stable names, no build stamps)
+                                filesystem (an absolute delivered path),
+                                or a deploy-directory-relative path
+                                (stable names, no build stamps)
     sha512                      SHA-512 of the delivered bytes (absent
                                 on defective entries)
     executable / archive /
@@ -99,8 +99,8 @@ file_inventory         recipe -> ordered delivered-file artifact facts,
     source                      "deployable" for the primary
                                 deployable artifact and "selected" for
                                 explicitly selected additional files;
-                                absent for root-filesystem package
-                                evidence
+                                absent for root-filesystem evidence,
+                                whether package-owned or primary-owned
                       The adapter skips root-filesystem symlinks and
                       other non-regular entries: their content
                       identity belongs to the regular file they
@@ -118,6 +118,7 @@ included_images       ordered embedded-image documents:
 import bz2
 import copy
 import fnmatch
+import functools
 import importlib
 import importlib.util
 import json
@@ -532,67 +533,96 @@ EFFECTIVE_LICENCE_PROPERTY = "bsi:component:effectiveLicence"
 ORIGINAL_LICENCE_ACKNOWLEDGEMENT = "declared"
 DISTRIBUTION_LICENCE_ACKNOWLEDGEMENT = "concluded"
 
-# A distribution or effective licence fact must be a syntactically valid
-# SPDX licence expression (TR-03183-2 v2.1.0 §6.1): licence identifiers
-# combined with the AND, OR and WITH operators and parentheses. This is
-# pure syntax; the generator draws no conclusion about the identifiers'
-# legal relationship and infers no licence role from another.
-SPDX_LICENCE_ID_TOKEN = re.compile(r"[A-Za-z0-9][A-Za-z0-9.\-+]*")
+# Explicit licence roles use the SPDX vocabulary pinned to the selected
+# CycloneDX version. Only expression syntax is evaluated, never legal
+# compatibility or the relationship between licence roles.
+SPDX_LICENCE_REF = re.compile(
+    r"(?:DocumentRef-[A-Za-z0-9.-]+:)?LicenseRef-[A-Za-z0-9.-]+")
 
 
-def _spdx_expression_is_valid(expression):
-    """True when the string parses as an SPDX licence expression."""
+@functools.lru_cache(maxsize=2)
+def _licence_vocabulary(spec_version):
+    """Pinned normative data, independent of the build's filesystem."""
+    directory = os.path.join(os.path.dirname(__file__), "..", "meta", "files",
+                             "spdx-license-list-data")
+    with open(os.path.join(directory, f"licenses-{spec_version}.json")) as stream:
+        licences = {entry["licenseId"] for entry in json.load(stream)["licenses"]}
+    with open(os.path.join(directory, f"exceptions-{spec_version}.json")) as stream:
+        exceptions = {entry["licenseExceptionId"]
+                      for entry in json.load(stream)["exceptions"]}
+    return licences, exceptions
+
+
+def _normalize_licence_expression(expression, spec_version):
+    """Validate SPDX syntax and identifiers; normalize OE operators."""
     if not isinstance(expression, str) or not expression.strip():
-        return False
-    expect_operand = True
-    after_identifier = False
-    depth = 0
-    for token in re.findall(r"\(|\)|\S+", expression):
-        if token == "(":
-            if not expect_operand:
-                return False
-            depth += 1
-            expect_operand = True
-        elif token == ")":
-            if expect_operand or depth == 0:
-                return False
-            depth -= 1
-            expect_operand = False
-            after_identifier = False
-        elif token in ("AND", "OR"):
-            if expect_operand:
-                return False
-            expect_operand = True
-            after_identifier = False
-        elif token == "WITH":
-            if expect_operand or not after_identifier:
-                return False
-            expect_operand = True
-        elif expect_operand and SPDX_LICENCE_ID_TOKEN.fullmatch(token):
-            expect_operand = False
-            after_identifier = True
-            continue
-        else:
+        return None
+    licences, exceptions = _licence_vocabulary(spec_version)
+    tokens = [{"&": "AND", "|": "OR"}.get(token, token)
+              for token in re.findall(r"\(|\)|[&|]|[^()\s&|]+", expression)]
+    position = 0
+
+    def operand():
+        nonlocal position
+        if position >= len(tokens):
             return False
-        after_identifier = False
-    return not expect_operand and depth == 0
+        token = tokens[position]
+        position += 1
+        if token == "(":
+            if not compound() or position >= len(tokens) \
+                    or tokens[position] != ")":
+                return False
+            position += 1
+            return True
+        if not (token in licences or token.removesuffix("+") in licences
+                or SPDX_LICENCE_REF.fullmatch(token)):
+            return False
+        if position < len(tokens) and tokens[position] == "WITH":
+            position += 1
+            if position >= len(tokens) or tokens[position] not in exceptions:
+                return False
+            position += 1
+        return True
+
+    def compound():
+        nonlocal position
+        if not operand():
+            return False
+        while position < len(tokens) and tokens[position] in ("AND", "OR"):
+            position += 1
+            if not operand():
+                return False
+        return True
+
+    if not compound() or position != len(tokens):
+        return None
+    return " ".join(tokens).replace("( ", "(").replace(" )", ")")
 
 
-def _apply_distribution_licence(component, expression, log, holder):
+def _apply_distribution_licence(component, expression, spec_version, log, holder):
     """Append an explicitly supplied distribution licence entry."""
-    if not _spdx_expression_is_valid(expression):
+    normalized = _normalize_licence_expression(expression, spec_version)
+    if normalized is None:
         _log(log, "warn", f"{holder}: distribution licence {expression!r} "
                            f"is not a valid SPDX licence expression; "
                            f"omitted")
         return
+    if spec_version == "1.6" and component.get("licenses"):
+        # 1.6 permits one SPDX expression OR a list of licence objects.
+        # Keep the original declarations as evidence and publish the
+        # asserted distribution expression separately, without relabelling.
+        originals = component.pop("licenses")
+        evidence = component.setdefault("evidence", {}).setdefault("licenses", [])
+        evidence.extend(entry for entry in originals if entry not in evidence)
     component.setdefault("licenses", []).append(
-        {"expression": expression,
+        {"expression": normalized,
          "acknowledgement": DISTRIBUTION_LICENCE_ACKNOWLEDGEMENT})
 
 
-def _apply_effective_licence(component, expression, log, holder):
+def _apply_effective_licence(component, expression, spec_version, log, holder):
     """Attach an explicitly supplied effective licence property once."""
-    if not _spdx_expression_is_valid(expression):
+    normalized = _normalize_licence_expression(expression, spec_version)
+    if normalized is None:
         _log(log, "warn", f"{holder}: effective licence {expression!r} is "
                            f"not a valid SPDX licence expression; omitted")
         return
@@ -601,11 +631,11 @@ def _apply_effective_licence(component, expression, log, holder):
            for p in properties):
         return
     properties.append({"name": EFFECTIVE_LICENCE_PROPERTY,
-                       "value": expression})
+                       "value": normalized})
 
 
 
-def _apply_licence_evidence(component, evidence, log, holder):
+def _apply_licence_evidence(component, evidence, spec_version, log, holder):
     """Attach explicitly supplied distribution and effective licences.
 
     Both roles exist only from a semantically authoritative source the
@@ -615,10 +645,10 @@ def _apply_licence_evidence(component, evidence, log, holder):
     if evidence.get("distribution_licence"):
         _apply_distribution_licence(component,
                                     evidence["distribution_licence"],
-                                    log, holder)
+                                    spec_version, log, holder)
     if evidence.get("effective_licence"):
         _apply_effective_licence(component, evidence["effective_licence"],
-                                 log, holder)
+                                 spec_version, log, holder)
 
 
 def _mark_original_licences(component):
@@ -792,9 +822,9 @@ def identity_collisions(sbom, vex=None):
 
     Components sharing at least one CPE (transitively) form one collision
     group. A group is explained when every member carries observable
-    evidence that distinguishes it from all others — package purl, licence
-    set, dependency targets or VEX status — which is exactly the case for
-    genuinely independent instances. Any two members indistinguishable on
+    evidence that distinguishes it from all others — package purl,
+    artifact hashes, build properties, licences, dependency targets or VEX
+    analysis. Any two members indistinguishable on
     all these axes are an unresolved identity collision. Returns a list
     of dicts with keys bomRefs and correlationCpes (both sorted) and bool
     explained, ordered by the first bomRef.
@@ -813,16 +843,18 @@ def identity_collisions(sbom, vex=None):
 
     vex_status = {}
     for vuln in (vex or {}).get("vulnerabilities") or []:
-        state = (vuln.get("analysis") or {}).get("state")
+        statement_key = _vex_statement_key(vuln)
         for affect in vuln.get("affects") or []:
             _prefix, _sep, ref = (affect.get("ref") or "").rpartition("#")
             if ref:
-                vex_status.setdefault(ref, []).append((vuln["id"], state))
+                vex_status.setdefault(ref, []).append(statement_key)
 
     def distinguishable_evidence(component):
         ref = component.get("bom-ref")
         return (
             component.get("purl"),
+            json.dumps(_canonical_evidence(component.get("hashes")), sort_keys=True),
+            json.dumps(_canonical_evidence(component.get("properties")), sort_keys=True),
             json.dumps(component.get("licenses"), sort_keys=True),
             tuple(dep_targets.get(ref, [])),
             tuple(sorted(vex_status.get(ref, []))))
@@ -1105,40 +1137,125 @@ def _upstream_creator_entities(component):
     return [{"name": owner, "url": f"https://{host}/{owner}/{project}"}]
 
 
-def _compatible_component_records(existing, candidate):
+def _canonical_evidence(value):
+    """Set-like document arrays compare independently of discovery order."""
+    if isinstance(value, dict):
+        return {key: _canonical_evidence(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return sorted((_canonical_evidence(item) for item in value),
+                      key=lambda item: json.dumps(item, sort_keys=True))
+    return value
+
+
+def _vex_statement_key(statement):
+    """Substantive statement identity; issuance times do not change analysis."""
+    content = {key: value for key, value in statement.items()
+               if key not in ("affects", "bom-ref")}
+    if "analysis" in content:
+        content["analysis"] = {
+            key: value for key, value in content["analysis"].items()
+            if key not in ("firstIssued", "lastUpdated")}
+    return json.dumps(_canonical_evidence(content), sort_keys=True)
+
+
+def _instance_context(components, dependencies, vulnerabilities=()):
+    """Keep the source graph and VEX beside each reconciliation candidate."""
+    nodes = {c["bom-ref"]: c for c in components if c.get("bom-ref")}
+    edges = {}
+    for entry in dependencies:
+        edges.setdefault(entry.get("ref"), set()).update(
+            entry.get("dependsOn") or [])
+    analyses = {}
+    for statement in vulnerabilities:
+        for affect in statement.get("affects") or []:
+            ref = (affect.get("ref") or "").rpartition("#")[2] \
+                or affect.get("ref")
+            analyses.setdefault(ref, set()).add(_vex_statement_key(statement))
+    return {"components": nodes, "dependencies": edges, "analyses": analyses}
+
+
+def _same_instance(left, right, left_context, right_context, seen):
+    """Coordinates nominate candidates; contradictory evidence vetoes a merge.
+
+    Compare dependency instances recursively in their original graphs, not
+    their document-local references. A visited pair closes a graph cycle.
+    Missing declarations may be enriched, but two differing declarations
+    must remain independently assessable.
     """
-    True when a candidate component carries no evidence contradicting the
-    component already in the graph under the same bom-ref: every field
-    present in both (bom-ref aside) agrees. Only then may the candidate
-    merge onto the existing record without losing an independently
-    assessable component instance.
-    """
-    for key, value in candidate.items():
-        if key == "bom-ref":
-            continue
-        if key in existing and existing[key] != value:
+    left_key, right_key = _instance_key(left), _instance_key(right)
+    same_ref = left.get("bom-ref") and left.get("bom-ref") == right.get("bom-ref")
+    if not same_ref and (left_key is None or left_key != right_key):
+        return False
+    for key in left.keys() & right.keys() - {"bom-ref", "scope"}:
+        if _canonical_evidence(left[key]) != _canonical_evidence(right[key]):
+            return False
+    left_ref, right_ref = left.get("bom-ref"), right.get("bom-ref")
+    left_analysis = left_context["analyses"].get(left_ref)
+    right_analysis = right_context["analyses"].get(right_ref)
+    if left_analysis is not None and right_analysis is not None \
+            and left_analysis != right_analysis:
+        return False
+    pair = (id(left), id(right), id(left_context), id(right_context))
+    if pair in seen:
+        return True
+    seen = seen | {pair}
+    left_targets = left_context["dependencies"].get(left_ref)
+    right_targets = right_context["dependencies"].get(right_ref)
+    if left_targets is None or right_targets is None:
+        return True
+    if len(left_targets) != len(right_targets):
+        return False
+    unmatched = sorted(right_targets)
+    for target in sorted(left_targets):
+        left_node = left_context["components"].get(target)
+        for index, candidate in enumerate(unmatched):
+            right_node = right_context["components"].get(candidate)
+            if (left_node is not None and right_node is not None
+                    and _same_instance(left_node, right_node, left_context,
+                                       right_context, seen)) \
+                    or (left_node is None and right_node is None
+                        and target == candidate):
+                unmatched.pop(index)
+                break
+        else:
             return False
     return True
 
 
+def _index_instance(index, component, context):
+    ref = component.get("bom-ref")
+    if not ref:
+        return
+    record = (component, [(component, context)])
+    index.setdefault(("ref", ref), []).append(record)
+    key = _instance_key(component)
+    if key is not None:
+        index.setdefault(key, []).append(record)
+
+
+def _matching_instance(index, component, context):
+    candidates = index.get(_instance_key(component), [])
+    candidates = candidates + index.get(("ref", component.get("bom-ref")), [])
+    for survivor, views in candidates:
+        if all(_same_instance(previous, component, source, context, set())
+               for previous, source in views):
+            # Retain every source view: later incomplete records cannot
+            # bridge two builds that have contradictory known evidence.
+            views.append((component, context))
+            return survivor
+    return None
+
+
 def _merge_instance_evidence(existing, incoming, add_scopes):
-    """
-    Fold one component instance's evidence into the surviving instance:
-    the higher-priority scope wins and licence entries union. Dependency
-    evidence unions separately as the graph edges merge, so a reconciled
-    instance never loses what either document declared about it.
-    """
+    """Enrich a compatible instance without replacing any source evidence."""
     if add_scopes:
         merged_scope = _highest_priority_scope(existing.get("scope"),
                                                incoming.get("scope"))
         if merged_scope:
             existing["scope"] = merged_scope
-    licences = incoming.get("licenses")
-    if licences:
-        kept = existing.setdefault("licenses", [])
-        for licence in licences:
-            if licence not in kept:
-                kept.append(licence)
+    for key, value in incoming.items():
+        if key not in ("bom-ref", "scope") and key not in existing:
+            existing[key] = copy.deepcopy(value)
 
 
 def render(facts):
@@ -1204,8 +1321,8 @@ def render(facts):
                 "externalReferences", []).append(
                     {"type": reference_type, "url": primary[reference_key]})
     _mark_original_licences(sbom_metadata["component"])
-    _apply_licence_evidence(sbom_metadata["component"], primary, log,
-                            "primary component")
+    _apply_licence_evidence(sbom_metadata["component"], primary, spec_version,
+                            log, "primary component")
 
     sbom = {
         "bomFormat": "CycloneDX",
@@ -1310,7 +1427,7 @@ def render(facts):
             # original licence evidence; its role is made explicit here
             # and never rewritten into another role (ADR-0003).
             _mark_original_licences(pn_pkg)
-            _apply_licence_evidence(pn_pkg, pn_list, log, pkg)
+            _apply_licence_evidence(pn_pkg, pn_list, spec_version, log, pkg)
 
             if pkg in image_install_recipes and pn_pkg.get("bom-ref"):
                 directly_installed_component_refs.add(pn_pkg["bom-ref"])
@@ -1418,43 +1535,34 @@ def render(facts):
             })
     extra_ref_components = {}
     extra_identity_index = {}
+    source_context = _instance_context(
+        sbom["components"], sbom["dependencies"], vex["vulnerabilities"])
     for component in sbom["components"]:
         ref = component.get("bom-ref")
         if ref:
             extra_ref_components.setdefault(ref, component)
-        key = _instance_key(component)
-        if key and key not in extra_identity_index:
-            extra_identity_index[key] = component
+        _index_instance(extra_identity_index, component, source_context)
     contributed_ref_remap = {}
     for pkg in sorted(fragments):
         pn_list = fragments[pkg]
+        context = _instance_context(
+            pn_list.get("extra_components") or [],
+            pn_list.get("extra_dependencies") or [])
         for component in pn_list.get("extra_components", []):
             ref = component.get("bom-ref")
-            key = _instance_key(component)
-            survivor = extra_identity_index.get(key) if key else None
-            if survivor is not None and survivor.get("bom-ref") != ref:
-                # Same logical name, version and package build seen
-                # through two ecosystem documents: one component
-                # instance, reconciled onto the surviving bom-ref. Both
-                # graphs' edges converge on it below; a shared CPE alone
-                # never reconciles anything (ADR-0006).
+            survivor = _matching_instance(extra_identity_index, component,
+                                           context)
+            if survivor is not None:
                 if ref:
                     contributed_ref_remap[ref] = survivor["bom-ref"]
                 _merge_instance_evidence(survivor, component, add_scopes)
                 continue
-            if ref and ref in extra_ref_components and \
-                    _compatible_component_records(extra_ref_components[ref],
-                                                  component):
-                # The very same record is already in the graph; merging
-                # onto it loses no evidence. Contradicting evidence under
-                # the same bom-ref keeps both instances and surfaces as a
-                # reference-integrity finding, never a silent drop.
-                continue
+            # Conflicting records, including colliding bom-refs, stay
+            # represented; integrity findings expose ambiguity.
             sbom["components"].append(component)
             if ref:
                 extra_ref_components.setdefault(ref, component)
-            if key and key not in extra_identity_index:
-                extra_identity_index[key] = component
+            _index_instance(extra_identity_index, component, context)
 
     # Fold the imported edges in after the whole contributed graph is
     # reconciled, so ref rewrites apply consistently. Edges are merged,
@@ -1523,9 +1631,9 @@ def render(facts):
                 owner_entry["dependsOn"].append(root_ref)
 
     # Fold in complete SBOMs of the included embedded images. Components
-    # carrying the same logical identity and package purl are the same
-    # instance and merge onto the parent's bom-ref; unique components are
-    # added with scope "required". A shared CPE alone never merges.
+    # with compatible source evidence may reconcile onto the parent's
+    # bom-ref. Contradictory artifact, build, licence, dependency or VEX
+    # evidence preserves separate instances, regardless of shared coordinates.
     _merge_included_images(sbom, vex, copy.deepcopy(facts.get("included_images")) or (),
                            config, spec_version, sbom_serial_number,
                            add_scopes, directly_installed_component_refs, log,
@@ -1763,10 +1871,9 @@ def render(facts):
     # Replace SBOM serial placeholder in VEX vulnerabilities
     # This must be done after all vulnerabilities are collected to ensure each image
     # gets its own SBOM serial number in multi-output builds (e.g., rootfs + initramfs)
-    sbom_refs = {comp["bom-ref"] for comp in sbom["components"]}
     serial_placeholder = placeholder
     resolved_vulns = []
-    covered_refs = {}
+    covered_affects = {}
     for vuln in vex["vulnerabilities"]:
         affects = []
         for affect in vuln.get("affects", []):
@@ -1774,26 +1881,26 @@ def render(facts):
                 affects.append(affect)
                 continue
 
-            prefix, _, bom_ref = affect["ref"].rpartition("#")
-            # References to components absent from the SBOM are dangling.
-            if bom_ref not in sbom_refs:
-                continue
-
-            # Refs merged from another image only become comparable to this
-            # document's own, still-templated refs once the serial is substituted.
-            ref = f"{prefix}#{bom_ref}".replace(serial_placeholder, sbom_serial_number)
-            if not any(existing.get("ref") == ref for existing in affects):
-                affects.append({**affect, "ref": ref})
+            # Keep unresolved targets as evidence for report/strict
+            # validation; serial substitution must never repair the graph.
+            ref = affect["ref"]
+            if serial_placeholder:
+                ref = ref.replace(serial_placeholder, sbom_serial_number)
+            resolved_affect = {**affect, "ref": ref}
+            if resolved_affect not in affects:
+                affects.append(resolved_affect)
 
         if not affects:
             continue
 
-        # Statements that add no component reference beyond earlier ones
-        # are redundant; the first statement of the CVE wins.
-        refs = {affect["ref"] for affect in affects if "ref" in affect}
-        if refs and refs.issubset(covered_refs.get(vuln["id"], set())):
+        # Suppress only repeated substantive statements about the same
+        # affected versions. Equal CVE IDs or analysis states are not enough.
+        statement_key = _vex_statement_key(vuln)
+        affect_keys = {json.dumps(_canonical_evidence(affect), sort_keys=True)
+                       for affect in affects}
+        if affect_keys.issubset(covered_affects.get(statement_key, set())):
             continue
-        covered_refs.setdefault(vuln["id"], set()).update(refs)
+        covered_affects.setdefault(statement_key, set()).update(affect_keys)
 
         vuln["affects"] = affects
         resolved_vulns.append(vuln)
@@ -1976,13 +2083,7 @@ def _sbom_cve_check_analysis(issue, include_unpatched, unpatched_state):
 
 
 def _instance_key(component):
-    """
-    Instance key used to recognize one and the same component instance in
-    different documents: the same logical name and version delivered by
-    the same package build (purl). Components without a name and purl are
-    never identified through a key; a CPE is correlation data only and
-    never part of instance identity (ADR-0006).
-    """
+    """Package coordinates used to find candidates, never proof of identity."""
     name = component.get("name")
     if name is None or not component.get("purl"):
         return None
@@ -1996,8 +2097,8 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
     """
     Merge the completed SBOM and VEX of each embedded image into the parent
     documents, remapping bom-refs of components that are the same instance
-    as one of the parent's (same logical identity from the same package
-    build) and the VEX references to the parent SBOM serial number.
+    as one of the parent's (compatible identity, artifact, build, licence,
+    dependency and VEX evidence), and rewriting the parent SBOM serial.
 
     Defective input is recorded in merge_defects and reported; the graph
     is never repaired by dropping nodes, edges, scopes or VEX statements
@@ -2005,14 +2106,13 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
     """
     if merge_defects is None:
         merge_defects = []
-    ref_components = {c["bom-ref"]: c for c in sbom["components"]
-                      if c.get("bom-ref")}
-    extra_seen_image_refs = {c["bom-ref"] for c in sbom["components"] if c.get("bom-ref")}
+    extra_seen_image_refs = {c["bom-ref"] for c in sbom["components"]
+                             if c.get("bom-ref")}
     identity_index = {}
+    context = _instance_context(
+        sbom["components"], sbom["dependencies"], vex["vulnerabilities"])
     for component in sbom["components"]:
-        key = _instance_key(component)
-        if key and key not in identity_index:
-            identity_index[key] = component
+        _index_instance(identity_index, component, context)
     for img in included_images:
         img_name = img["name"]
         img_sbom_data = img["sbom"]
@@ -2055,39 +2155,25 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
         # The UUID portion of the included SBOM's serialNumber appears verbatim in its VEX affects refs.
         included_serial = (img_sbom_data.get("serialNumber") or "").removeprefix("urn:uuid:")
 
-        # Map included bom-refs to parent bom-refs for components that are
-        # the same instance: the same logical identity delivered by the
-        # same package build (name, version and package purl). A CPE is
-        # vulnerability-correlation data and never merges instances.
+        # Reconcile only compatible evidence in both source graphs.
+        context = _instance_context(
+            img_sbom_data.get("components") or [],
+            img_sbom_data.get("dependencies") or [],
+            (img_vex_data or {}).get("vulnerabilities") or [])
         included_bom_ref_remap = {}
         for inc_comp in img_sbom_data.get("components") or []:
             inc_ref = inc_comp.get("bom-ref")
-            key = _instance_key(inc_comp)
-            if not inc_ref or not key:
+            if not inc_ref:
                 continue
-            existing = identity_index.get(key)
-            if existing:
+            existing = _matching_instance(identity_index, inc_comp, context)
+            if existing is not None:
                 included_bom_ref_remap[inc_ref] = existing["bom-ref"]
-                # The same package build seen through two documents: the
-                # survivor unions both views' evidence - the higher
-                # scope and every licence entry - so reconciliation never
-                # discloses into evidence loss. Dependency evidence
-                # unions separately as the image edges merge.
                 _merge_instance_evidence(existing, inc_comp, add_scopes)
 
         # Add components unique to the included image (no instance match in the parent SBOM).
         for inc_comp in img_sbom_data.get("components") or []:
             inc_ref = inc_comp.get("bom-ref")
-            key = _instance_key(inc_comp)
             if inc_ref and inc_ref in included_bom_ref_remap:
-                continue
-            if inc_ref and inc_ref in ref_components and \
-                    _compatible_component_records(ref_components[inc_ref],
-                                                  inc_comp):
-                # The very same record; merging onto it loses nothing.
-                # Contradicting evidence under a colliding bom-ref keeps
-                # both instances and surfaces as a reference-integrity
-                # finding, never a silent drop of an image component.
                 continue
             if add_scopes and "scope" not in inc_comp:
                 inc_comp = dict(inc_comp)
@@ -2095,9 +2181,7 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
             sbom["components"].append(inc_comp)
             if inc_ref:
                 extra_seen_image_refs.add(inc_ref)
-                ref_components.setdefault(inc_ref, inc_comp)
-            if key and key not in identity_index:
-                identity_index[key] = inc_comp
+            _index_instance(identity_index, inc_comp, context)
 
         # Represent the included image itself as a firmware component in the parent SBOM.
         inc_metadata_comp = (img_sbom_data.get("metadata") or {}).get("component") or {}
@@ -2202,25 +2286,14 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
                 if "#" in ref:
                     prefix, bom_ref_part = ref.rsplit("#", 1)
                     ref = f"{prefix}#{remap_ref(bom_ref_part)}"
-                bom_ref_in_ref = ref.rsplit("#", 1)[-1] if "#" in ref else ""
-                if bom_ref_in_ref and not any(
-                    c.get("bom-ref") == bom_ref_in_ref for c in sbom["components"]
-                ):
-                    continue
-                remapped_affects.append({"ref": ref})
+                remapped_affects.append({**affect, "ref": ref})
             if not remapped_affects:
                 continue
+            statement_key = _vex_statement_key(inc_vuln)
             existing_vuln = next(
-                (v for v in vex["vulnerabilities"] if v.get("id") == cve_id), None
-            )
-            same_analysis = (
-                (existing_vuln or {}).get("analysis", {}).get("state") ==
-                inc_vuln.get("analysis", {}).get("state"))
-            if existing_vuln and same_analysis:
-                # One analysis seen twice: union the affected refs. A
-                # differing analysis is a distinct statement about the
-                # same CVE and rides along separately - folding would
-                # silently lose it.
+                (v for v in vex["vulnerabilities"]
+                 if _vex_statement_key(v) == statement_key), None)
+            if existing_vuln is not None:
                 for a in remapped_affects:
                     if a not in existing_vuln["affects"]:
                         existing_vuln["affects"].append(a)

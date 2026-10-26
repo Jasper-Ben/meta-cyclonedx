@@ -1,6 +1,8 @@
 """Embedded image composition: CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES merging."""
 
-from helpers import (affect_refs, component_by_name, default_facts, document,
+import pytest
+
+from helpers import (affect_refs, component_by_name, default_facts, dep_entry, document,
                      finding_by_id, fragment, pkg, profile_config, ref_of,
                      render_all, render_docs, root_entry, vuln, vex_document)
 
@@ -255,3 +257,73 @@ def test_included_image_without_metadata_root_is_found_and_dangling():
     finding = finding_by_id(docs["report"], "REQ-MERGE-001")
     assert finding["verdict"] == "unmet"
     assert "inc-meta" in finding["diagnosticMessage"]
+
+
+@pytest.mark.parametrize("difference", ["hashes", "licenses", "dependencies", "vex"])
+def test_embedded_instances_with_equal_coordinates_keep_distinct_evidence(
+        difference):
+    image = included_image(vex=None)
+    facts = parent_facts(config=profile_config(), included_images=[image])
+    parent = facts["fragments"]["zlib"]["pkgs"][0]
+    embedded = image["sbom"]["components"][0]
+    if difference == "hashes":
+        parent["hashes"] = [{"alg": "SHA-512", "content": "a" * 128}]
+        embedded["hashes"] = [{"alg": "SHA-512", "content": "b" * 128}]
+    elif difference == "licenses":
+        parent["licenses"] = [{"license": {"id": "MIT"}}]
+        embedded["licenses"] = [{"license": {"id": "BSD-2-Clause"}}]
+    elif difference == "dependencies":
+        facts["fragments"]["zlib"]["dependencies"] = [
+            {"ref": "ref-z", "dependsOn": ["app"]}]
+    else:
+        facts["fragments"]["zlib"]["cves"] = [
+            vuln("CVE-2024-9", "ref-z", state="resolved")]
+        image["vex"] = vex_document([{
+            "id": "CVE-2024-9", "analysis": {"state": "exploitable"},
+            "affects": [{"ref": f"urn:cdx:{INC_SERIAL}/1#inc-z"}],
+        }])
+    docs, _logs = render_all(facts)
+    copies = {c["bom-ref"]: c for c in docs["sbom"]["components"]
+              if c["name"] == "zlib"}
+    assert set(copies) == {"ref-z", "inc-z"}
+    assert dep_entry(docs["sbom"], "inc-z")["dependsOn"] == ["inc-u"]
+    if difference in ("hashes", "licenses"):
+        assert copies["ref-z"][difference] != copies["inc-z"][difference]
+    if difference == "vex":
+        targets = {v["analysis"]["state"]: affect_refs(v)
+                   for v in docs["vex"]["vulnerabilities"]}
+        serial = docs["sbom"]["serialNumber"].removeprefix("urn:uuid:")
+        assert targets == {
+            "resolved": [f"urn:cdx:{serial}/1#ref-z"],
+            "exploitable": [f"urn:cdx:{serial}/1#inc-z"],
+        }
+    assert finding_by_id(docs["report"], "REQ-IDEN-001")["verdict"] == "verified"
+
+
+@pytest.mark.parametrize("field,left,right", [
+    ("justification", "code_not_present", "code_not_reachable"),
+    ("detail", "not built in the application", "present but unreachable"),
+    ("response", ["will_not_fix"], ["update"]),
+])
+def test_equal_vex_states_do_not_overwrite_substantive_analysis(
+        field, left, right):
+    parent_statement = vuln("CVE-2024-42", "ref-app", state="not_affected")
+    parent_statement["analysis"][field] = left
+    incoming = vuln("CVE-2024-42", "inc-u", state="not_affected")
+    incoming["analysis"][field] = right
+    incoming["affects"] = [{"ref": f"urn:cdx:{INC_SERIAL}/1#inc-u"}]
+    image = included_image(vex=vex_document([incoming]))
+    facts = parent_facts(included_images=[image])
+    facts["fragments"]["app"]["cves"] = [parent_statement]
+    sbom, vex, _logs = render_docs(facts)
+    serial = sbom["serialNumber"].removeprefix("urn:uuid:")
+    by_target = {affect["ref"].rpartition("#")[2]: statement["analysis"]
+                 for statement in vex["vulnerabilities"]
+                 for affect in statement["affects"]}
+    assert by_target["ref-app"][field] == left
+    assert by_target["inc-u"][field] == right
+    assert {affect["ref"] for statement in vex["vulnerabilities"]
+            for affect in statement["affects"]} == {
+        f"urn:cdx:{serial}/1#ref-app", f"urn:cdx:{serial}/1#inc-u"}
+
+

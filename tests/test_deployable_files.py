@@ -359,7 +359,7 @@ def run_collect_deploy_files(tmp_path, variables):
         def note(message):
             events.append(("note", str(message)))
 
-    vars = {"IMGDEPLOYDIR": str(tmp_path), **variables}
+    vars = {"DEPLOY_DIR_IMAGE": str(tmp_path), **variables}
 
     class _Data:
         def getVar(self, name):
@@ -424,3 +424,27 @@ def test_the_link_name_fallback_strips_the_build_stamp_without_reading_it(tmp_pa
     )
     assert [e["path"] for e in entries] == ["core-image-minimal-qemux86-64.ext4"]
     assert entries[0]["sha512"] == hashlib.sha512(image_bytes).hexdigest()
+
+
+def test_deploy_selection_reads_final_outputs_not_image_staging(tmp_path):
+    import hashlib
+
+    staged = tmp_path / "staged"
+    deployed = tmp_path / "deployed"
+    staged.mkdir()
+    deployed.mkdir()
+    (staged / "image.ext4").write_bytes(b"old staged image")
+    (deployed / "image.ext4").write_bytes(b"final delivered image")
+    (deployed / "u-boot.bin").write_bytes(b"delivered bootloader")
+    entries, _events = run_collect_deploy_files(tmp_path, {
+        "IMGDEPLOYDIR": str(staged),
+        "DEPLOY_DIR_IMAGE": str(deployed),
+        "IMAGE_LINK_NAME": "image",
+        "IMAGE_FSTYPES": "ext4",
+        "CYCLONEDX_ADDITIONAL_FILES": "u-boot.bin",
+    })
+    assert {entry["path"]: entry.get("sha512") for entry in entries} == {
+        "image.ext4": hashlib.sha512(b"final delivered image").hexdigest(),
+        "u-boot.bin": hashlib.sha512(b"delivered bootloader").hexdigest(),
+    }
+    assert all("error" not in entry for entry in entries)
