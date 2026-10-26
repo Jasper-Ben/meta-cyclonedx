@@ -321,6 +321,7 @@ def test_final_rootfs_inventory_includes_unowned_executables_and_archives(
     exec(compile(tree, BBCLASS, "exec"), namespace)
     namespace["collect_cyclonedx_file_inventory"](_Data({
         "CYCLONEDX_PROFILE": "tr03183-2.1", "WORKDIR": str(tmp_path),
+        "CYCLONEDX_IMAGEDATA_WORKDIR": str(tmp_path),
         "IMAGE_ROOTFS": str(rootfs)}))
     inventory = json.loads(
         (tmp_path / "cyclonedx-file-inventory.json").read_text())

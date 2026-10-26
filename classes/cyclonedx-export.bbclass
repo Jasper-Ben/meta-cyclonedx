@@ -1307,9 +1307,11 @@ def write_cyclonedx_image_data(d, sbom, vex):
     import shutil
 
     imagedata_dir = d.getVar("CYCLONEDX_IMAGEDATA_WORKDIR")
-    if os.path.exists(imagedata_dir):
-        shutil.rmtree(imagedata_dir)
     bb.utils.mkdirhier(imagedata_dir)
+    # Drop the previous check outcome rather than the whole directory:
+    # the rootfs-phase facts caches live in it and must survive.
+    shutil.rmtree(os.path.join(imagedata_dir, "sbom-cve-check"),
+                  ignore_errors=True)
     write_json(os.path.join(imagedata_dir, "bom.json"), sbom)
     write_json(os.path.join(imagedata_dir, "vex.json"), vex)
     # The checked VEX has a separate sstate owner. The manifest selects it
@@ -1604,8 +1606,12 @@ def export_cyclonedx(d, deploy_phase=False):
     # querying it again in the deploy phase makes dnf fail and fails
     # the task. The rootfs phase therefore persists the facts it
     # assembled, and the deploy phase reuses them instead of
-    # re-deriving anything from installed packages.
-    facts_file = os.path.join(d.getVar("WORKDIR"),
+    # re-deriving anything from installed packages. They live inside the
+    # sstate-staged image-data directory, not the work directory at
+    # large: a cache-served do_rootfs restores that directory with it,
+    # so the deploy phase of every later run can still complete the
+    # generation.
+    facts_file = os.path.join(d.getVar("CYCLONEDX_IMAGEDATA_WORKDIR"),
                               "cyclonedx-rootfs-facts.json")
     if profile and is_image and deploy_phase:
         if not os.path.exists(facts_file):
@@ -1683,6 +1689,7 @@ def export_cyclonedx(d, deploy_phase=False):
         # below; the record of the build-time recipe selection stays in
         # the file for provenance (the fragments carry its result).
         if profile and is_image and not deploy_phase:
+            bb.utils.mkdirhier(d.getVar("CYCLONEDX_IMAGEDATA_WORKDIR"))
             write_json(facts_file, {
                 "runtime_recipes": sorted(runtime_recipes),
                 "image_install_recipes": sorted(image_install_recipes),
@@ -1705,7 +1712,7 @@ def export_cyclonedx(d, deploy_phase=False):
     # Deploy regeneration reuses that snapshot rather than inspecting the
     # rootfs or asking the package manager outside its task environment.
     file_inventory = {}
-    inventory_file = os.path.join(d.getVar("WORKDIR"),
+    inventory_file = os.path.join(d.getVar("CYCLONEDX_IMAGEDATA_WORKDIR"),
                                   "cyclonedx-file-inventory.json")
     if profile:
         if deploy_phase and is_image:
@@ -1879,11 +1886,11 @@ ROOTFS_POSTUNINSTALL_COMMAND =+ "do_export_cyclonedx"
 python collect_cyclonedx_file_inventory() {
     if not d.getVar("CYCLONEDX_PROFILE") or not bb.data.inherits_class("image", d):
         return
-    facts = read_json(os.path.join(d.getVar("WORKDIR"),
-                                   "cyclonedx-rootfs-facts.json"))
+    cache_dir = d.getVar("CYCLONEDX_IMAGEDATA_WORKDIR")
+    facts = read_json(os.path.join(cache_dir, "cyclonedx-rootfs-facts.json"))
     inventory = collect_file_inventory(d, sorted(facts["fragments"]))
-    write_json(os.path.join(d.getVar("WORKDIR"),
-                            "cyclonedx-file-inventory.json"), inventory)
+    write_json(os.path.join(cache_dir, "cyclonedx-file-inventory.json"),
+               inventory)
 }
 # Observe the final rootfs, including ROOTFS_POSTPROCESS_COMMAND changes,
 # without re-querying its removed package-manager database.
@@ -1928,8 +1935,80 @@ python do_deploy_cyclonedx() {
     else:
         export_cyclonedx(d)
 }
-# Synchronize consumers with the final document producer, including its setscene
-# task. This task has no output of its own.
+# The regeneration in do_deploy_cyclonedx is sstate-cacheable, but the
+# artifact bytes it hashes are not reproducible (image payloads embed
+# per-build entropy), and BitBake's signature chain cannot see deploy
+# content. A restored document can therefore record an older build's
+# digests while do_image_complete republishes fresh bytes in the same
+# invocation. do_cyclonedx_verify closes that window: ordered after the
+# deploy generation and ahead of the CVE check merge and the consumer
+# sync point, it compares each deployable-artifact file component's
+# recorded SHA-512 against the deployed bytes now and rewrites just
+# those hash entries, in place. The document's identity - serials,
+# references, timestamp - belongs to its generation and stays
+# untouched; digests are the only values that can drift after the
+# document has been written, so digests are the only values corrected.
+# The bytes being checked are invisible to this task's signature (file
+# checksums would predate the image tasks' republish within the same
+# invocation), so the task runs on every invocation; when the
+# agreement already holds it only hashes and writes nothing.
+python do_cyclonedx_verify() {
+    import hashlib
+    import json
+    import os
+
+    if not bb.data.inherits_class("image", d):
+        return
+    if not (d.getVar("CYCLONEDX_PROFILE") or ""):
+        return
+    deploy_dir = d.getVar("DEPLOY_DIR_IMAGE") or ""
+    export_dir = d.getVar("CYCLONEDX_EXPORT_DIR") or ""
+    sbom_name = d.getVar("CYCLONEDX_EXPORT_SBOM") or ""
+    sbom_path = sbom_name if os.path.isabs(sbom_name) \
+        else os.path.join(export_dir, sbom_name)
+    if not deploy_dir or not os.path.isfile(sbom_path):
+        return
+    with open(sbom_path) as handle:
+        sbom = json.load(handle)
+    corrected = []
+    for component in sbom.get("components") or []:
+        ref = component.get("bom-ref") or ""
+        if component.get("type") != "file" or not ref.startswith("yocto-file::"):
+            continue  # not a deploy-directory artifact of this image
+        path = ref[len("yocto-file::"):]
+        if not path or os.path.isabs(path) or ".." in path.split(os.sep):
+            continue
+        artifact = os.path.join(deploy_dir, path)
+        if not os.path.isfile(artifact):
+            continue  # missing artifacts stay inventory evidence
+        computed = hashlib.sha512()
+        with open(artifact, "rb") as handle:
+            for chunk in iter(lambda: handle.read(1 << 20), b""):
+                computed.update(chunk)
+        digest = computed.hexdigest()
+        for entry in component.get("hashes") or []:
+            if entry.get("alg") != "SHA-512":
+                continue
+            if (entry.get("content") or "") != digest:
+                entry["content"] = digest
+                corrected.append(path)
+            break
+    if not corrected:
+        return
+    bb.note("CycloneDX deploy verification: corrected "
+            "deployable-artifact digests against the deployed bytes: "
+            + ", ".join(sorted(set(corrected))))
+    write_json(sbom_path, sbom)
+    # Mirror the image-data copy used by later merges and consumers so
+    # the same digests are all anyone reads.
+    imagedata_bom = os.path.join(d.getVar("CYCLONEDX_IMAGEDATA"),
+                                 d.getVar("SSTATE_PKGARCH"),
+                                 d.getVar("PN"), "bom.json")
+    if os.path.isfile(imagedata_bom):
+        write_json(imagedata_bom, sbom)
+}
+# Synchronize consumers with the final document producer, including its
+# setscene task. This task has no output of its own.
 do_cyclonedx_complete[noexec] = "1"
 python () {
     if bb.data.inherits_class("image", d):
@@ -1943,20 +2022,44 @@ python () {
         # alone lets a cache hit restore documents that hashed an older
         # build's artifact bytes while do_image_complete republishes
         # fresh ones in the same run.
-        d.appendVarFlag("do_deploy_cyclonedx", "depends",
-                        f" {d.getVar('PN')}:do_image_complete")
+        image_dep = f"{d.getVar('PN')}:do_image_complete"
+        if image_dep not in (d.getVarFlag("do_deploy_cyclonedx",
+                                          "depends") or "").split():
+            d.appendVarFlag("do_deploy_cyclonedx", "depends", f" {image_dep}")
         bb.build.addtask("do_deploy_cyclonedx", "do_build", "do_image_complete", d)
-        complete_after = "do_deploy_cyclonedx"
+        verify_before = "do_cyclonedx_complete"
+        complete_after = "do_cyclonedx_verify"
         if cyclonedx_sbom_cve_check_enabled(d):
+            # Verification reads the current bytes, so it runs ahead of
+            # the CVE check merge; the merge then lands on the corrected
+            # document instead of being replaced by it.
+            verify_before = "do_cyclonedx_sbom_cve_check"
+            bb.build.addtask("do_cyclonedx_sbom_cve_check",
+                             "do_cyclonedx_complete",
+                             "do_sbom_cve_check do_deploy_cyclonedx", d)
             complete_after = "do_cyclonedx_sbom_cve_check"
-            bb.build.addtask("do_cyclonedx_sbom_cve_check", "do_build", "do_sbom_cve_check do_deploy_cyclonedx", d)
         elif d.getVar("CYCLONEDX_INCLUDE_UNPATCHED_VULNS") == "1":
             bb.warn(f"meta-cyclonedx: CYCLONEDX_INCLUDE_UNPATCHED_VULNS needs the sbom-cve-check class for {d.getVar('PN')}")
-        bb.build.addtask("do_cyclonedx_complete", "do_build", complete_after, d)
+        bb.build.addtask("do_cyclonedx_verify", verify_before,
+                         "do_deploy_cyclonedx", d)
+        bb.build.addtask("do_cyclonedx_complete", "do_build",
+                         complete_after, d)
+        # The deployed bytes this task checks are invisible to its
+        # signature (file checksums would predate the image tasks'
+        # republish within the same invocation), so the task must not
+        # participate in stamp-based skipping: nostamp, the same
+        # always-run mechanism do_build uses. When the agreement holds
+        # it hashes, compares and writes nothing.
+        d.setVarFlag("do_cyclonedx_verify", "nostamp", "1")
         pn = d.getVar("PN")
         for img in (d.getVar("CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES") or "").split():
             if img != pn:
-                d.appendVarFlag("do_rootfs", "depends", f" {img}:do_cyclonedx_complete")
+                # Appended only when absent: anonymous python re-runs
+                # on the re-parse that validates hash determinism, and
+                # an append would land twice.
+                dep = f"{img}:do_cyclonedx_complete"
+                if dep not in (d.getVarFlag("do_rootfs", "depends") or "").split():
+                    d.appendVarFlag("do_rootfs", "depends", f" {dep}")
 }
 
 def cyclonedx_sbom_cve_check_enabled(d):

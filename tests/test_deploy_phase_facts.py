@@ -4,7 +4,8 @@ The facts derived from the package manager's view of the assembled root
 filesystem (`image_list_installed_packages` -> dnf) only exist inside
 do_rootfs's pseudo environment; re-deriving them in do_deploy_cyclonedx
 fails the task. The rootfs phase therefore persists its assembled facts
-into WORKDIR and the deploy phase loads them instead of re-deriving.
+in the sstate-staged image-data cache directory; the deploy phase loads
+them instead of re-deriving.
 These tests exec the adapter's assembly functions under a stubbed
 BitBake/oe environment (the same seam as
 test_deployable_files.run_collect_deploy_files); the dnf stub raises, so
@@ -24,6 +25,8 @@ BBCLASS = os.path.join(os.path.dirname(meta_cyclonedx.__file__),
                        "..", "classes", "cyclonedx-export.bbclass")
 
 FACTS_NAME = "cyclonedx-rootfs-facts.json"
+# The persistence seam: inside the sstate-staged image-data directory.
+CACHE = ("work", "cyclonedx-image")
 
 # Facts the rootfs phase assembles; the deploy phase must reuse them verbatim.
 PERSISTED = {
@@ -90,6 +93,7 @@ def run_export(tmp_path, variables, deploy_phase=False,
     vars = {
         "PN": "core-image-minimal",
         "WORKDIR": str(workdir),
+        "CYCLONEDX_IMAGEDATA_WORKDIR": str(workdir / "cyclonedx-image"),
         "PKGDATA_DIR": str(pkgdata),
         "CYCLONEDX_PNDATA": str(tmp_path / "pndata"),
         "SSTATE_ARCHS": "qemux86_64 all",
@@ -262,7 +266,7 @@ class _Data:
 
 
 def persisted_facts(tmp_path, content=None):
-    path = tmp_path / "work" / FACTS_NAME
+    path = tmp_path.joinpath(*CACHE) / FACTS_NAME
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(PERSISTED if content is None else content))
     return path
@@ -272,7 +276,7 @@ def test_deploy_phase_reuses_persisted_facts_without_the_package_manager(tmp_pat
     # The final generation under a profile loads the rootfs-phase facts;
     # the stubbed dnf raises if the adapter ever asks it again.
     persisted_facts(tmp_path)
-    (tmp_path / "work" / "cyclonedx-file-inventory.json").write_text(
+    (tmp_path.joinpath(*CACHE) / "cyclonedx-file-inventory.json").write_text(
         json.dumps({"/bin/busybox": [{"path": "/bin/busybox"}]}))
     facts, events, calls = run_export(
         tmp_path, {"_IMAGE_RECIPE": "1",
@@ -309,7 +313,8 @@ def test_rootfs_phase_persists_the_assembled_facts(tmp_path):
                    "CYCLONEDX_EXTRA_RUNTIME_RECIPES": "optee-os",
                    "_EDGES": {"busybox": ["base-files"]}},
         functions=("export_cyclonedx",))
-    stored = json.loads((tmp_path / "work" / FACTS_NAME).read_text())
+    stored = json.loads(
+        (tmp_path.joinpath(*CACHE) / FACTS_NAME).read_text())
     assert stored["runtime_recipes"] == facts["runtime_recipes"]
     assert stored["image_install_recipes"] == facts["image_install_recipes"]
     assert stored["runtime_edges"] == facts["runtime_edges"]
@@ -327,7 +332,7 @@ def test_nonprofile_generation_persists_nothing(tmp_path):
         tmp_path, {"_IMAGE_RECIPE": "1",
                    "_INSTALLED_PACKAGES": ["pkg-busybox"]},
         functions=("export_cyclonedx",))
-    assert not (tmp_path / "work" / FACTS_NAME).exists()
+    assert not (tmp_path.joinpath(*CACHE) / FACTS_NAME).exists()
     assert facts["runtime_recipes"] == ["busybox"]
     assert "image_list_installed_packages" in calls  # derived live, as before
 
@@ -337,4 +342,4 @@ def test_nonimage_recipe_persists_nothing_even_with_a_profile(tmp_path):
         tmp_path, {"CYCLONEDX_PROFILE": "TR-03183-2",
                    "_INSTALLED_PACKAGES": ["pkg-busybox"]},
         functions=("export_cyclonedx",))
-    assert not (tmp_path / "work" / FACTS_NAME).exists()
+    assert not (tmp_path.joinpath(*CACHE) / FACTS_NAME).exists()

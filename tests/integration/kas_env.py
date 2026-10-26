@@ -320,14 +320,21 @@ _SETSCENE_RESTORE = re.compile(
     r"\((?P<task>[^()]*:do_[a-z0-9_]+)_setscene\)"
 )
 
+#: A checksum-gated consistency check (do_cyclonedx_verify): it reads
+#: the deployed bytes and corrects only drifted hash entries. When the
+#: documents already agree, it writes nothing and is not a rerun of work.
+_CONSISTENCY_CHECK = re.compile(r":do_cyclonedx_verify$")
+
 
 def work_tasks_reran(text):
     """Set of recipe:task entries BitBake actually re-executed as work.
 
-    Empty means sstate served everything: setscene restores and noexec
-    bookkeeping do no work and are not counted.
+    Setscene restores, noexec bookkeeping, and the consistency check
+    do not count as regenerated output. If the check does correct a digest,
+    the deployed-byte comparison detects the changed artifact separately.
     """
-    return {match.group("task") for match in _WORK_TASK_RUN.finditer(text)}
+    return {match.group("task") for match in _WORK_TASK_RUN.finditer(text)
+            if not _CONSISTENCY_CHECK.search(match.group("task"))}
 
 
 def setscene_restored_tasks(text):

@@ -55,6 +55,15 @@ carry only what the
 
 ### Fixes
 
+- Corrected deployable-artifact SHA-512 digests that could record the
+  previous build's bytes. Image payload bytes are not reproducible and
+  BitBake's signature chain cannot see them, so a cached document could
+  be restored over freshly republished artifacts from
+  `do_image_complete`. Profile image builds now verify the recorded
+  digests against the final deploy directory (`do_cyclonedx_verify`) and
+  correct the drifted hash entries in place; the rootfs-phase caches
+  ride in the sstate-staged image data so a deploy-phase regeneration
+  after a cached `do_rootfs` still has its inputs.
 - Keep imported and embedded component instances separate when hashes,
   build metadata, licences, dependency graphs or VEX analyses differ,
   even if name, version and purl match. Compatible partial records may
