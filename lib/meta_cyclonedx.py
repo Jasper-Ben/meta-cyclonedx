@@ -184,7 +184,8 @@ SUPPORTED_IMAGE_TYPES = [
 
 
 def config_errors(spec_version, image_type, profile=None, enforcement=None,
-                  deduplicate_cpe_collisions=False):
+                  deduplicate_cpe_collisions=False,
+                  expand_cve_product_aliases=False):
     """
     Validate renderer-relevant configuration and return a human-readable
     fatal error string, or None when the configuration is supported.
@@ -193,7 +194,7 @@ def config_errors(spec_version, image_type, profile=None, enforcement=None,
     CYCLONEDX_PROFILE_ENFORCEMENT selections; an absent or empty profile
     keeps the plain (unaligned) output, so demanding enforcement without a
     profile is a configuration error.
-    The opt-in CPE collision projection cannot coexist with a profile.
+    Neither opt-in CPE tooling projection can coexist with a profile.
     """
     matrix = _alignment_profile()
     if profile:
@@ -209,6 +210,9 @@ def config_errors(spec_version, image_type, profile=None, enforcement=None,
             )
     if profile and deduplicate_cpe_collisions:
         return ("CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS cannot be enabled "
+                "with CYCLONEDX_PROFILE; projected output is not alignment evidence")
+    if profile and expand_cve_product_aliases:
+        return ("CYCLONEDX_EXPAND_CVE_PRODUCT_ALIASES cannot be enabled "
                 "with CYCLONEDX_PROFILE; projected output is not alignment evidence")
 
     if spec_version not in SUPPORTED_SPEC_VERSIONS:
@@ -256,6 +260,11 @@ VALID_LOGICAL_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~+-]*")
 ALIAS_PRODUCT_PROPERTY = "yocto:cve:product"
 ALIAS_VERSION_PROPERTY = "yocto:cve:version"
 ALIAS_CPE_PROPERTY = "yocto:cve:cpe"
+
+# View-only rows for CPE-keyed consumers must never become inventory or VEX
+# anchors. Recipe fragments continue to carry only logical components.
+ALIAS_PROJECTION_PROPERTY = "yocto:projection:cve-product-alias"
+
 
 # Statically linked code is attributed only from the debugsrc lists BitBake's
 # own do_package records in pkgdata; delivered binaries are never parsed
@@ -1265,6 +1274,51 @@ def _merge_instance_evidence(existing, incoming, add_scopes):
             existing[key] = copy.deepcopy(value)
 
 
+def _expand_cve_product_aliases(sbom, recipe_refs):
+    """Project secondary recipe product tokens, without changing logical facts."""
+    components_by_ref = {component["bom-ref"]: component
+                         for component in sbom["components"]
+                         if component.get("bom-ref")}
+    for refs in recipe_refs.values():
+        for ref in refs:
+            logical = components_by_ref.get(ref)
+            if logical is None:
+                continue
+            properties = logical.get("properties") or []
+            products = list(dict.fromkeys(
+                prop["value"] for prop in properties
+                if prop.get("name") == ALIAS_PRODUCT_PROPERTY and prop.get("value")))
+            cpes = [prop["value"] for prop in properties
+                    if prop.get("name") == ALIAS_CPE_PROPERTY and prop.get("value")]
+            version = next((prop["value"] for prop in properties
+                            if prop.get("name") == ALIAS_VERSION_PROPERTY
+                            and prop.get("value")), logical.get("version", "unknown"))
+            for token in products[1:]:
+                vendor, separator, product = token.partition(":")
+                if not separator:
+                    vendor, product = "*", token
+                cpe = next((value for value in cpes
+                            if value.startswith(
+                                f"cpe:2.3:*:{vendor or '*'}:{product}:{version}:")), None)
+                if cpe is None:
+                    continue
+                alias_ref = str(uuid.uuid4())
+                alias = {
+                    "type": "library",
+                    "name": product,
+                    "version": version,
+                    "bom-ref": alias_ref,
+                    "cpe": cpe,
+                    "properties": [{"name": ALIAS_PROJECTION_PROPERTY,
+                                    "value": "true"}],
+                }
+                sbom["components"].append(alias)
+                sbom["dependencies"].append(
+                    {"ref": alias_ref, "dependsOn": [ref]})
+                sbom["compositions"].append(
+                    {"aggregate": "unknown", "assemblies": [alias_ref]})
+
+
 def _deduplicate_cpe_collisions(sbom, vex, recipe_refs, log):
     """Project only explained collisions of native recipe components."""
     native_refs = {ref for refs in recipe_refs.values() for ref in refs}
@@ -2065,6 +2119,11 @@ def render(facts):
                               f"URI")
             holder["externalReferences"] = kept
 
+    if config.get("expand_cve_product_aliases"):
+        _expand_cve_product_aliases(sbom, recipe_refs)
+        _log(log, "note", "CYCLONEDX_EXPAND_CVE_PRODUCT_ALIASES: "
+             "CVE product alias projection enabled")
+
     if not profile:
         return {"sbom": sbom, "vex": vex}
 
@@ -2123,6 +2182,9 @@ def merge_sbom_cve_check(sbom, vex, report, config, log=None):
     refs_by_cpe = {}
     refs_by_pn = {}
     for component in sbom.get("components", []):
+        if any(prop.get("name") == ALIAS_PROJECTION_PROPERTY
+               for prop in component.get("properties") or []):
+            continue
         for cpe in sorted(component_correlation_cpes(component)):
             refs_by_cpe.setdefault(cpe, []).append(component["bom-ref"])
         purl = component.get("purl", "")
