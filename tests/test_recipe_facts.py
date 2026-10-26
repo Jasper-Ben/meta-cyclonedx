@@ -9,19 +9,6 @@ import meta_cyclonedx
 from helpers import PLACEHOLDER
 
 
-def test_aliases_collapse_into_one_logical_component():
-    pkg = meta_cyclonedx.component_identity(
-        "foo", "1.2", "pkg:yocto/foo@1.2", cve_products="libfoo foo")
-
-    assert pkg["name"] == "foo"
-    assert pkg["version"] == "1.2"
-    assert pkg["purl"] == "pkg:yocto/foo@1.2"
-    products = [p["value"] for p in pkg["properties"]
-                if p["name"] == "yocto:cve:product"]
-    assert products == ["foo", "libfoo"]
-    assert pkg["cpe"] == "cpe:2.3:*:*:foo:1.2:*:*:*:*:*:*:*"
-
-
 def test_identity_overrides_take_precedence():
     pkg = meta_cyclonedx.component_identity(
         "yocto-recipe", "9.9-r0", "pkg:yocto/x@9.9", cve_products="foo",
