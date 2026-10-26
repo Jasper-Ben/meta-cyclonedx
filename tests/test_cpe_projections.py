@@ -80,6 +80,121 @@ def test_second_recipe_alias_projects_one_marked_component_without_owning_files_
                for level, message in logs)
 
 
+def test_three_distinct_product_tokens_project_only_secondary_products():
+    facts = alias_facts(expand_cve_product_aliases=True)
+    logical = facts["fragments"]["kernel"]["pkgs"][0]
+    logical["properties"].extend([
+        {"name": "yocto:cve:product", "value": "acme:linux_driver"},
+        {"name": "yocto:cve:product", "value": "linux_kernel"},
+        {"name": "yocto:cve:cpe",
+         "value": "cpe:2.3:*:acme:linux_driver:6.6:*:*:*:*:*:*:*"},
+    ])
+
+    sbom, _vex, _logs = render_docs(facts)
+    aliases = [component for component in sbom["components"]
+               if {"name": "yocto:projection:cve-product-alias",
+                   "value": "true"} in component.get("properties", [])]
+    assert len(aliases) == 2
+    assert {(alias.get("group"), alias["name"], alias["cpe"])
+            for alias in aliases} == {
+        (None, "linux_kernel", ALIAS_CPE),
+        ("acme", "linux_driver",
+         "cpe:2.3:*:acme:linux_driver:6.6:*:*:*:*:*:*:*"),
+    }
+
+
+def test_duplicate_products_and_multiple_versions_keep_one_row_per_product():
+    facts = alias_facts(expand_cve_product_aliases=True)
+    logical = facts["fragments"]["kernel"]["pkgs"][0]
+    logical["version"] = "6.6+vendor1"
+    logical["properties"].extend([
+        {"name": "yocto:cve:product", "value": "acme:driver"},
+        {"name": "yocto:cve:product", "value": "acme:driver"},
+        {"name": "yocto:cve:version", "value": "6.5"},
+        {"name": "yocto:cve:cpe",
+         "value": "cpe:2.3:*:*:linux_kernel:6.5:*:*:*:*:*:*:*"},
+        {"name": "yocto:cve:cpe",
+         "value": "cpe:2.3:*:acme:driver:6.6:*:*:*:*:*:*:*"},
+        {"name": "yocto:cve:cpe",
+         "value": "cpe:2.3:*:acme:driver:6.5:*:*:*:*:*:*:*"},
+    ])
+
+    sbom, _vex, _logs = render_docs(facts)
+    assert next(c for c in sbom["components"] if c["bom-ref"] == "ref-kernel")[
+        "version"] == "6.6+vendor1"
+    aliases = [component for component in sbom["components"]
+               if {"name": "yocto:projection:cve-product-alias",
+                   "value": "true"} in component.get("properties", [])]
+    assert len(aliases) == 2
+    assert {alias["version"] for alias in aliases} == {"6.6"}
+    assert {(alias.get("group"), alias["name"]): (
+        alias["cpe"], [prop["value"] for prop in alias["properties"]
+                       if prop["name"] == "yocto:cve:cpe"])
+        for alias in aliases} == {
+        (None, "linux_kernel"): (
+            ALIAS_CPE, ["cpe:2.3:*:*:linux_kernel:6.5:*:*:*:*:*:*:*"]),
+        ("acme", "driver"): (
+            "cpe:2.3:*:acme:driver:6.6:*:*:*:*:*:*:*",
+            ["cpe:2.3:*:acme:driver:6.5:*:*:*:*:*:*:*"]),
+    }
+
+
+def test_expansion_preserves_primary_included_imported_and_embedded_graphs():
+    from helpers import document, vex_document
+
+    facts = alias_facts()
+    foreign = pkg("foreign", "6.6", "ref-imported", cpe=PRIMARY_CPE,
+                  properties=[
+                      {"name": "yocto:cve:product", "value": "linux"},
+                      {"name": "yocto:cve:product", "value": "linux_kernel"},
+                      {"name": "yocto:cve:cpe", "value": ALIAS_CPE}])
+    facts["fragments"]["kernel"]["extra_components"].append(foreign)
+    facts["fragments"]["kernel"]["extra_dependencies"] = [dep("ref-imported")]
+    embedded = pkg("embedded", "6.6", "ref-embedded", cpe=PRIMARY_CPE,
+                   properties=[
+                       {"name": "yocto:cve:product", "value": "linux"},
+                       {"name": "yocto:cve:product", "value": "linux_kernel"},
+                       {"name": "yocto:cve:cpe", "value": ALIAS_CPE}])
+    facts["included_images"] = [{
+        "name": "initramfs",
+        "sbom": document(
+            "11111111-2222-3333-4444-555555555555",
+            [embedded], [dep("ref-embedded")],
+            metadata_component={"type": "firmware", "name": "initramfs",
+                                "version": "1", "bom-ref": "ref-initramfs"}),
+        "vex": vex_document([]), "vex_error": None,
+    }]
+    plain, plain_vex, _ = render_docs(copy.deepcopy(facts))
+    facts["config"]["expand_cve_product_aliases"] = True
+    expanded, expanded_vex, _ = render_docs(facts)
+
+    def stable(value):
+        return re.sub(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                      r"[0-9a-f]{4}-[0-9a-f]{12}", "<uuid>",
+                      json.dumps(value, sort_keys=True))
+
+    assert stable(expanded["metadata"]["component"]) == stable(
+        plain["metadata"]["component"])
+    for ref in ("ref-kernel", "file:vmlinux", "ref-imported",
+                "ref-embedded", "ref-initramfs"):
+        for key, selector in (
+            ("components", lambda row: row.get("bom-ref") == ref),
+            ("dependencies", lambda row: row.get("ref") == ref),
+            ("compositions", lambda row: ref in row.get("assemblies", [])),
+        ):
+            before = [row for row in plain[key] if selector(row)]
+            after = [row for row in expanded[key] if selector(row)]
+            assert stable(after) == stable(before), (key, ref)
+
+    def primary_graph(sbom):
+        ref = sbom["metadata"]["component"]["bom-ref"]
+        return [entry for entry in sbom["dependencies"] if entry["ref"] == ref]
+
+    assert stable(primary_graph(expanded)) == stable(primary_graph(plain))
+    assert stable(expanded_vex["vulnerabilities"]) == stable(
+        plain_vex["vulnerabilities"])
+
+
 def test_alias_flag_off_keeps_exact_rendered_bytes():
     plain, plain_vex, _ = render_docs(alias_facts())
     off, off_vex, _ = render_docs(alias_facts(expand_cve_product_aliases=False))
