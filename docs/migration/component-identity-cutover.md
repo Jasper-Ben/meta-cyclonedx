@@ -67,6 +67,12 @@ and alignment-profile output share the corrected model.
    while indistinguishable duplicates are reported as an unmet
    `REQ-IDEN-001` alignment finding naming the affected bom-refs and a
    build warning, and strict enforcement rejects them.
+   Ordinary output retains this model by default. Integrators targeting
+   CPE-keyed tools may explicitly opt into the lossy
+   `CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS` projection described in the
+   [configuration reference](../../README.md#cpe-collision-deduplication-opt-in);
+   alignment-profile output never accepts that flag.
+
 
 7. **Winning correlation alias.** For multi-alias recipes the component
    `cpe` now uses the first declared `CVE_PRODUCT` token crossed with the
