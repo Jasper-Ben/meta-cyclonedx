@@ -228,6 +228,15 @@ adds tooling-only components and is not a truthful inventory of separately
 built software. Imported and embedded graphs are not expanded. It cannot
 be combined with `CYCLONEDX_PROFILE`; that combination fails at parse time.
 
+When both flags are enabled, expansion runs **before** collision
+deduplication: aliases shared across recipes collapse to one CPE-carrying
+row per correlation token. A distinct primary CPE of an absorbed recipe
+remains visible as a marked view row. File ownership and VEX stay anchored
+to the surviving logical component; merged dependency and composition
+references follow that survivor. Neither flag changes recipe fragments,
+the default inventory, or alignment-profile evidence
+([ADR-0013](docs/adr/0013-keep-cpe-projections-at-render-boundary.md)).
+
 ### Recipe-contributed CycloneDX Fragments
 
 Language ecosystems that resolve their own dependency trees — cargo, npm, go —

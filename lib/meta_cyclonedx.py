@@ -1282,6 +1282,7 @@ def _merge_instance_evidence(existing, incoming, add_scopes):
 
 def _expand_cve_product_aliases(sbom, recipe_refs):
     """Project secondary recipe product tokens, without changing logical facts."""
+    projected_refs = set()
     components_by_ref = {component["bom-ref"]: component
                          for component in sbom["components"]
                          if component.get("bom-ref")}
@@ -1311,6 +1312,7 @@ def _expand_cve_product_aliases(sbom, recipe_refs):
                 if cpe is None:
                     continue
                 alias_ref = str(uuid.uuid4())
+                projected_refs.add(alias_ref)
                 alias = {
                     "type": "library",
                     "name": product,
@@ -1330,10 +1332,12 @@ def _expand_cve_product_aliases(sbom, recipe_refs):
                     {"ref": alias_ref, "dependsOn": [ref]})
                 sbom["compositions"].append(
                     {"aggregate": "unknown", "assemblies": [alias_ref]})
+    return projected_refs
 
 
-def _deduplicate_cpe_collisions(sbom, vex, recipe_refs, log):
-    """Project only explained collisions of native recipe components."""
+def _deduplicate_cpe_collisions(sbom, vex, recipe_refs, log,
+                                projected_refs=None):
+    """Project explained native collisions, then coalesce their alias rows."""
     native_refs = {ref for refs in recipe_refs.values() for ref in refs}
     recipe_by_ref = {ref: recipe for recipe, refs in recipe_refs.items()
                      for ref in refs}
@@ -1372,8 +1376,67 @@ def _deduplicate_cpe_collisions(sbom, vex, recipe_refs, log):
                                         ALIAS_VERSION_PROPERTY,
                                         ALIAS_CPE_PROPERTY) and prop not in existing:
                     existing.append(prop)
+            if projected_refs is not None and member.get("cpe") and (
+                    member["cpe"] != survivor.get("cpe")):
+                # The absorbed recipe's primary token was not expanded (only
+                # secondary tokens are). Keep its correlation CPE visible as
+                # a view row, without transferring its files or VEX status.
+                cpe = member["cpe"]
+                parts = cpe.split(":")
+                vendor, product, version = parts[3:6]
+                alias_ref = str(uuid.uuid4())
+                alias = {
+                    "type": "library",
+                    "name": product,
+                    "version": version,
+                    "bom-ref": alias_ref,
+                    "cpe": cpe,
+                    "properties": [
+                        {"name": ALIAS_PROJECTION_PROPERTY, "value": "true"},
+                    ],
+                }
+                if vendor != "*":
+                    alias["group"] = vendor
+                sbom["components"].append(alias)
+                projected_refs.add(alias_ref)
+                sbom["dependencies"].append(
+                    {"ref": alias_ref, "dependsOn": [member["bom-ref"]]})
+                sbom["compositions"].append(
+                    {"aggregate": "unknown", "assemblies": [alias_ref]})
             _log(log, "note", "CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS: "
                  f"merged {member.get('purl')} into {survivor.get('purl')}")
+
+    # Expansion has already added alias rows for each native instance.
+    # Native survivors retain their logical identity; aliases contributed
+    # by absorbed recipes coalesce only within the same surviving owner.
+    # An alias with the survivor's own CPE is redundant.
+    projected = ([component for component in sbom["components"]
+                  if component.get("bom-ref") in projected_refs]
+                 if projected_refs is not None else [])
+    alias_owner = {
+        entry["ref"]: entry["dependsOn"][0]
+        for entry in sbom["dependencies"]
+        if entry["ref"] in (projected_refs or ()) and entry.get("dependsOn")}
+    visible_aliases = {}
+    for alias in projected:
+        ref = alias["bom-ref"]
+        owner = remap.get(alias_owner.get(ref), alias_owner.get(ref))
+        if owner is None:
+            continue
+        native = components_by_ref.get(owner)
+        if native is not None and alias["cpe"] == native.get("cpe"):
+            remap[ref] = owner
+            continue
+        key = (owner, alias["cpe"])
+        if key in visible_aliases:
+            remap[ref] = visible_aliases[key]["bom-ref"]
+            survivor_alias = visible_aliases[key]
+            existing = survivor_alias.setdefault("properties", [])
+            for prop in alias.get("properties") or []:
+                if prop not in existing:
+                    existing.append(prop)
+        else:
+            visible_aliases[key] = alias
 
     if not remap:
         return
@@ -2101,15 +2164,26 @@ def render(facts):
 
     # Sort vulnerabilities by CVE id for a stable, human-readable order.
     vex["vulnerabilities"].sort(key=lambda v: v["id"])
+    projected_alias_refs = None
+    if config.get("expand_cve_product_aliases"):
+        projected_alias_refs = _expand_cve_product_aliases(sbom, recipe_refs)
+        _log(log, "note", "CYCLONEDX_EXPAND_CVE_PRODUCT_ALIASES: "
+             "CVE product alias projection enabled")
+
     if config.get("deduplicate_cpe_collisions"):
-        _deduplicate_cpe_collisions(sbom, vex, recipe_refs, log)
+        _deduplicate_cpe_collisions(
+            sbom, vex, recipe_refs, log, projected_refs=projected_alias_refs)
         _log(log, "note", "CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS: "
              "CPE collision projection enabled")
 
-    # The ordinary output keeps CPE-equal instances separate; the opt-in
-    # projection above merges only explained native groups. Any remaining
-    # indistinguishable duplicates retain their unresolved-collision warning.
-    collisions = identity_collisions(sbom, vex)
+    # Alias rows are a view, not independent build instances; collision
+    # diagnostics continue to describe only the underlying inventory.
+    collision_sbom = sbom
+    if projected_alias_refs:
+        collision_sbom = {**sbom, "components": [
+            component for component in sbom["components"]
+            if component.get("bom-ref") not in projected_alias_refs]}
+    collisions = identity_collisions(collision_sbom, vex)
     for collision in collisions:
         refs = ", ".join(collision["bomRefs"])
         cpes = ", ".join(collision["correlationCpes"])
@@ -2140,10 +2214,23 @@ def render(facts):
                               f"URI")
             holder["externalReferences"] = kept
 
-    if config.get("expand_cve_product_aliases"):
-        _expand_cve_product_aliases(sbom, recipe_refs)
-        _log(log, "note", "CYCLONEDX_EXPAND_CVE_PRODUCT_ALIASES: "
-             "CVE product alias projection enabled")
+    if (config.get("expand_cve_product_aliases")
+            and config.get("deduplicate_cpe_collisions")):
+        # Every projected edge must resolve after all absorption and reference
+        # rewriting, including file-owner dependencies and composition edges.
+        refs = {sbom_metadata["component"]["bom-ref"]}
+        refs.update(c["bom-ref"] for c in sbom["components"])
+        assert all(entry["ref"] in refs
+                   and set(entry.get("dependsOn") or []) <= refs
+                   for entry in sbom["dependencies"])
+        assert all(set(composition.get("assemblies") or []) <= refs
+                   for composition in sbom["compositions"])
+        prefix = (f"urn:cdx:{sbom['serialNumber'].removeprefix('urn:uuid:')}"
+                  f"/{sbom['version']}#")
+        assert all(affect.get("ref", "")[len(prefix):] in refs
+                   for statement in vex["vulnerabilities"]
+                   for affect in statement.get("affects") or []
+                   if affect.get("ref", "").startswith(prefix))
 
     if not profile:
         return {"sbom": sbom, "vex": vex}
