@@ -263,13 +263,16 @@ Imported and embedded SBOM component graphs are not deduplicated.
 ### CVE Product Alias Expansion (Opt-In)
 
 Set `CYCLONEDX_EXPAND_CVE_PRODUCT_ALIASES = "1"` for CPE-keyed tools
-that do not inspect `yocto:cve:*` properties. For a recipe with multiple
-`CVE_PRODUCT` tokens, each secondary product gains a projected component
-whose `cpe` carries that alias. A dependency edge from the alias to the
-logical component expresses the composition; the property
+that do not inspect `yocto:cve:*` properties. Every distinct secondary
+`CVE_PRODUCT` token of a recipe gains one projected component, regardless
+of how many `CVE_VERSION` values the recipe declares. Vendor-qualified tokens
+use the vendor as `group` and the bare product as `name`. Each projected row
+uses the first short correlation version in its `version` and `cpe` fields;
+the other CPE versions remain in its `yocto:cve:cpe` properties. A dependency
+edge from each alias to the logical component expresses the composition;
 `yocto:projection:cve-product-alias = "true"` identifies these view-only
-rows. The logical component remains the inventory and VEX anchor: aliases
-own no delivered files and receive no VEX statements.
+rows for filtering. The primary and logical components remain unchanged;
+aliases own no delivered files and receive no VEX statements.
 
 This flag defaults to `"0"` and changes no default output. Enabled output
 adds tooling-only components and is not a truthful inventory of separately
@@ -1120,6 +1123,12 @@ CYCLONEDX_TLP_MARKING = ""           # TLP marking (CLEAR|GREEN|AMBER|AMBER_AND_
 # Space-separated list of recipes to always include with scope "required",
 # even if they do not produce rootfs packages (default: "").
 CYCLONEDX_EXTRA_RUNTIME_RECIPES = ""
+
+# CPE-keyed tooling-only alias rows (default: "0"; not a truthful inventory
+# of separate builds). Filter projected rows by the
+# yocto:projection:cve-product-alias = "true" property.
+# Cannot be combined with CYCLONEDX_PROFILE.
+CYCLONEDX_EXPAND_CVE_PRODUCT_ALIASES = "0"
 
 # BSI TR-03183-2 alignment profile (default: "", no alignment output)
 CYCLONEDX_PROFILE = ""                    # or "tr03183-2.1"

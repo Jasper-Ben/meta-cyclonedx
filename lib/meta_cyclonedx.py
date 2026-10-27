@@ -1378,9 +1378,11 @@ def _expand_cve_product_aliases(sbom, recipe_refs):
                 vendor, separator, product = token.partition(":")
                 if not separator:
                     vendor, product = "*", token
-                cpe = next((value for value in cpes
-                            if value.startswith(
-                                f"cpe:2.3:*:{vendor or '*'}:{product}:{version}:")), None)
+                prefix = f"cpe:2.3:*:{vendor or '*'}:{product}:"
+                product_cpes = list(dict.fromkeys(
+                    value for value in cpes if value.startswith(prefix)))
+                cpe = next((value for value in product_cpes
+                            if value.startswith(f"{prefix}{version}:")), None)
                 if cpe is None:
                     continue
                 alias_ref = str(uuid.uuid4())
@@ -1390,9 +1392,14 @@ def _expand_cve_product_aliases(sbom, recipe_refs):
                     "version": version,
                     "bom-ref": alias_ref,
                     "cpe": cpe,
-                    "properties": [{"name": ALIAS_PROJECTION_PROPERTY,
-                                    "value": "true"}],
+                    "properties": [
+                        {"name": ALIAS_PROJECTION_PROPERTY, "value": "true"},
+                        *({"name": ALIAS_CPE_PROPERTY, "value": value}
+                          for value in product_cpes if value != cpe),
+                    ],
                 }
+                if separator and vendor:
+                    alias["group"] = vendor
                 sbom["components"].append(alias)
                 sbom["dependencies"].append(
                     {"ref": alias_ref, "dependsOn": [ref]})
