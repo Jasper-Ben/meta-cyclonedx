@@ -7,9 +7,11 @@
 The branch support policy for the BSI TR-03183-2 alignment capability is in
 [docs/release-branches.md](docs/release-branches.md).
 
-`meta-cyclonedx` is a [Yocto](https://www.yoctoproject.org/) meta-layer which
-produces [CycloneDX](https://cyclonedx.org/) Software Bill of Materials
-(aka [SBOMs](https://www.ntia.gov/SBOM)) from your target root filesystem.
+`meta-cyclonedx` is a [Yocto](https://www.yoctoproject.org/) meta-layer
+which produces [CycloneDX](https://cyclonedx.org/) Software Bill of
+Materials (aka [SBOMs](https://www.ntia.gov/SBOM)) for built images. Its
+graph includes delivered components and known dependencies at the delivery
+boundary; an alignment profile also inventories mandatory delivered files.
 
 ## Features
 
@@ -23,11 +25,11 @@ This layer generates **CycloneDX** compliant SBOMs with the following features:
 - Added generation of an additional CycloneDX VEX file which contains
   information on patched and ignored CVEs from within the OpenEmbedded build
   system.
-- Component scopes to differentiate between runtime (`required`) and build-time
-  (`optional`) dependencies, enabling per-use-case SBOM filtering.
+- Component scopes to distinguish delivered runtime components (`required`)
+  from known components outside the delivery item (`excluded`).
 - Include component licenses.
 - Added option to reduce the SBOM size by limiting SBOM collection to run-time
-  packages ([which might potentially come at some expense](#potentially-missing-packages-after-runtime-filtering))
+  packages ([which might potentially come at some expense](#potentially-missing-packages-after-run-time-filtering))
 - Optional BSI TR-03183-2 alignment profile with `report` and `strict`
   enforcement, publishing a machine-readable alignment report beside the SBOM
   and VEX ([guide](docs/alignment-profile.md)).
@@ -61,11 +63,15 @@ BBLAYERS += "${BSPDIR}/sources/meta-cyclonedx"
 > Starting with Wrynose the `CYCLONEDX_INCLUDE_UNPATCHED_VULNS` option requires
 > the `sbom-cve-check` class, see [sbom-cve-check Results](#sbom-cve-check-results).
 
-> **:warning: Breaking change in the release carrying TR-03183-2 alignment
-> support:** components are now named and versioned by creator-assigned
-> logical identity instead of CVE aliases, and CPE-equality deduplication is
-> removed; component names, versions, counts and references change in every
-> generated SBOM, with no compatibility mode. See the
+> **:warning: Default-output change with TR-03183-2 alignment support:**
+> recipe components use creator-assigned logical names and versions instead of
+> CVE aliases. Alias-generated components and CPE-equality merging are disabled
+> by default, but CPE-keyed tools can opt into
+> [alias expansion](#cve-product-alias-expansion-opt-in) and
+> [collision deduplication](#cpe-collision-deduplication-opt-in) render
+> projections. These lossy views do not restore the old identity model and
+> cannot be used with an alignment profile. Affected names, versions, counts
+> and references can change on upgrade. See the
 > [migration guidance](docs/migration/tr-03183-alignment.md).
 
 To enable and configure the layer simply inherit the `cyclonedx-export` class
@@ -85,10 +91,10 @@ CYCLONEDX_SPEC_VERSION = "1.7"  # Default - latest format
 # CYCLONEDX_SPEC_VERSION = "1.6"
 ```
 
-**Version differences:**
-
-- **1.6**: Modern format with enhanced metadata and timestamps
-- **1.7**: Latest version with advanced cryptography transparency (CBOM), intellectual property visibility, citations, and improved custom license handling (default)
+**Version differences:** Both 1.6 and 1.7 are supported. CycloneDX 1.7
+enables this layer's optional citations, licence details and TLP marking;
+support for the 1.7 schema does not imply that the layer generates every
+CycloneDX feature (see [unsupported advanced features](#unsupported-advanced-features)).
 
 ### Image Component Version
 
@@ -205,14 +211,15 @@ CYCLONEDX_CPE_UPDATE = "rc3"
 
 ### Runtime vs Build-time Packages
 
-By default, meta-cyclonedx will only include run-time packages in the SBOM,
-which drastically reduces the number of potentially irrelevant packages.
-However, this can lead to valid packages being omitted from the SBOM
-(see [here](#potentially-missing-packages-after-runtime-filtering)).
+By default, meta-cyclonedx selects recipes from installed runtime packages
+rather than the full build-time recipe set, reducing unrelated build-tool
+components. It still represents known dependencies through the first
+component outside the scope of delivery, as well as explicitly added recipes
+and contributed or embedded graphs. See
+[potentially missing packages](#potentially-missing-packages-after-run-time-filtering)
+for the limits of runtime selection.
 
-If preferred, you can add the following configuration setting
-(e.g in your local.conf), which will cause meta-cyclonedx to include
-all build-time packages as well:
+To include build-time recipes as well, set in `local.conf`:
 
 ```sh
 CYCLONEDX_RUNTIME_PACKAGES_ONLY = "0"
@@ -314,12 +321,13 @@ generates the document while building should order the task accordingly:
 addtask do_populate_cyclonedx after do_compile
 ```
 
-The components and dependency edges are merged into the image BOM verbatim.
-They already carry their own bom-refs, purls and dependency edges, so the CPE
-deduplication and the recipe-name dependency remapping applied to Yocto-derived
-components are deliberately skipped — those would corrupt an externally
-resolved tree. Duplicate `bom-ref`s (the same crate pulled in by two recipes)
-are dropped, keeping the first occurrence.
+Contributed components and dependency graphs keep their ecosystem identities:
+the renderer does not remap them by recipe name or merge them on CPE equality.
+Compatible instances already represented in the SBOM are reconciled using
+name, version, purl and noncontradictory instance evidence; their references
+and edges are remapped to the survivor. Conflicting instances remain separate,
+even when they share a `bom-ref`, so an alignment profile reports the
+ambiguous reference rather than silently deleting a component.
 
 The document's own root — `metadata.component`, the module the recipe builds —
 is carried over as a component too, and a dependency edge is added from the
@@ -364,11 +372,13 @@ Multiple image names are separated by spaces.
 
 **Merging behaviour:**
 
-- **Deduplication by CPE.** A component that exists in both SBOMs is kept
-  exactly once (the parent's copy wins). Dependency edges from both images
-  are preserved under the parent's `bom-ref`, so the dependency graph
-  remains complete. The surviving copy keeps the more significant of the two
-  scopes, ordered `required` > `optional` > `excluded`.
+- **Instance reconciliation, not CPE deduplication.** Matching name, version
+  and package purl nominate components for reconciliation; conflicting
+  artifact, build, dependency, licence or VEX evidence keeps instances
+  separate even when their CPEs match. Compatible instances retain the
+  parent's `bom-ref` and evidence from both images; dependency edges are
+  remapped to that ref. The surviving instance keeps the more significant
+  of the two scopes, ordered `required` > `optional` > `excluded`.
 - **Unique components** from the included image are added to the parent SBOM
   with `scope = "required"`, unless they already declare a scope of their own.
 - **The included image itself** appears as an additional `firmware` component
@@ -406,8 +416,10 @@ The link paths can be customized with `CYCLONEDX_EXPORT_SBOM_LINK` and
 `CYCLONEDX_EXPORT_VEX_LINK`, or disabled by setting them to an empty string.
 Neither affects cross-image lookup. The included image can use a different
 `IMAGE_BASENAME`, `IMAGE_NAME_SUFFIX`, timestamp or export directory.
-If its internal image data is missing, a warning is emitted and the image
-is skipped without failing the export.
+If its internal image data is missing or unreadable, the image remains a
+firmware component with unknown version; a warning and, under an alignment
+profile, a composition finding expose the missing evidence. Its component
+graph cannot be imported without the document.
 
 ### Logical Component Identity
 
@@ -424,8 +436,11 @@ CYCLONEDX_COMPONENT_NAME = "upstream-widget"
 CYCLONEDX_COMPONENT_VERSION = "2.4.1"
 ```
 
-`CVE_PRODUCT` and `CVE_VERSION` are vulnerability-correlation aliases
-only: they never create or rename components. Every whitespace-separated
+`CVE_PRODUCT` and `CVE_VERSION` are vulnerability-correlation aliases, not
+logical component identities. By default they do not create or rename
+components; with [alias expansion](#cve-product-alias-expansion-opt-in),
+distinct secondary product CPEs can produce marked tooling-only rows, not
+additional logical component instances. Every whitespace-separated
 alias token (including `vendor:`-qualified tokens, which qualify the
 correlation CPE) remains available in the component's
 `yocto:cve:product`, `yocto:cve:version` and `yocto:cve:cpe` properties,
@@ -433,11 +448,11 @@ so all aliases keep reaching CVE and VEX matching. The Yocto/package
 identity of the build stays in the component purl (`pkg:yocto/...`,
 OpenEmbedded's purl prefix) alongside the logical identity.
 
-The component's single `cpe` uses the first declared `CVE_PRODUCT` token
-crossed with the first declared `CVE_VERSION` token; repeated aliases are
-deduplicated without changing declaration order in the properties.
-Other aliases remain available for in-layer vulnerability matching, but
-CPE-keyed external tools match the selected `cpe` field only.
+Each logical component's single `cpe` uses the first declared `CVE_PRODUCT`
+token crossed with the first declared `CVE_VERSION` token; repeated aliases
+are deduplicated without changing declaration order in the properties.
+Other aliases remain available for in-layer vulnerability matching. Without
+alias expansion, CPE-keyed external tools match only the selected `cpe` field.
 
 By default, two component instances that share a CPE are never deduplicated:
 they remain separate while their artifact, build, dependency, licence or
@@ -447,15 +462,16 @@ build warning. The opt-in CPE tooling projection described above may merge
 explained native instances, but never indistinguishable duplicates. Backported
 fixes are recorded as VEX statements and never
 change the logical component version. See
-`docs/migration/component-identity-cutover.md` for the breaking change
-history.
+`docs/migration/component-identity-cutover.md` for the default-output change
+and opt-in projection options.
 
 ### Dependency Graph
 
-The primary component (the delivered product) is the root of the
-dependency graph, and every component in the SBOM carries a `bom-ref`
-and exactly one `dependencies` entry - leaves with an empty list, so a
-machine can tell a known leaf apart from lost edges.
+The primary component (the delivered product) is the root of the dependency
+graph. Every generated component has a `bom-ref` and a `dependencies` entry
+(an empty list for known leaves). Malformed imported graphs retain their
+unresolved references for the alignment report rather than being silently
+repaired.
 
 Known dependency recipes outside the scope of delivery are no longer
 pruned: each path is followed to the first component outside the
@@ -486,12 +502,12 @@ states it, strict enforcement fails on it. See
 
 ### Component Scopes
 
-When including both runtime and build-time packages, meta-cyclonedx uses
-[CycloneDX component scopes](https://cyclonedx.org/docs/1.6/json/#components_items_scope)
-to differentiate between them:
+When enabled, [CycloneDX component scopes](https://cyclonedx.org/docs/1.6/json/#components_items_scope)
+express the scope of delivery:
 
-- Runtime packages are marked with `"scope": "required"`
-- Build-time only packages are marked with `"scope": "optional"`
+- Delivered runtime components are marked `"scope": "required"`.
+- Build-time-only or known external dependency components are marked
+  `"scope": "excluded"`; they are not delivered runtime content.
 
 This allows tools to filter components based on their use case:
 
@@ -577,9 +593,9 @@ You may choose to exclude license information from your SBOM:
 CYCLONEDX_ADD_COMPONENT_LICENSES = "0"
 ```
 
-The licenses data is taken from the component recipe
-(see [LICENSE](https://docs.yoctoproject.org/singleindex.html#term-LICENSE).
-Single licenses are matched against a list of [known SPDX licenses](/https://github.com/iris-GmbH/meta-cyclonedx/tree/main/meta/files/spdx-license-list-data)
+The licence data comes from the component recipe (see
+[LICENSE](https://docs.yoctoproject.org/singleindex.html#term-LICENSE)).
+Single licences are matched against the [vendored SPDX licence lists](meta/files/spdx-license-list-data/)
 where possible.
 
 These are original licence evidence only - the licences the component
@@ -981,16 +997,15 @@ though no root-filesystem package manifest names it. Because image
 assembly finishes after `do_rootfs`, the artifact bytes are not final
 during the document generation inside `do_rootfs`; hashing them there
 would chase a moving target. Image recipes with a profile therefore
-generate the final documents once more in `do_deploy_cyclonedx`, which
-now runs after `do_image_complete`: there the primary artifact's content is
-final, its bytes are hashed, and the entry joins the same file-
-inventory facts (`source: deployable`, owned by the primary component
-under the recipe-less facts key). Names come from the stable
-`${IMAGE_LINK_NAME}.<IMAGE_FSTYPES>` lineage (the same lineage the
-export basename follows), never the `DATETIME`-stamped filenames, and
-hashes cover content only - equivalent rebuilds, including
-sstate-restored artifacts under a fresh build stamp, reproduce identical
-inventories.
+regenerate documents in `do_deploy_cyclonedx` after `do_image_complete`,
+including the primary artifact's SHA-512 and file-inventory facts
+(`source: deployable`, owned by the primary component). A restored
+document can still carry an older digest if the image is republished in
+the same invocation; `do_cyclonedx_verify` compares recorded hashes with
+the final deployed bytes and corrects only differing hashes before the
+documents are consumed. File references use the stable
+`${IMAGE_LINK_NAME}.<IMAGE_FSTYPES>` lineage rather than `DATETIME`-stamped
+filenames. Hashes represent the actual bytes and can differ between builds.
 
 ```python
 # Explicitly selected additional deployed files (default: "").
@@ -1018,59 +1033,28 @@ deployable and selected file.
 
 ### Minimal SBOM Configuration
 
-Meta-cyclonedx supports generating a **minimal SBOM** that includes only the essential information required by the CycloneDX specification. This is useful for:
-
-- Reducing SBOM file size
-- Compliance with minimal SBOM requirements
-- Fast SBOM generation
-- Environments with strict data minimization policies
-
-#### What's Included in a Minimal SBOM
-
-The minimal SBOM always contains:
-
-**Component Information:**
-
-- `name` - Component name
-- `version` - Component version
-- `type` - Component type (typically "library")
-- `bom-ref` - Unique reference identifier
-
-**Identifiers:**
-
-- `cpe` - Common Platform Enumeration for vulnerability matching
-- `purl` - Package URL for package identification
-
-**Relationships:**
-
-- `dependencies` - Component dependency graph
-
-**Metadata:**
-
-- `bomFormat`, `specVersion`, `serialNumber`, `version`
-- `timestamp` - SBOM generation time
-- `tools` - SBOM generation tool information
-
-**VEX (Vulnerability Exploitability Exchange):**
-
-- `vulnerabilities` - CVE status information (patched/ignored)
-
-#### Minimal Configuration Example
-
-To generate a minimal SBOM, disable all optional features:
+To reduce optional metadata, keep the default runtime recipe selection and
+disable the fields you do not need:
 
 ```sh
 INHERIT += "cyclonedx-export"
-
-# Use minimal configuration
-CYCLONEDX_SPEC_VERSION = "1.7"           # or "1.6"
-CYCLONEDX_RUNTIME_PACKAGES_ONLY = "1"    # Runtime packages only
-CYCLONEDX_ADD_COMPONENT_SCOPES = "0"     # Disable scope marking
-CYCLONEDX_ADD_VULN_TIMESTAMPS = "0"      # Disable VEX timestamps
-CYCLONEDX_ADD_COMPONENT_LICENSES = "0"   # Exclude licenses
+CYCLONEDX_RUNTIME_PACKAGES_ONLY = "1"
+CYCLONEDX_ADD_COMPONENT_SCOPES = "0"
+CYCLONEDX_ADD_VULN_TIMESTAMPS = "0"
+CYCLONEDX_ADD_COMPONENT_LICENSES = "0"
+CYCLONEDX_ADD_LAYER_REFERENCES = "0"
+CYCLONEDX_ADD_LICENSE_DETAILS = "0"
+CYCLONEDX_ADD_CITATION = "0"
 ```
 
-This produces the smallest valid CycloneDX SBOM with only essential vulnerability and package information.
+The SBOM still represents selected components, known dependency-boundary
+components and their graph. Generated recipe components carry package purls;
+their CPEs reflect available correlation aliases, while primary and imported
+components need not carry either identifier. A separate VEX document is still
+generated and may have no vulnerability statements. This example does not
+guarantee the smallest valid document or satisfy an alignment profile's
+evidence requirements; selecting a profile also activates its mandatory file
+inventory.
 
 ### Advanced Configuration Summary
 
@@ -1086,7 +1070,8 @@ CYCLONEDX_IMAGE_VERSION = "${DISTRO_VERSION}${IMAGE_VERSION_SUFFIX}"
 # Value must be a valid CycloneDX specified type (default: "firmware").
 CYCLONEDX_IMAGE_TYPE = "firmware"
 
-# Include build-time packages (default: "1" = runtime only)
+# Select installed runtime recipes by default; "0" adds build-time recipes.
+# Known dependencies at the delivery boundary remain represented either way.
 CYCLONEDX_RUNTIME_PACKAGES_ONLY = "1"
 
 # Add component scopes (default: "1")
@@ -1208,7 +1193,7 @@ By default the final CycloneDX SBOM and VEX files are saved to the same folder
 as the corresponding image file(s) (`${DEPLOY_DIR_IMAGE}`), using a filename suffix of
 `.cyclonedx.bom.json` and `.cyclonedx.vex.json` respectively.
 
-## Uploading to DependencyTrack (tested against DT v4.11.4)
+## Uploading to Dependency-Track
 
 While this layer does not offer a direct integration with DependencyTrack
 (we consider that a feature, since it removes dependencies to external
@@ -1221,20 +1206,22 @@ If your DependencyTrack instance is older than that, set
 `CYCLONEDX_SPEC_VERSION = "1.6"` — older versions will reject the default
 1.7 output outright.
 
-At the time of writing DependencyTrack does not support uploading component
-and vulnerability information in one go (which is why we currently create a
-separate `vex.json` file). The status on supporting this may be tracked
-[here](https://github.com/DependencyTrack/dependency-track/issues/919).
+The layer publishes an SBOM and a separate VEX document. For the
+Dependency-Track workflow below, upload the SBOM and then apply the VEX.
+Handling patches directly from BOM pedigree is a distinct
+[upstream request](https://github.com/DependencyTrack/dependency-track/issues/919).
 
-### Manual Upload
+### Import workflow
 
-1. Go into an existing project in your DependencyTrack instance or create a new
-   one.
-2. Go to the _Components_ tab and click _Upload BOM_.
-3. Select the `bom.json` file from your deploy directory.
-4. Wait for the vulnerability analysis to complete.
-5. Go to the _Audit Vulnerabilities_ tab and click _Apply VEX_.
-6. Select the `vex.json` file from your deploy directory.
+1. Open or create the target project and upload the deployed SBOM (default
+   image link `${IMAGE_LINK_NAME}.cyclonedx.bom.json`) through its BOM import
+   action. In Dependency-Track 5.1, upload is in the project header
+   ([release notes](https://dependencytrack.org/news/dependency-track-5-1/)).
+2. Wait until vulnerability analysis creates findings. VEX import applies
+   decisions to existing findings; it does not create findings.
+3. Import the deployed VEX (default image link
+   `${IMAGE_LINK_NAME}.cyclonedx.vex.json`) for the same project using
+   [the VEX import API](https://dependencytrack.github.io/docs/next/reference/vex-and-vdr/#import).
 
 ### Automated Upload
 
@@ -1277,12 +1264,12 @@ prerequisites and the deployed-artifact checks are described in
 
 ### Potentially Missing Packages After Run-time Filtering
 
-We use the `image_list_installed_packages` function from upstream
-OpenEmbedded as a means to reduce the SBOM contents to packages that are added
-to the final resulting rootfs. This drastically reduces the "noise" generated
-by CVEs in build-time dependencies. This however comes with some potential
-downsides (i.e. Missing some packages), as discussed
-[here](https://github.com/savoirfairelinux/meta-cyclonedx/issues/9#issue-2494183505).
+The layer uses OpenEmbedded's `image_list_installed_packages` to select
+runtime recipe fragments without pulling in the entire build-time recipe
+set. Known dependency paths still reach the first component outside the
+scope of delivery, but build-time recipes not otherwise delivered or
+referenced may be omitted. Explicit runtime recipes and contributed BOMs
+can fill deliberate gaps; see the [upstream discussion](https://github.com/savoirfairelinux/meta-cyclonedx/issues/9#issue-2494183505).
 
 ### Missing Dependencies with Modern Programming Languages
 
