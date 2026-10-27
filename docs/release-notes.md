@@ -44,6 +44,12 @@ carry only what the
   report is alignment evidence for the manufacturer's own
   determination; it is not an approval and decides nothing itself. See the
   [alignment profile guide](alignment-profile.md).
+- **Opt-in CPE collision deduplication** (`CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS
+  = "1"`): merge explained native-recipe CPE twins for CPE-keyed tooling,
+  selecting the lowest-purl survivor and remapping dependency and VEX
+  references. Enabled output is a lossy projection, not a truthful
+  per-instance inventory; alignment profiles reject the flag at parse time.
+  The default output remains unchanged.
 - **File inventory**: delivered executables, archives and the primary
   deployable artifact are represented as file components with SHA-512
   artifact identities; `CYCLONEDX_ADDITIONAL_FILES` selects further

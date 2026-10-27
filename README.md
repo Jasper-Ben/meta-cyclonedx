@@ -238,6 +238,23 @@ Multiple recipe names are separated by spaces. Each listed recipe must have
 already run `do_populate_cyclonedx` during the build, otherwise an error is
 raised and the recipe is skipped.
 
+### CPE Collision Deduplication (Opt-In)
+
+For CPE-keyed vulnerability tools, set
+`CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS = "1"` to merge native recipe
+components that share correlation CPEs **and** have distinguishable
+artifact, build, dependency, licence, package or VEX evidence. It defaults
+to `"0"`; indistinguishable duplicates remain separate and are reported.
+The component with the lexicographically lowest package purl survives.
+Its dependency, VEX and delivered-file ownership references absorb those
+of the other components, and a build-log note names each merge.
+
+This is a tooling projection, not a truthful inventory of separate build
+instances: the identities and per-instance distinctions of absorbed
+components are no longer present in the output. It cannot be combined
+with `CYCLONEDX_PROFILE`; that configuration fails at parse time.
+Imported and embedded SBOM component graphs are not deduplicated.
+
 ### Recipe-contributed CycloneDX Fragments
 
 Language ecosystems that resolve their own dependency trees — cargo, npm, go —

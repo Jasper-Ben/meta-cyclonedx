@@ -259,12 +259,14 @@ def image_purl(base_purl, layer_version=None, repository_url=None):
     return base_purl + "?" + "&".join(qualifiers)
 
 
-def config_errors(spec_version, image_type, image_cpe=None, profile=None, enforcement=None):
+def config_errors(spec_version, image_type, image_cpe=None, profile=None,
+                  enforcement=None, deduplicate_cpe_collisions=False):
     """
     Validate renderer-relevant configuration and return a human-readable
     fatal error string, or None when the configuration is supported. The
     image_cpe carries the optional CYCLONEDX_IMAGE_CPE override. An absent
     profile keeps the plain output; strict enforcement requires a profile.
+    The opt-in CPE collision projection cannot coexist with a profile.
     """
     matrix = _alignment_profile()
     if profile:
@@ -278,6 +280,9 @@ def config_errors(spec_version, image_type, image_cpe=None, profile=None, enforc
                 f"{', '.join(baseline['specVersions'])}; CYCLONEDX_SPEC_VERSION "
                 f"'{spec_version}' is an unsupported profile/schema combination"
             )
+    if profile and deduplicate_cpe_collisions:
+        return ("CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS cannot be enabled "
+                "with CYCLONEDX_PROFILE; projected output is not alignment evidence")
 
     if spec_version not in SUPPORTED_SPEC_VERSIONS:
         return (f"Unsupported CYCLONEDX_SPEC_VERSION: {spec_version}. "
@@ -1335,6 +1340,117 @@ def _merge_instance_evidence(existing, incoming, add_scopes):
             existing[key] = copy.deepcopy(value)
 
 
+def _deduplicate_cpe_collisions(sbom, vex, recipe_refs, log):
+    """Project only explained collisions of native recipe components."""
+    native_refs = {ref for refs in recipe_refs.values() for ref in refs}
+    native_components = [c for c in sbom["components"]
+                         if c.get("bom-ref") in native_refs]
+    collisions = identity_collisions(
+        {"components": native_components, "dependencies": sbom["dependencies"]},
+        vex)
+    components_by_ref = {c["bom-ref"]: c for c in native_components}
+    remap = {}
+    for group in collisions:
+        if not group["explained"]:
+            continue
+        members = [components_by_ref[ref] for ref in group["bomRefs"]]
+        # Missing/ambiguous package coordinates must not make a random
+        # bom-ref the tie breaker.
+        purls = [member.get("purl") for member in members]
+        if not all(purls) or len(set(purls)) != len(purls):
+            _log(log, "warn", "CPE collision has no distinct package purls; "
+                 "kept separate")
+            continue
+        survivor = min(members, key=lambda member: member["purl"])
+        for member in members:
+            if member is survivor:
+                continue
+            remap[member["bom-ref"]] = survivor["bom-ref"]
+            existing = survivor.setdefault("properties", [])
+            for prop in member.get("properties") or []:
+                if prop.get("name") in (ALIAS_PRODUCT_PROPERTY,
+                                        ALIAS_VERSION_PROPERTY,
+                                        ALIAS_CPE_PROPERTY) and prop not in existing:
+                    existing.append(prop)
+            _log(log, "note", "CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS: "
+                 f"merged {member.get('purl')} into {survivor['purl']}")
+
+    if not remap:
+        return
+    sbom["components"] = [c for c in sbom["components"]
+                          if c.get("bom-ref") not in remap]
+    # Both owner and target edges are rewritten, including native owners of
+    # delivered file components and the primary component's install edges.
+    rewritten = []
+    by_ref = {}
+    for entry in sbom["dependencies"]:
+        owner = remap.get(entry["ref"], entry["ref"])
+        output = by_ref.get(owner)
+        if output is None:
+            output = {**entry, "ref": owner, "dependsOn": []}
+            rewritten.append(output)
+            by_ref[owner] = output
+        for ref in entry.get("dependsOn") or []:
+            target = remap.get(ref, ref)
+            if target != owner and target not in output["dependsOn"]:
+                output["dependsOn"].append(target)
+    sbom["dependencies"] = rewritten
+
+    # Composition assemblies are references too. Distinct native instances
+    # now name the same assembly, without changing imported assemblies.
+    assemblies = set()
+    compositions = []
+    for composition in sbom.get("compositions") or []:
+        refs = [remap.get(ref, ref) for ref in composition.get("assemblies") or []]
+        refs = list(dict.fromkeys(refs))
+        if len(refs) == 1 and refs[0] in assemblies:
+            continue
+        assemblies.update(refs)
+        compositions.append({**composition, "assemblies": refs})
+    sbom["compositions"] = compositions
+
+    # Serial substitution already happened; only refs in this SBOM's own
+    # serial namespace can name an absorbed native instance.
+    prefix = f"urn:cdx:{sbom['serialNumber'].removeprefix('urn:uuid:')}/{sbom['version']}#"
+    survivor_targets = {prefix + ref for ref in remap.values()}
+    analyses = {}
+    statements = []
+    for statement in vex["vulnerabilities"]:
+        affects = []
+        for affect in statement.get("affects") or []:
+            ref = affect.get("ref", "")
+            if ref.startswith(prefix):
+                ref = prefix + remap.get(ref[len(prefix):], ref[len(prefix):])
+            target = {**affect, "ref": ref}
+            if target not in affects:
+                affects.append(target)
+        projected_targets = {affect.get("ref") for affect in affects} & survivor_targets
+        key = _vex_statement_key(statement)
+        existing = next((row for targets, row in analyses.get(key, [])
+                         if projected_targets & targets), None)
+        if existing is None:
+            existing = {**statement, "affects": affects}
+            statements.append(existing)
+            if projected_targets:
+                analyses.setdefault(key, []).append((projected_targets, existing))
+        else:
+            existing["affects"].extend(
+                affect for affect in affects if affect not in existing["affects"])
+    vex["vulnerabilities"] = statements
+
+    # Do not conceal pre-existing malformed fragments/imported documents;
+    # only assert that no removed reference remains in a projected document.
+    assert all(entry["ref"] not in remap and
+               not any(ref in remap for ref in entry.get("dependsOn") or [])
+               for entry in sbom["dependencies"])
+    assert all(not any(ref in remap for ref in composition.get("assemblies") or [])
+               for composition in sbom["compositions"])
+    assert all(not any(affect.get("ref", "").startswith(prefix)
+                       and affect["ref"][len(prefix):] in remap
+                       for affect in statement.get("affects") or [])
+               for statement in statements)
+
+
 def render(facts):
     """
     Render the SBOM and VEX documents from normalized build facts.
@@ -1989,12 +2105,14 @@ def render(facts):
 
     # Sort vulnerabilities by CVE id for a stable, human-readable order.
     vex["vulnerabilities"].sort(key=lambda v: v["id"])
+    if config.get("deduplicate_cpe_collisions"):
+        _deduplicate_cpe_collisions(sbom, vex, recipe_refs, log)
+        _log(log, "note", "CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS: "
+             "CPE collision projection enabled")
 
-    # CPE equality never authorizes deduplication; ambiguous identity
-    # collisions are reported instead. Explainable groups (distinct
-    # artifact, build, dependency, licence or vulnerability evidence) are
-    # deliberately separate instances; indistinguishable duplicates are
-    # an unresolved collision.
+    # The ordinary output keeps CPE-equal instances separate; the opt-in
+    # projection above merges only explained native groups. Any remaining
+    # indistinguishable duplicates retain their unresolved-collision warning.
     collisions = identity_collisions(sbom, vex)
     for collision in collisions:
         refs = ", ".join(collision["bomRefs"])

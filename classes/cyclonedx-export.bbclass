@@ -171,6 +171,10 @@ CYCLONEDX_ADD_CITATION ??= "1"
 # See: https://www.first.org/tlp/
 CYCLONEDX_TLP_MARKING ??= ""
 
+# Opt-in render-phase tooling projection: merge only explained native-recipe
+# collisions by correlation CPE. Never compatible with an alignment profile.
+CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS ??= "0"
+
 # Versioned BSI TR-03183-2 alignment profile; empty (default) keeps the
 # plain SBOM/VEX output. Supported: "tr03183-2.1", whose profile baseline
 # is BSI TR-03183-2 v2.1.0 plus the BSI CycloneDX property taxonomy v0.1.2
@@ -276,7 +280,8 @@ python () {
         d.getVar("CYCLONEDX_SPEC_VERSION"), d.getVar("CYCLONEDX_IMAGE_TYPE"),
         d.getVar("CYCLONEDX_IMAGE_CPE"),
         profile=d.getVar("CYCLONEDX_PROFILE"),
-        enforcement=d.getVar("CYCLONEDX_PROFILE_ENFORCEMENT"))
+        enforcement=d.getVar("CYCLONEDX_PROFILE_ENFORCEMENT"),
+        deduplicate_cpe_collisions=d.getVar("CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS") == "1")
     if error:
         bb.fatal(error)
 }
@@ -1803,6 +1808,8 @@ def export_cyclonedx(d, deploy_phase=False):
             "sbom_serial_placeholder": d.getVar('CYCLONEDX_SBOM_SERIAL_PLACEHOLDER'),
             "profile": d.getVar('CYCLONEDX_PROFILE') or "",
             "enforcement": d.getVar('CYCLONEDX_PROFILE_ENFORCEMENT') or "report",
+            "deduplicate_cpe_collisions": d.getVar(
+                'CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS') == "1",
         },
         "timestamp": timestamp,
         "sbom_creator": d.getVar('CYCLONEDX_SBOM_CREATOR') or "",
@@ -1900,7 +1907,8 @@ do_rootfs[postfuncs] += "collect_cyclonedx_file_inventory"
 export_cyclonedx[vardeps] += "CYCLONEDX_EXPORT_SBOM CYCLONEDX_EXPORT_VEX \
     CYCLONEDX_EXPORT_SBOM_LINK CYCLONEDX_EXPORT_VEX_LINK \
     CYCLONEDX_EXPORT_ALIGNMENT_REPORT CYCLONEDX_EXPORT_ALIGNMENT_REPORT_LINK \
-    CYCLONEDX_PROFILE CYCLONEDX_PROFILE_ENFORCEMENT"
+    CYCLONEDX_PROFILE CYCLONEDX_PROFILE_ENFORCEMENT \
+    CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS"
 export_cyclonedx[vardeps] += "CYCLONEDX_ADDITIONAL_FILES"
 export_cyclonedx[vardepsexclude] += "DATETIME IMAGE_NAME"
 # collect_deploy_files reads IMAGE_NAME only to derive the stable link
