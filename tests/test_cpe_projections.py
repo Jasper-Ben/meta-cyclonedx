@@ -139,6 +139,33 @@ def test_duplicate_products_and_multiple_versions_keep_one_row_per_product():
     }
 
 
+def test_bare_and_wildcard_vendor_tokens_project_one_row_per_cpe():
+    gcc_cpe = "cpe:2.3:*:*:gcc:6.6:*:*:*:*:*:*:*"
+    vendor_cpe = "cpe:2.3:*:acme:gcc:6.6:*:*:*:*:*:*:*"
+    for tokens, expected_group in (
+            (("gcc", "*:gcc"), None),
+            (("*:gcc", "gcc"), "*")):
+        facts = alias_facts(expand_cve_product_aliases=True)
+        logical = facts["fragments"]["kernel"]["pkgs"][0]
+        logical["properties"].extend(
+            {"name": "yocto:cve:product", "value": token}
+            for token in (*tokens, "acme:gcc"))
+        logical["properties"].extend([
+            {"name": "yocto:cve:cpe", "value": gcc_cpe},
+            {"name": "yocto:cve:cpe", "value": vendor_cpe},
+        ])
+
+        sbom, _vex, _logs = render_docs(facts)
+        aliases = [component for component in sbom["components"]
+                   if {"name": "yocto:projection:cve-product-alias",
+                       "value": "true"} in component.get("properties", [])]
+        assert [(alias["cpe"], alias.get("group")) for alias in aliases] == [
+            (ALIAS_CPE, None), (gcc_cpe, expected_group), (vendor_cpe, "acme")]
+        assert all(next(entry for entry in sbom["dependencies"]
+                        if entry["ref"] == alias["bom-ref"])["dependsOn"]
+                   == ["ref-kernel"] for alias in aliases)
+
+
 def test_expansion_preserves_primary_included_imported_and_embedded_graphs():
     from helpers import document, vex_document
 
