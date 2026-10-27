@@ -242,12 +242,17 @@ raised and the recipe is skipped.
 
 For CPE-keyed vulnerability tools, set
 `CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS = "1"` to merge native recipe
-components that share correlation CPEs **and** have distinguishable
-artifact, build, dependency, licence, package or VEX evidence. It defaults
-to `"0"`; indistinguishable duplicates remain separate and are reported.
-The component with the lexicographically lowest package purl survives.
-Its dependency, VEX and delivered-file ownership references absorb those
-of the other components, and a build-log note names each merge.
+components in transitively connected shared-CPE groups **only when** every
+member has distinguishable artifact, build, dependency, licence or VEX
+evidence. Different package purls or correlation aliases alone do not
+distinguish build instances. It defaults to `"0"`; indistinguishable
+duplicates remain separate and retain their unresolved-collision warning
+even when enabled. Each independent group keeps the component with the
+lexicographically lowest package purl; equal or absent purls are resolved
+by stable component evidence. The survivor
+keeps every member's correlation-alias properties, while its dependency, VEX
+and delivered-file ownership references absorb those of the other components.
+A build-log note names each merge.
 
 This is a tooling projection, not a truthful inventory of separate build
 instances: the identities and per-instance distinctions of absorbed
@@ -419,11 +424,13 @@ deduplicated without changing declaration order in the properties.
 Other aliases remain available for in-layer vulnerability matching, but
 CPE-keyed external tools match the selected `cpe` field only.
 
-Two component instances that share a CPE are never deduplicated: they
-remain separate while their artifact, build, dependency, licence or
+By default, two component instances that share a CPE are never deduplicated:
+they remain separate while their artifact, build, dependency, licence or
 vulnerability evidence differs; indistinguishable duplicates produce a
 `REQ-IDEN-001` alignment finding (see the alignment profile below) and a
-build warning. Backported fixes are recorded as VEX statements and never
+build warning. The opt-in CPE tooling projection described above may merge
+explained native instances, but never indistinguishable duplicates. Backported
+fixes are recorded as VEX statements and never
 change the logical component version. See
 `docs/migration/component-identity-cutover.md` for the breaking change
 history.
