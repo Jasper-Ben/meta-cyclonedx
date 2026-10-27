@@ -3,10 +3,57 @@
 # SPDX-FileCopyrightText: Copyright (C) 2024 Savoir-faire Linux Inc. (<www.savoirfairelinux.com>).
 # SPDX-FileCopyrightText: Copyright (C) 2026 iris-GmbH infrared & intelligent sensors.
 
-# The product name that the CVE database uses.  Defaults to BPN, but may need to
-# be overriden per recipe (for example tiff.bb sets CVE_PRODUCT=libtiff).
+# Vulnerability-correlation aliases only (ADR-0006, ADR-0009): whitespace-
+# separated CVE_PRODUCT and CVE_VERSION values are used to match components
+# against CVE databases and CPEs; they never create or rename components.
+# Defaults to BPN and PV, but may need to be overriden per recipe (for
+# example tiff.bb sets CVE_PRODUCT=libtiff). Vendor-qualified tokens
+# ("vendor:name") carry the vendor into the correlation CPE.
 CVE_PRODUCT ??= "${BPN}"
 CVE_VERSION ??= "${PV}"
+
+# Logical component identity override: the creator-assigned upstream name
+# and version of the recipe's component. An explicit value takes
+# precedence verbatim; when empty, the renderer defaults to BPN and the
+# short PV, used only when they are semantically valid (degenerate values
+# degrade to the "unknown" placeholder). CVE_PRODUCT/CVE_VERSION remain
+# vulnerability-correlation aliases either way. See
+# docs/migration/component-identity-cutover.md.
+CYCLONEDX_COMPONENT_NAME ??= ""
+CYCLONEDX_COMPONENT_VERSION ??= ""
+
+# Creator evidence. CYCLONEDX_SBOM_CREATOR names the entity responsible
+# for compiling the SBOM and CYCLONEDX_PRIMARY_COMPONENT_CREATOR the
+# product manufacturer as creator of the delivered product; both use the
+# contact grammar "NAME <email-or-url>", "<URL>", a bare email address
+# or a bare URL, with ';' separating multiple contacts. The product
+# manufacturer is never applied to third-party components.
+CYCLONEDX_SBOM_CREATOR ??= ""
+CYCLONEDX_PRIMARY_COMPONENT_CREATOR ??= ""
+# Recipe-scoped creator override, taking precedence over the upstream
+# repository identity recorded in the component metadata (upstream purl
+# or fetcher-recorded vcs reference); set it where that evidence is
+# absent or wrong.
+CYCLONEDX_COMPONENT_CREATOR ??= ""
+# Explicit source and deployable URIs. URIs are emitted only from these
+# overrides or from metadata the layer already records (SRC_URI-derived
+# references, layer revisions), and only when syntactically valid.
+CYCLONEDX_COMPONENT_SOURCE_URI ??= ""
+CYCLONEDX_COMPONENT_DEPLOYABLE_URI ??= ""
+CYCLONEDX_PRIMARY_COMPONENT_SOURCE_URI ??= ""
+CYCLONEDX_PRIMARY_COMPONENT_DEPLOYABLE_URI ??= ""
+
+# Licence role evidence. Recipe LICENSE metadata is original licence
+# evidence only (creator-assigned). A distribution licence - the licence
+# under which recipients may use a component - has a semantically
+# authoritative source: CYCLONEDX_DISTRIBUTION_LICENCE. The effective
+# licence - the licence under which the creator of the SBOM uses a
+# component - is optional and only rides CYCLONEDX_EFFECTIVE_LICENCE.
+# Both are SPDX licence expressions, honoured in recipe scope (for the
+# components built here) and in image scope (for the delivered product);
+# no licence role is ever inferred from another.
+CYCLONEDX_DISTRIBUTION_LICENCE ??= ""
+CYCLONEDX_EFFECTIVE_LICENCE ??= ""
 
 # Defines SBOM_CVE_CHECK_DEPLOY_DB_DIR, used by the kernel CVE filtering below
 # to find the cvelist database deployed by sbom-cve-check-update-cvelist-native.
@@ -112,6 +159,42 @@ CYCLONEDX_ADD_CITATION ??= "1"
 # See: https://www.first.org/tlp/
 CYCLONEDX_TLP_MARKING ??= ""
 
+# Opt-in render-phase tooling projection: merge only explained native-recipe
+# collisions by correlation CPE. Never compatible with an alignment profile.
+CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS ??= "0"
+
+# Opt-in view for CPE-keyed tooling: project secondary recipe CVE products
+# as alias components. Logical component remains the inventory/VEX anchor.
+CYCLONEDX_EXPAND_CVE_PRODUCT_ALIASES ??= "0"
+
+# Versioned BSI TR-03183-2 alignment profile; empty (default) keeps the
+# plain SBOM/VEX output. Supported: "tr03183-2.1", whose profile baseline
+# is BSI TR-03183-2 v2.1.0 plus the BSI CycloneDX property taxonomy v0.1.2
+# evaluated against CycloneDX 1.6 or 1.7. The profile applies TR-03183-2
+# mappings and checks without claiming conformance; the project-owned
+# requirements matrix lives in lib/alignment_profile.py.
+CYCLONEDX_PROFILE ??= ""
+
+# Alignment enforcement for the selected profile: "report" publishes the
+# SBOM, the separate VEX and the adjacent alignment report even when
+# requirements are unmet or unverifiable; "strict" fails the build on every
+# machine-detectable violation or missing required assertion. Neither mode
+# makes a conformance claim. Requires CYCLONEDX_PROFILE to be set.
+CYCLONEDX_PROFILE_ENFORCEMENT ??= "report"
+
+# Explicitly selected additional deployed files (alignment profile
+# only): whitespace-separated shell-style globs (fnmatch; `*` crosses
+# directory boundaries) matched against paths relative to the image
+# deploy directory ${DEPLOY_DIR_IMAGE}; a leading "/" anchors there too.
+# For kernel, bootloader, firmware, TEE, initramfs, embedded-image and
+# other product payloads that package manifests do not cover.
+# Selected files become file components under the same classification,
+# SHA-512 identity and graph rules as root-filesystem files; a
+# selection that resolves to nothing is an alignment finding, never
+# silently skipped. The primary deployable artifact is inventoried
+# under the profile regardless of this setting (ADR-0005).
+CYCLONEDX_ADDITIONAL_FILES ??= ""
+
 CYCLONEDX_TMP_EXPORT_DIR = "${WORKDIR}/cyclonedx-export"
 CYCLONEDX_EXPORT_DIR ??= "${DEPLOY_DIR_IMAGE}"
 # Try to set meaningful default filenames for both image and non-image recipes
@@ -119,10 +202,12 @@ CYCLONEDX_EXPORT_BASENAME ?= "${@d.getVar('IMAGE_NAME') or d.getVar('IMAGE_BASEN
 CYCLONEDX_EXPORT_SBOM ??= "${CYCLONEDX_EXPORT_BASENAME}.bom.json"
 CYCLONEDX_EXPORT_VEX ??= "${CYCLONEDX_EXPORT_BASENAME}.vex.json"
 CYCLONEDX_EXPORT_SBOM_CVE_CHECK_VEX ??= "${CYCLONEDX_EXPORT_BASENAME}.sbom-cve-check.vex.json"
+CYCLONEDX_EXPORT_ALIGNMENT_REPORT ??= "${CYCLONEDX_EXPORT_BASENAME}.alignment-report.json"
 # Create symlinks for image recipes similar to the image files by default.
 IMAGE_LINK_NAME ??= ""
 CYCLONEDX_EXPORT_SBOM_LINK ??= "${@'${IMAGE_LINK_NAME}.cyclonedx.bom.json' if d.getVar('IMAGE_LINK_NAME') else ''}"
 CYCLONEDX_EXPORT_VEX_LINK ??= "${@'${IMAGE_LINK_NAME}.cyclonedx.vex.json' if d.getVar('IMAGE_LINK_NAME') else ''}"
+CYCLONEDX_EXPORT_ALIGNMENT_REPORT_LINK ??= "${@'${IMAGE_LINK_NAME}.cyclonedx.alignment-report.json' if d.getVar('IMAGE_LINK_NAME') else ''}"
 CYCLONEDX_PNDATA_WORKDIR = "${WORKDIR}/cyclonedx"
 CYCLONEDX_PNDATA = "${TMPDIR}/cyclonedx/pn"
 CYCLONEDX_IMAGEDATA_WORKDIR = "${WORKDIR}/cyclonedx-image"
@@ -181,9 +266,13 @@ python () {
     extend_cve_status(d)
 
     # Validate renderer-relevant configuration; the supported CycloneDX
-    # versions and image types are owned by the renderer.
+    # versions, image types and alignment profile/enforcement combinations
+    # are owned by the renderer.
     error = _cyclonedx_renderer(d).config_errors(
-        d.getVar("CYCLONEDX_SPEC_VERSION"), d.getVar("CYCLONEDX_IMAGE_TYPE"))
+        d.getVar("CYCLONEDX_SPEC_VERSION"), d.getVar("CYCLONEDX_IMAGE_TYPE"),
+        d.getVar("CYCLONEDX_PROFILE"), d.getVar("CYCLONEDX_PROFILE_ENFORCEMENT"),
+        d.getVar("CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS") == "1",
+        d.getVar("CYCLONEDX_EXPAND_CVE_PRODUCT_ALIASES") == "1")
     if error:
         bb.fatal(error)
 }
@@ -210,18 +299,15 @@ python do_populate_cyclonedx() {
         if pn.endswith(ignored_suffix):
             return
 
-    # get all CVE product names and version from the recipe
-    name = d.getVar("CVE_PRODUCT")
-    version = d.getVar("CVE_VERSION")
+    # One recipe is one independently assessable logical component with a
+    # creator-assigned identity (ADR-0006, ADR-0009). CVE_PRODUCT and
+    # CVE_VERSION feed the renderer only as vulnerability-correlation
+    # aliases; CYCLONEDX_COMPONENT_NAME/_VERSION override the logical
+    # identity explicitly, otherwise BPN and PV are the defaults.
 
     # We create and populate a per-recipe partial sbom which will be added to the sstate cache
     pn_list = {}
-    pn_list["pkgs"] = []
     cves = []
-
-    # Track duplicate bom-refs that map to the same CPE
-    # This prevents self-dependencies when multiple packages share the same CPE
-    bom_ref_dedup_map = {}
 
     # The renderer owns component identity. The package URL and any
     # SRC_URI external references are artifact facts collected here.
@@ -232,50 +318,48 @@ python do_populate_cyclonedx() {
     references = (generate_source_references(d)
                   if d.getVar("CYCLONEDX_ADD_COMPONENT_SOURCE_REFERENCES") == "1" else None)
 
-    # append all defined package names for recipe to pn_list pkgs
-    for pkg in renderer.component_identity(name, version, purl, references):
-        # Check if we already have a package with this CPE
-        existing_pkg = next((c for c in pn_list["pkgs"] if c["cpe"] == pkg["cpe"]), None)
-        if existing_pkg:
-            # Map this bom-ref to the existing (canonical) bom-ref
-            bom_ref_dedup_map[pkg["bom-ref"]] = existing_pkg["bom-ref"]
-            continue
+    pkg = renderer.component_identity(
+        d.getVar("BPN"),
+        d.getVar("PV"),
+        purl,
+        cve_products=d.getVar("CVE_PRODUCT"),
+        cve_versions=d.getVar("CVE_VERSION"),
+        name_override=d.getVar("CYCLONEDX_COMPONENT_NAME"),
+        version_override=d.getVar("CYCLONEDX_COMPONENT_VERSION"),
+        external_references=references)
 
-        if d.getVar("CYCLONEDX_ADD_COMPONENT_LICENSES") == "1":
-            bb.debug(2, f"Resolving licenses for {pkg['name']}")
-            licenses = resolve_license_data(d)
-            if len(licenses) != 0:
-                pkg["licenses"] = licenses
-            else:
-                bb.warn(f"LICENSE variable not set for package {pn}")
+    if d.getVar("CYCLONEDX_ADD_COMPONENT_LICENSES") == "1":
+        bb.debug(2, f"Resolving licenses for {pkg['name']}")
+        licenses = resolve_license_data(d)
+        if len(licenses) != 0:
+            pkg["licenses"] = licenses
+        else:
+            bb.warn(f"LICENSE variable not set for package {pn}")
 
-        custom_properties = get_custom_properties(d)
-        if custom_properties:
-            pkg["properties"] = custom_properties
+    custom_properties = get_custom_properties(d)
+    if custom_properties:
+        pkg.setdefault("properties", []).extend(custom_properties)
 
-        pn_list["pkgs"].append(pkg)
-        bom_ref = pkg["bom-ref"]
+    pn_list["pkgs"] = [pkg]
+    bom_ref = pkg["bom-ref"]
 
-        # append any CVEs either patched or taken from CVE_STATUS
-        patched_cves = get_patched_cves(d)
-        for cve_id, cve_info in patched_cves.items():
-            cve = (
-                cve_id,
-                cve_info["abbrev-status"],
-                cve_info["status"],
-                cve_info.get("justification", "")
-            )
-            renderer.add_status_vex_statement(
-                cve, cves, bom_ref, d.getVar("BPN"),
-                d.getVar('CYCLONEDX_SBOM_SERIAL_PLACEHOLDER'),
-                d.getVar('CYCLONEDX_ADD_VULN_TIMESTAMPS') == "1",
-                log=_cyclonedx_log)
+    # append any CVEs either patched or taken from CVE_STATUS
+    patched_cves = get_patched_cves(d)
+    for cve_id, cve_info in patched_cves.items():
+        cve = (
+            cve_id,
+            cve_info["abbrev-status"],
+            cve_info["status"],
+            cve_info.get("justification", "")
+        )
+        renderer.add_status_vex_statement(
+            cve, cves, bom_ref, d.getVar("BPN"),
+            d.getVar('CYCLONEDX_SBOM_SERIAL_PLACEHOLDER'),
+            d.getVar('CYCLONEDX_ADD_VULN_TIMESTAMPS') == "1",
+            log=_cyclonedx_log)
 
     # append any cve status within recipe to pn_list cves
     pn_list["cves"] = cves
-
-    # Store the deduplication map for use during deployment
-    pn_list["bom_ref_dedup_map"] = bom_ref_dedup_map
 
     # Add dependencies
     dependencies = []
@@ -306,10 +390,13 @@ python do_populate_cyclonedx() {
     extra_components = []
     extra_dependencies = []
     extra_roots = []
+    extra_bom_errors = []
     for bom_path in (d.getVar("CYCLONEDX_EXTRA_BOM_FILES") or "").split():
         if not os.path.exists(bom_path):
             if d.getVar("CYCLONEDX_EXTRA_BOM_FILES_FAIL_ON_BROKEN_BOM_FILES") == "0":
                 bb.warn(f"CYCLONEDX_EXTRA_BOM_FILES: {pn}: no such file, skipping: {bom_path}")
+                extra_bom_errors.append({"file": bom_path,
+                                         "error": "no such file"})
                 continue
             else:
                 bb.fatal(f"CYCLONEDX_EXTRA_BOM_FILES: {pn}: no such file: {bom_path}")
@@ -318,6 +405,7 @@ python do_populate_cyclonedx() {
         except Exception as e:
             if d.getVar("CYCLONEDX_EXTRA_BOM_FILES_FAIL_ON_BROKEN_BOM_FILES") == "0":
                 bb.warn(f"CYCLONEDX_EXTRA_BOM_FILES: {pn}: cannot parse {bom_path}, skipping: {e}")
+                extra_bom_errors.append({"file": bom_path, "error": str(e)})
                 continue
             else:
                 bb.fatal(f"CYCLONEDX_EXTRA_BOM_FILES: {pn}: cannot parse {bom_path}: {e}")
@@ -331,6 +419,13 @@ python do_populate_cyclonedx() {
         if root.get("bom-ref"):
             components = components + [root]
             extra_roots.append(root["bom-ref"])
+        elif components:
+            # Parseable but rootless: the tree merges, the renderer's
+            # composition findings make the missing attachment visible.
+            extra_bom_errors.append({
+                "file": bom_path,
+                "error": "no metadata.component with a bom-ref; the "
+                         "imported graph cannot be attached as a tree"})
         extra_components.extend(components)
         extra_dependencies.extend(extra_bom.get("dependencies") or [])
         bb.debug(1, f"CYCLONEDX_EXTRA_BOM_FILES: {pn}: merged {len(components)} "
@@ -341,6 +436,28 @@ python do_populate_cyclonedx() {
         pn_list["extra_dependencies"] = extra_dependencies
     if extra_roots:
         pn_list["extra_roots"] = extra_roots
+    if extra_bom_errors:
+        pn_list["extra_bom_errors"] = extra_bom_errors
+
+    # Creator and URI evidence overrides: the renderer owns the
+    # precedence (explicit override above recorded metadata) and the
+    # syntax validation; the adapter only forwards the configured values.
+    for fact_key, variable in (("creator", "CYCLONEDX_COMPONENT_CREATOR"),
+                               ("source_uri", "CYCLONEDX_COMPONENT_SOURCE_URI"),
+                               ("deployable_uri",
+                                "CYCLONEDX_COMPONENT_DEPLOYABLE_URI")):
+        value = d.getVar(variable)
+        if value:
+            pn_list[fact_key] = value
+
+    # The renderer validates explicit licence-role assertions against its
+    # pinned SPDX vocabulary; the adapter forwards the source verbatim.
+    for fact_key, variable in (
+            ("distribution_licence", "CYCLONEDX_DISTRIBUTION_LICENCE"),
+            ("effective_licence", "CYCLONEDX_EFFECTIVE_LICENCE")):
+        expression = d.getVar(variable)
+        if expression:
+            pn_list[fact_key] = expression
 
     # Add "not_affected" VEX entries for kernel CVEs whose affected files were
     # never compiled, based on the sources actually compiled for this kernel
@@ -431,6 +548,13 @@ list_buildtime_recipes[vardepsexclude] += "BB_TASKDEPDATA"
 addtask do_populate_cyclonedx before do_build after do_package do_packagedata
 do_populate_cyclonedx[cleandirs] = "${CYCLONEDX_PNDATA_WORKDIR}"
 do_populate_cyclonedx[vardeps] += "CVE_STATUS"
+# Logical component identity and its vulnerability-correlation aliases are
+# fragment inputs; a change to any of them must regenerate the fragment.
+do_populate_cyclonedx[vardeps] += "CVE_PRODUCT CVE_VERSION"
+do_populate_cyclonedx[vardeps] += "CYCLONEDX_COMPONENT_NAME CYCLONEDX_COMPONENT_VERSION"
+do_populate_cyclonedx[vardeps] += "CYCLONEDX_COMPONENT_CREATOR"
+do_populate_cyclonedx[vardeps] += "CYCLONEDX_COMPONENT_SOURCE_URI CYCLONEDX_COMPONENT_DEPLOYABLE_URI"
+do_populate_cyclonedx[vardeps] += "CYCLONEDX_DISTRIBUTION_LICENCE CYCLONEDX_EFFECTIVE_LICENCE"
 SSTATETASKS += "do_populate_cyclonedx"
 do_populate_cyclonedx[sstate-inputdirs] = "${CYCLONEDX_PNDATA_WORKDIR}"
 do_populate_cyclonedx[sstate-outputdirs] = "${CYCLONEDX_PNDATA}/${SSTATE_PKGARCH}"
@@ -578,6 +702,7 @@ def extract_license_details(d, expression):
         details.append(detail)
 
     return details if details else None
+
 
 def resolve_license_data(d):
     """
@@ -1146,10 +1271,272 @@ def write_cyclonedx_image_data(d, sbom, vex):
         "vex": "sbom-cve-check/vex.json" if cyclonedx_sbom_cve_check_enabled(d) else "vex.json",
     })
 
-def export_cyclonedx(d):
+def collect_debug_sources(d, recipes):
+    """
+    Gather the debug-source paths that BitBake's own do_package recorded in
+    pkgdata for each recipe's delivered files. Extended pkgdata records are
+    keyed by binary package, so each recipe's PACKAGES list resolves them.
+    Recipes with inhibited (INHIBIT_PACKAGE_DEBUG_SPLIT) or absent debug
+    splitting simply do not appear: that is unknown coverage for the
+    renderer, never an absence of dependencies. The pkgdata records arrive
+    with the same sstate/task plumbing as the runtime pkgdata that
+    build_runtime_dependency_edges() already reads, so no extra task
+    dependencies or vardeps are needed.
+    """
+    import oe.packagedata
+
+    sources = {}
+    for pn in recipes:
+        recipe_data = oe.packagedata.read_pkgdata(pn, d)
+        packages = (recipe_data.get("PACKAGES") or pn).split()
+        per_recipe = {}
+        for pkg in sorted(packages):
+            extended = oe.packagedata.read_subpkgdata_extended(pkg, d)
+            if not extended:
+                continue
+            for fpath, info in (extended.get("files_info") or {}).items():
+                debugsrc = info.get("debugsrc")
+                if not debugsrc:
+                    continue
+                if isinstance(debugsrc, str):
+                    debugsrc = debugsrc.split()
+                per_recipe.setdefault(fpath, []).extend(sorted(debugsrc))
+        if per_recipe:
+            sources[pn] = per_recipe
+    return sources
+
+
+def collect_file_inventory(d, recipes):
+    """
+    Collect the mandatory-file artifact facts of the assembled root
+    filesystem for the alignment profile: every delivered executable and
+    archive, classified deterministically and hashed with SHA-512 over
+    the delivered bytes; nothing else is inventoried (ADR-0005) and no
+    binary analysis, debug extraction or dependency inference from file
+    contents ever happens (ADR-0002).
+
+    Walk the delivered rootfs; pkgdata attributes known paths but is not
+    the discovery boundary. Executables and archives created by postinst
+    scripts or image customization belong to the primary component when
+    no recipe claims them. A path claimed by several recipes is attributed
+    to the first in sorted recipe order. Symlinks and special entries are
+    not separate content artifacts.
+
+    Read signatures of regular files, then hash mandatory content only.
+    This runs in do_rootfs's pseudo environment after rootfs processing.
+    Unreadable or unclassifiable files stay explicit evidence (ADR-0004).
+    """
+    import hashlib
+    import os
+    import stat
+    import oe.packagedata
+
+    renderer = _cyclonedx_renderer(d)
+    rootfs = d.getVar("IMAGE_ROOTFS")
+    if not rootfs or not os.path.isdir(rootfs):
+        bb.note("CycloneDX file inventory: no assembled root filesystem; "
+                "the file inventory is empty for this export")
+        return {}
+
+    claims = {}
+    for pn in sorted(recipes):
+        recipe_data = oe.packagedata.read_pkgdata(pn, d)
+        packages = (recipe_data.get("PACKAGES") or pn).split()
+        for pkg in sorted(packages):
+            extended = oe.packagedata.read_subpkgdata_extended(pkg, d)
+            if not extended:
+                continue
+            for fpath in (extended.get("files_info") or {}):
+                claims.setdefault(fpath, pn)
+
+    def defective(pn, fpath, kind):
+        bb.warn(f"CycloneDX file inventory: {pn}: delivered mandatory file "
+                f"{fpath} is {kind}")
+        inventory.setdefault(pn, []).append({"path": fpath, "error": kind})
+
+    inventory = {}
+    def delivered_paths():
+        for root, dirs, names in os.walk(rootfs):
+            dirs.sort()
+            for name in sorted(names):
+                yield "/" + os.path.relpath(os.path.join(root, name), rootfs)
+
+    for fpath in delivered_paths():
+        pn = claims.get(fpath, "")
+        delivered = os.path.join(rootfs, fpath.lstrip("/"))
+        try:
+            mode = os.lstat(delivered).st_mode
+        except FileNotFoundError:
+            defective(pn, fpath, "missing")
+            continue
+        except OSError:
+            defective(pn, fpath, "unreadable")
+            continue
+        if not stat.S_ISREG(mode):
+            continue  # symlinks and special entries: not artifacts
+        try:
+            with open(delivered, "rb") as artifact:
+                head = artifact.read(renderer.ARTIFACT_HEAD_SIZE)
+        except OSError:
+            defective(pn, fpath, "unreadable")
+            continue
+        if not renderer.classify_delivered_file(fpath, mode,
+                                                head)["mandatory"]:
+            continue
+        try:
+            with open(delivered, "rb") as artifact:
+                data = artifact.read()
+        except OSError:
+            defective(pn, fpath, "unreadable")
+            continue
+        verdict = renderer.classify_delivered_file(fpath, mode, data)
+        entry = {key: verdict[key]
+                 for key in ("executable", "archive", "structured")
+                 if key in verdict}
+        entry["path"] = fpath
+        if verdict.get("error"):
+            entry["error"] = verdict["error"]
+            bb.warn(f"CycloneDX file inventory: {pn}: delivered mandatory "
+                    f"file {fpath} is {verdict['error']}")
+        else:
+            entry["sha512"] = hashlib.sha512(data).hexdigest()
+        inventory.setdefault(pn, []).append(entry)
+    return {pn: sorted(entries, key=lambda e: e["path"])
+            for pn, entries in sorted(inventory.items())}
+
+
+def collect_deploy_files(d):
+    """
+    Collect the deploy-directory artifact facts for the alignment
+    profile (ticket #10): the image's primary deployable artifact(s) -
+    the deployed files of the declared IMAGE_FSTYPES under the stable
+    ${IMAGE_LINK_NAME}, the same name lineage the export basename
+    follows - plus the files explicitly selected through
+    CYCLONEDX_ADDITIONAL_FILES (kernel, bootloader, firmware, TEE,
+    initramfs, embedded images and other product payloads that package
+    manifests do not cover). Selection semantics live in the renderer's
+    pure plan_deploy_file_selection(); this function only enumerates
+    and hashes.
+
+    Determinism: entries record the stable link name, never the
+    DATETIME-stamped real filename, and hashes cover content only, so
+    equivalent rebuilds - including runs where the image artifacts come
+    from sstate under a fresh build stamp - reproduce identical
+    inventories. Call it only from the deploy phase (do_deploy_cyclonedx
+    runs after do_image_complete): inside do_rootfs the artifact bytes are not
+    final yet and hashing there would chase a moving target. Inclusion
+    is by mandate or explicit selection, not by the classifier: the
+    classifier only records the BSI properties (a raw filesystem image
+    is inventoried even when no archive signature makes it mandatory
+    inventory on its own). Symlinks record the artifact under the
+    stable link name; the content identity is the target's. Our own
+    deployed documents are never inventory artifacts. Missing or
+    unreadable selections stay reported (ADR-0004).
+    """
+    import hashlib
+    import os
+    import re
+    import stat
+
+    renderer = _cyclonedx_renderer(d)
+    deploy_dir = d.getVar("DEPLOY_DIR_IMAGE")
+    if not deploy_dir or not os.path.isdir(deploy_dir):
+        bb.note("CycloneDX deploy inventory: no deploy directory; no "
+                "deployable artifact or selected files for this export")
+        return []
+
+    own_paths = set()
+    export_dir = d.getVar("CYCLONEDX_EXPORT_DIR") or ""
+    for var in ("CYCLONEDX_EXPORT_SBOM", "CYCLONEDX_EXPORT_VEX",
+                "CYCLONEDX_EXPORT_SBOM_LINK", "CYCLONEDX_EXPORT_VEX_LINK",
+                "CYCLONEDX_EXPORT_ALIGNMENT_REPORT",
+                "CYCLONEDX_EXPORT_ALIGNMENT_REPORT_LINK",
+                "CYCLONEDX_EXPORT_SBOM_CVE_CHECK_VEX"):
+        path = d.getVar(var) or ""
+        if not path or not export_dir:
+            continue
+        absolute = path if os.path.isabs(path) else os.path.join(export_dir, path)
+        absolute = os.path.normpath(absolute)
+        if absolute.startswith(os.path.normpath(deploy_dir) + os.sep):
+            own_paths.add(os.path.relpath(absolute, deploy_dir))
+
+    deploy_files = {}
+    for root, dirs, names in os.walk(deploy_dir):
+        dirs.sort()
+        for name in sorted(names):
+            full = os.path.join(root, name)
+            rel = os.path.relpath(full, deploy_dir)
+            if rel in own_paths:
+                continue
+            entry_stat = os.lstat(full)
+            if stat.S_ISLNK(entry_stat.st_mode):
+                target = os.path.realpath(full)
+                if not os.path.exists(full):
+                    target = None
+                elif os.path.normpath(target).startswith(
+                        os.path.normpath(deploy_dir) + os.sep):
+                    target = os.path.relpath(target, deploy_dir)
+                deploy_files[rel] = {"kind": "symlink", "target": target}
+            elif stat.S_ISREG(entry_stat.st_mode):
+                deploy_files[rel] = {"kind": "file", "target": None}
+
+    link_name = d.getVar("IMAGE_LINK_NAME") or ""
+    if not link_name:
+        # No stable link name: derive one from IMAGE_NAME by stripping
+        # the trailing build stamp, the same name lineage as the export
+        # basename. Matching the 14-digit stamp shape keeps DATETIME out
+        # of this function's signature dependencies.
+        link_name = re.sub(r"-[0-9]{14}$", "", d.getVar("IMAGE_NAME") or "")
+    candidates = []
+    for fstype in (d.getVar("IMAGE_FSTYPES") or "").split():
+        for sub in (fstype, *(d.getVarFlag("IMAGE_TYPEDEP", fstype)
+                              or "").split()):
+            name = f"{link_name}.{sub}" if link_name else ""
+            if name and name not in candidates:
+                candidates.append(name)
+
+    entries = []
+    for item in renderer.plan_deploy_file_selection(
+            d.getVar("CYCLONEDX_ADDITIONAL_FILES") or "",
+            deploy_files, candidates):
+        entry = {"path": item["path"], "source": item["source"]}
+        if item.get("error"):
+            bb.warn(f"CycloneDX deploy inventory: selected artifact "
+                    f"{item['path']} is {item['error']}")
+            entry["error"] = item["error"]
+            entries.append(entry)
+            continue
+        full = os.path.join(deploy_dir, item["path"])
+        try:
+            mode = os.stat(full).st_mode  # symlinks: the target's bytes
+            with open(full, "rb") as artifact:
+                data = artifact.read()
+        except OSError:
+            bb.warn(f"CycloneDX deploy inventory: artifact {item['path']} "
+                    f"is unreadable")
+            entry["error"] = "unreadable"
+            entries.append(entry)
+            continue
+        verdict = renderer.classify_delivered_file(item["path"], mode, data)
+        for key in ("executable", "archive", "structured"):
+            entry[key] = verdict[key]
+        if verdict.get("error"):
+            bb.warn(f"CycloneDX deploy inventory: artifact {item['path']} "
+                    f"is {verdict['error']}")
+            entry["error"] = verdict["error"]
+        else:
+            entry["sha512"] = hashlib.sha512(data).hexdigest()
+        entries.append(entry)
+    return entries
+
+def export_cyclonedx(d, deploy_phase=False):
     """
     Collect normalized build facts and artifact facts, hand them to the
-    renderer and deploy the SBOM and VEX documents it returns.
+    renderer and deploy the SBOM, VEX and (for a selected alignment
+    profile) alignment report it returns. deploy_phase marks the final
+    generation in do_deploy_cyclonedx - after image assembly - where the
+    primary deployable artifact and the selected additional files are
+    complete (ticket #10).
     """
     import os
     from pathlib import Path
@@ -1158,71 +1545,159 @@ def export_cyclonedx(d):
     timestamp = datetime.now(timezone.utc).isoformat()
 
 
-    # taken from https://github.com/yoctoproject/poky/blob/fec201518be3c35a9359ec8c37675a33e458b92d/meta/classes/cve-check.bbclass
-    # SPDX-License-Identifier: MIT
-    # SPDX-FileCopyrightText: Copyright OpenEmbedded Contributors
-    # Determine runtime packages for scope assignment
-    runtime_recipes = list_runtime_recipes(d)
+    is_image = bb.data.inherits_class("image", d)
+    profile = (d.getVar("CYCLONEDX_PROFILE") or "")
 
-    # Determine recipes explicitly requested by the image author.
-    image_install_recipes = list_image_install_recipes(d)
-
-    # Determine which recipes to include
-    recipes = set()
-    if d.getVar('CYCLONEDX_RUNTIME_PACKAGES_ONLY') == "1":
-        recipes = set(runtime_recipes)
+    # Image recipes under a profile generate twice: once in do_rootfs
+    # and finally, with the complete deployable-artifact evidence, in
+    # do_deploy_cyclonedx (ticket #10). The runtime facts below come
+    # from the package manager's view of the assembled root filesystem,
+    # and that view only exists inside do_rootfs's pseudo environment:
+    # querying it again in the deploy phase makes dnf fail and fails
+    # the task. The rootfs phase therefore persists the facts it
+    # assembled, and the deploy phase reuses them instead of
+    # re-deriving anything from installed packages.
+    facts_file = os.path.join(d.getVar("WORKDIR"),
+                              "cyclonedx-rootfs-facts.json")
+    if profile and is_image and deploy_phase:
+        if not os.path.exists(facts_file):
+            bb.fatal(f"CycloneDX rootfs-phase facts {facts_file} missing; "
+                     "was do_rootfs run without the profile?")
+        rootfs_facts = read_json(facts_file)
+        fragments = rootfs_facts["fragments"]
+        runtime_recipes = set(rootfs_facts["runtime_recipes"])
+        image_install_recipes = set(rootfs_facts["image_install_recipes"])
+        runtime_edges = {pkg: set(deps)
+                         for pkg, deps in rootfs_facts["runtime_edges"].items()}
     else:
-        recipes = list_buildtime_recipes(d).union(runtime_recipes)
+        # taken from https://github.com/yoctoproject/poky/blob/fec201518be3c35a9359ec8c37675a33e458b92d/meta/classes/cve-check.bbclass
+        # SPDX-License-Identifier: MIT
+        # SPDX-FileCopyrightText: Copyright OpenEmbedded Contributors
+        # Determine runtime packages for scope assignment
+        runtime_recipes = list_runtime_recipes(d)
 
-    # Always include explicitly requested recipes (e.g. optee-os embedded in fitImage)
-    # Resolve virtual/* entries via PREFERRED_PROVIDER_*
-    extra_recipes = set()
+        # Determine recipes explicitly requested by the image author.
+        image_install_recipes = list_image_install_recipes(d)
 
-    for recipe in (d.getVar('CYCLONEDX_EXTRA_RUNTIME_RECIPES') or '').split():
-        if recipe.startswith("virtual/"):
-            resolved = (d.getVar("PREFERRED_RPROVIDER_" + recipe)
-                        or d.getVar("PREFERRED_PROVIDER_" + recipe))
-            if not resolved:
-                bb.warn(f"CYCLONEDX_EXTRA_RUNTIME_RECIPES: no provider for {recipe}, skipping")
+        # Determine which recipes to include
+        recipes = set()
+        if d.getVar('CYCLONEDX_RUNTIME_PACKAGES_ONLY') == "1":
+            recipes = set(runtime_recipes)
+        else:
+            recipes = list_buildtime_recipes(d).union(runtime_recipes)
+
+        # Always include explicitly requested recipes (e.g. optee-os embedded in fitImage)
+        # Resolve virtual/* entries via PREFERRED_PROVIDER_*
+        extra_recipes = set()
+
+        for recipe in (d.getVar('CYCLONEDX_EXTRA_RUNTIME_RECIPES') or '').split():
+            if recipe.startswith("virtual/"):
+                resolved = (d.getVar("PREFERRED_RPROVIDER_" + recipe)
+                            or d.getVar("PREFERRED_PROVIDER_" + recipe))
+                if not resolved:
+                    bb.warn(f"CYCLONEDX_EXTRA_RUNTIME_RECIPES: no provider for {recipe}, skipping")
+                    continue
+                bb.debug(2, f"CYCLONEDX_EXTRA_RUNTIME_RECIPES: resolved {recipe} -> {resolved}")
+                recipe = resolved
+            extra_recipes.add(recipe)
+        recipes = recipes.union(extra_recipes)
+
+        # Extra runtime recipes are runtime content and direct image-install intent.
+        runtime_recipes = set(runtime_recipes) | extra_recipes
+        image_install_recipes = set(image_install_recipes).union(extra_recipes)
+
+        # Load the per-recipe facts written by do_populate_cyclonedx. They are
+        # plain JSON fragments; the renderer never sees the data store.
+        fragments = {}
+        pkgarchs = d.getVar("SSTATE_ARCHS").split()
+        pkgarchs.reverse()
+        for pkg in sorted(recipes):
+            for pkgarch in pkgarchs:
+                pn_list_filepath = os.path.join(d.getVar("CYCLONEDX_PNDATA"),
+                                                pkgarch, f"{pkg}.json")
+                if os.path.exists(pn_list_filepath):
+                    break
+            if not os.path.exists(pn_list_filepath):
+                bb.error(f"CycloneDX PN file not found: {pkg}.json")
                 continue
-            bb.debug(2, f"CYCLONEDX_EXTRA_RUNTIME_RECIPES: resolved {recipe} -> {resolved}")
-            recipe = resolved
-        extra_recipes.add(recipe)
-    recipes = recipes.union(extra_recipes)
+            fragments[pkg] = read_json(pn_list_filepath)
 
-    # Extra runtime recipes are runtime content and direct image-install intent.
-    runtime_recipes = set(runtime_recipes) | extra_recipes
-    image_install_recipes = set(image_install_recipes).union(extra_recipes)
+        # Runtime edges derived from pkgdata cover RRECOMMENDS, per-package
+        # RDEPENDS and generated shlib dependencies, which the recipe metadata
+        # alone misses. With configured export dependencies the caller has
+        # resolved them instead.
+        runtime_edges = {}
+        if not (d.getVar("CYCLONEDX_EXPORT_DEPENDS") or "").split():
+            runtime_edges = build_runtime_dependency_edges(d)
 
-    # Load the per-recipe facts written by do_populate_cyclonedx. They are
-    # plain JSON fragments; the renderer never sees the data store.
-    fragments = {}
-    pkgarchs = d.getVar("SSTATE_ARCHS").split()
-    pkgarchs.reverse()
-    for pkg in sorted(recipes):
-        for pkgarch in pkgarchs:
-            pn_list_filepath = os.path.join(d.getVar("CYCLONEDX_PNDATA"),
-                                            pkgarch, f"{pkg}.json")
-            if os.path.exists(pn_list_filepath):
-                break
-        if not os.path.exists(pn_list_filepath):
-            bb.error(f"CycloneDX PN file not found: {pkg}.json")
-            continue
-        fragments[pkg] = read_json(pn_list_filepath)
+        # The profile's final generation in do_deploy_cyclonedx reuses
+        # these assembled facts beside the file inventory written
+        # below; the record of the build-time recipe selection stays in
+        # the file for provenance (the fragments carry its result).
+        if profile and is_image and not deploy_phase:
+            write_json(facts_file, {
+                "runtime_recipes": sorted(runtime_recipes),
+                "image_install_recipes": sorted(image_install_recipes),
+                "recipes": sorted(recipes),
+                "runtime_edges": {pkg: sorted(deps)
+                                  for pkg, deps in runtime_edges.items()},
+                "fragments": fragments,
+            })
 
-    # Runtime edges derived from pkgdata cover RRECOMMENDS, per-package
-    # RDEPENDS and generated shlib dependencies, which the recipe metadata
-    # alone misses. With configured export dependencies the caller has
-    # resolved them instead.
-    runtime_edges = {}
-    if not (d.getVar("CYCLONEDX_EXPORT_DEPENDS") or "").split():
-        runtime_edges = build_runtime_dependency_edges(d)
+    # Statically linked dependency evidence from the debugsrc lists
+    # recorded in pkgdata; the renderer derives the edges and never parses
+    # a delivered binary.
+    debug_sources = collect_debug_sources(d, sorted(fragments))
+
+    # The mandatory delivered-file inventory belongs to the alignment
+    # profile (ADR-0005); without one, no file is read or hashed at all.
+    # Image recipes publish final documents after do_image_complete.
+    # Their final rootfs inventory is collected in do_rootfs's postfunc,
+    # after postinst and rootfs customization, while pseudo is active.
+    # Deploy regeneration reuses that snapshot rather than inspecting the
+    # rootfs or asking the package manager outside its task environment.
+    file_inventory = {}
+    inventory_file = os.path.join(d.getVar("WORKDIR"),
+                                  "cyclonedx-file-inventory.json")
+    if profile:
+        if deploy_phase and is_image:
+            if not os.path.exists(inventory_file):
+                bb.fatal(f"CycloneDX final rootfs inventory {inventory_file} "
+                         "missing; run do_rootfs with the profile")
+            file_inventory = read_json(inventory_file)
+            deploy_entries = collect_deploy_files(d)
+            if deploy_entries:
+                file_inventory.setdefault("", []).extend(deploy_entries)
+        elif not is_image:
+            file_inventory = collect_file_inventory(d, sorted(fragments))
 
     primary = {
         "type": d.getVar("CYCLONEDX_IMAGE_TYPE") or "firmware",
         "name": d.getVar("CYCLONEDX_IMAGE_NAME") or d.getVar("PN") or "image",
         "version": d.getVar("CYCLONEDX_IMAGE_VERSION") or "unknown",
     }
+    for variable, fact_key in (
+            ("CYCLONEDX_PRIMARY_COMPONENT_CREATOR", "creator"),
+            ("CYCLONEDX_PRIMARY_COMPONENT_SOURCE_URI", "source_uri"),
+            ("CYCLONEDX_PRIMARY_COMPONENT_DEPLOYABLE_URI",
+             "deployable_uri")):
+        value = d.getVar(variable)
+        if value:
+            primary[fact_key] = value
+
+    # Licence roles of the delivered product: the image recipe LICENSE is
+    # original licence evidence only, and distribution or effective
+    # licences come from the product integration explicitly.
+    if d.getVar("LICENSE"):
+        original_licences = resolve_license_data(d)
+        if original_licences:
+            primary["licenses"] = original_licences
+    for variable, fact_key in (
+            ("CYCLONEDX_DISTRIBUTION_LICENCE", "distribution_licence"),
+            ("CYCLONEDX_EFFECTIVE_LICENCE", "effective_licence")):
+        expression = d.getVar(variable)
+        if expression:
+            primary[fact_key] = expression
     if d.getVar("CYCLONEDX_ADD_LAYER_REFERENCES") == "1":
         primary["external_references"] = generate_layer_references(d)
 
@@ -1232,11 +1707,17 @@ def export_cyclonedx(d):
     for img_name, img_sbom_path, img_vex_path in resolve_extra_image_sbom_paths(d):
         if not os.path.exists(img_sbom_path):
             bb.warn(f"CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES: SBOM not found for {img_name}: {img_sbom_path}")
+            included_images.append({"name": img_name, "sbom": None,
+                                    "vex": None, "vex_error": None,
+                                    "sbom_error": f"SBOM not found: {img_sbom_path}"})
             continue
         try:
             img_sbom_data = read_json(img_sbom_path)
         except Exception as e:
             bb.warn(f"CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES: cannot parse SBOM for {img_name}: {e}")
+            included_images.append({"name": img_name, "sbom": None,
+                                    "vex": None, "vex_error": None,
+                                    "sbom_error": str(e)})
             continue
         img_vex_data = None
         img_vex_error = None
@@ -1256,18 +1737,36 @@ def export_cyclonedx(d):
             "tlp_marking": d.getVar('CYCLONEDX_TLP_MARKING'),
             "add_vuln_timestamps": d.getVar('CYCLONEDX_ADD_VULN_TIMESTAMPS') == "1",
             "sbom_serial_placeholder": d.getVar('CYCLONEDX_SBOM_SERIAL_PLACEHOLDER'),
+            "profile": d.getVar('CYCLONEDX_PROFILE') or "",
+            "enforcement": d.getVar('CYCLONEDX_PROFILE_ENFORCEMENT') or "report",
+            "deduplicate_cpe_collisions": d.getVar(
+                'CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS') == "1",
+            "expand_cve_product_aliases": d.getVar(
+                'CYCLONEDX_EXPAND_CVE_PRODUCT_ALIASES') == "1",
         },
         "timestamp": timestamp,
+        "sbom_creator": d.getVar('CYCLONEDX_SBOM_CREATOR') or "",
         "log": _cyclonedx_log,
         "primary": primary,
         "fragments": fragments,
         "runtime_recipes": sorted(runtime_recipes),
         "image_install_recipes": sorted(image_install_recipes),
         "runtime_edges": {pkg: sorted(deps) for pkg, deps in runtime_edges.items()},
+        "debug_sources": debug_sources,
+        "file_inventory": file_inventory,
         "included_images": included_images,
     })
+    if "failure" in docs:
+        failure = docs["failure"]
+        for violation in failure.get("violations", ()):
+            bb.error("alignment violation %s: %s%s" % (
+                violation["requirementId"], violation["diagnosticMessage"],
+                " (components: %s)" % ", ".join(violation["bomRefs"])
+                if violation.get("bomRefs") else ""))
+        bb.fatal(failure["diagnosticMessage"])
     sbom = docs["sbom"]
     vex = docs["vex"]
+    report = docs.get("report")
 
     export_dir = d.getVar("CYCLONEDX_EXPORT_DIR")
     tmp_export_dir = d.getVar("CYCLONEDX_TMP_EXPORT_DIR")
@@ -1295,14 +1794,24 @@ def export_cyclonedx(d):
     export_sbom = get_cyclonedx_export_path("CYCLONEDX_EXPORT_SBOM", required=True)
     export_vex = get_cyclonedx_export_path("CYCLONEDX_EXPORT_VEX", required=True)
 
-    write_json(export_sbom, sbom)
-    write_json(export_vex, vex)
-    write_cyclonedx_image_data(d, sbom, vex)
-
     def make_deploy_symlink(target, link_name):
         if link_name and target != link_name:
             target = Path(target).relative_to(os.path.dirname(link_name))
             os.symlink(target, link_name)
+
+    write_json(export_sbom, sbom)
+    write_json(export_vex, vex)
+    if report is not None:
+        # The alignment report is written through the renderer's canonical
+        # serialization so equivalent facts always deploy identical bytes.
+        export_report = get_cyclonedx_export_path(
+            "CYCLONEDX_EXPORT_ALIGNMENT_REPORT", required=True)
+        with open(export_report, "w") as f:
+            f.write(_cyclonedx_renderer(d).serialize_report(report))
+        make_deploy_symlink(export_report,
+                            get_cyclonedx_export_path("CYCLONEDX_EXPORT_ALIGNMENT_REPORT_LINK"))
+    write_cyclonedx_image_data(d, sbom, vex)
+
     make_deploy_symlink(export_sbom, get_cyclonedx_export_path("CYCLONEDX_EXPORT_SBOM_LINK"))
     if not cyclonedx_sbom_cve_check_enabled(d):
         make_deploy_symlink(export_vex, get_cyclonedx_export_path("CYCLONEDX_EXPORT_VEX_LINK"))
@@ -1311,13 +1820,39 @@ python do_export_cyclonedx() {
     export_cyclonedx(d)
 }
 
-# We use ROOTFS_POSTUNINSTALL_COMMAND to make sure this function runs exactly once
-# after the build process has been completed
-# see https://docs.yoctoproject.org/ref-manual/variables.html#term-ROOTFS_POSTUNINSTALL_COMMAND
+# Capture package-manager facts before its database is removed.
 ROOTFS_POSTUNINSTALL_COMMAND =+ "do_export_cyclonedx"
+
+python collect_cyclonedx_file_inventory() {
+    if not d.getVar("CYCLONEDX_PROFILE") or not bb.data.inherits_class("image", d):
+        return
+    facts = read_json(os.path.join(d.getVar("WORKDIR"),
+                                   "cyclonedx-rootfs-facts.json"))
+    inventory = collect_file_inventory(d, sorted(facts["fragments"]))
+    write_json(os.path.join(d.getVar("WORKDIR"),
+                            "cyclonedx-file-inventory.json"), inventory)
+}
+# Observe the final rootfs, including ROOTFS_POSTPROCESS_COMMAND changes,
+# without re-querying its removed package-manager database.
+do_rootfs[postfuncs] += "collect_cyclonedx_file_inventory"
+
 # Looked up through a variable name argument, invisible to the signature
 export_cyclonedx[vardeps] += "CYCLONEDX_EXPORT_SBOM CYCLONEDX_EXPORT_VEX \
-    CYCLONEDX_EXPORT_SBOM_LINK CYCLONEDX_EXPORT_VEX_LINK"
+    CYCLONEDX_EXPORT_SBOM_LINK CYCLONEDX_EXPORT_VEX_LINK \
+    CYCLONEDX_EXPORT_ALIGNMENT_REPORT CYCLONEDX_EXPORT_ALIGNMENT_REPORT_LINK \
+    CYCLONEDX_PROFILE CYCLONEDX_PROFILE_ENFORCEMENT \
+    CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS \
+    CYCLONEDX_EXPAND_CVE_PRODUCT_ALIASES"
+export_cyclonedx[vardeps] += "CYCLONEDX_ADDITIONAL_FILES"
+export_cyclonedx[vardepsexclude] += "DATETIME IMAGE_NAME"
+# collect_deploy_files reads IMAGE_NAME only to derive the stable link
+# name; its value carries the DATETIME stamp, so exclude it here too -
+# vardepsexclude is per-function and does not inherit export_cyclonedx's.
+collect_deploy_files[vardepsexclude] += "IMAGE_NAME"
+export_cyclonedx[vardeps] += "CYCLONEDX_SBOM_CREATOR"
+export_cyclonedx[vardeps] += "CYCLONEDX_PRIMARY_COMPONENT_CREATOR \
+    CYCLONEDX_PRIMARY_COMPONENT_SOURCE_URI \
+    CYCLONEDX_PRIMARY_COMPONENT_DEPLOYABLE_URI"
 
 SSTATETASKS += "do_deploy_cyclonedx"
 do_deploy_cyclonedx[sstate-inputdirs] = "${CYCLONEDX_TMP_EXPORT_DIR} ${CYCLONEDX_IMAGEDATA_WORKDIR}"
@@ -1326,23 +1861,40 @@ do_deploy_cyclonedx[vardeps] += "CYCLONEDX_EXPORT_DIR"
 # Link names are stable (no timestamp) so they can safely invalidate sstate without churn.
 do_deploy_cyclonedx[vardeps] += "CYCLONEDX_EXPORT_SBOM_LINK"
 do_deploy_cyclonedx[vardeps] += "CYCLONEDX_EXPORT_VEX_LINK"
+do_deploy_cyclonedx[vardeps] += "CYCLONEDX_EXPORT_ALIGNMENT_REPORT CYCLONEDX_EXPORT_ALIGNMENT_REPORT_LINK"
 python do_deploy_cyclonedx_setscene() {
     sstate_setscene(d)
 }
 addtask do_deploy_cyclonedx_setscene
 python do_deploy_cyclonedx() {
     if bb.data.inherits_class("image", d):
-       bb.note("Deploying CycloneDX SBOM and VEX files generated by do_rootfs")
-       return
+        if (d.getVar("CYCLONEDX_PROFILE") or ""):
+            bb.note("Regenerating CycloneDX output with the complete "
+                    "deployable-artifact inventory")
+            export_cyclonedx(d, deploy_phase=True)
+        else:
+            bb.note("Deploying CycloneDX SBOM and VEX files generated by do_rootfs")
     else:
-       export_cyclonedx(d)
+        export_cyclonedx(d)
 }
 # Synchronize consumers with the final document producer, including its setscene
 # task. This task has no output of its own.
 do_cyclonedx_complete[noexec] = "1"
 python () {
     if bb.data.inherits_class("image", d):
-        bb.build.addtask("do_deploy_cyclonedx", "do_image_complete", "do_rootfs", d)
+        # The regeneration must observe the FINAL deploy directory: the
+        # dated image artifacts reach DEPLOY_DIR_IMAGE through
+        # do_image_complete's sstate installation, so the task runs
+        # after it; hashing before that step records the previous
+        # build's bytes for every artifact do_image_complete owns.
+        # The depends flag additionally puts do_image_complete's output
+        # hash into this task's sstate signature: task-graph ordering
+        # alone lets a cache hit restore documents that hashed an older
+        # build's artifact bytes while do_image_complete republishes
+        # fresh ones in the same run.
+        d.appendVarFlag("do_deploy_cyclonedx", "depends",
+                        f" {d.getVar('PN')}:do_image_complete")
+        bb.build.addtask("do_deploy_cyclonedx", "do_build", "do_image_complete", d)
         complete_after = "do_deploy_cyclonedx"
         if cyclonedx_sbom_cve_check_enabled(d):
             complete_after = "do_cyclonedx_sbom_cve_check"
@@ -1408,6 +1960,31 @@ do_populate_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/meta_cyclone
 do_rootfs[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/meta_cyclonedx.py:True"
 do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/meta_cyclonedx.py:True"
 do_cyclonedx_sbom_cve_check[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/meta_cyclonedx.py:True"
+# The requirements-matrix module is loaded by the renderer, so its bytes
+# belong in the same task signatures.
+do_populate_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/alignment_profile.py:True"
+do_rootfs[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/alignment_profile.py:True"
+do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/alignment_profile.py:True"
+do_cyclonedx_sbom_cve_check[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/alignment_profile.py:True"
+# The schema-validation module and the vendored official schemas are read
+# by the renderer when documents are generated, so their bytes belong in
+# the generating tasks' signatures (do_rootfs runs do_export_cyclonedx).
+do_rootfs[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/schema_validation.py:True"
+do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/schema_validation.py:True"
+do_rootfs[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx/bom-1.6.schema.json:True"
+do_rootfs[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx/bom-1.7.schema.json:True"
+do_rootfs[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx/spdx.schema.json:True"
+do_rootfs[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx/jsf-0.82.schema.json:True"
+do_rootfs[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx/cryptography-defs.schema.json:True"
+do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx/bom-1.6.schema.json:True"
+do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx/bom-1.7.schema.json:True"
+do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx/spdx.schema.json:True"
+do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx/jsf-0.82.schema.json:True"
+do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/lib/data/cyclonedx/cryptography-defs.schema.json:True"
+do_rootfs[file-checksums] += "${CYCLONEDX_LAYERDIR}/meta/files/spdx-license-list-data/licenses-${CYCLONEDX_SPEC_VERSION}.json:True"
+do_rootfs[file-checksums] += "${CYCLONEDX_LAYERDIR}/meta/files/spdx-license-list-data/exceptions-${CYCLONEDX_SPEC_VERSION}.json:True"
+do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/meta/files/spdx-license-list-data/licenses-${CYCLONEDX_SPEC_VERSION}.json:True"
+do_deploy_cyclonedx[file-checksums] += "${CYCLONEDX_LAYERDIR}/meta/files/spdx-license-list-data/exceptions-${CYCLONEDX_SPEC_VERSION}.json:True"
 python do_cyclonedx_sbom_cve_check_setscene() {
     sstate_setscene(d)
 }

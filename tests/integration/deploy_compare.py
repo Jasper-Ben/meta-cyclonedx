@@ -18,14 +18,24 @@ def cyclonedx_checksums(checksums):
     }
 
 
-def identity_report(record, before, subset=None):
+def identity_report(record, before, subset=None, now=None):
     """Report why *record*'s artifacts are not byte-identical to *before*.
 
-    *before* is a recorded run or its checksums mapping. *subset*, if
-    given, is a checksums filter naming the claim's subject.
+    *before* is a recorded run or its checksums mapping. *now*, if
+    given, replaces the recorded snapshot as the subject of the
+    comparison — a deliberately rejected run snapshots nothing, and its
+    claim is about the live deploy directory it left untouched.
+    *subset*, if given, is a checksums filter naming the claim's subject.
     """
-    now = record.checksums
+    if now is None:
+        now = record.checksums
     then = getattr(before, "checksums", before)
+    if now is None or then is None:
+        return (
+            f"cannot compare the {record.name} run: "
+            f"{'it failed and' if now is None else ''} "
+            "snapshots are missing"
+        )
     if subset:
         now, then = subset(now), subset(then)
     added = sorted(key for key in now if key not in then)

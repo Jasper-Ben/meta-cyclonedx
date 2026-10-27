@@ -43,10 +43,9 @@ class KasBuildResult:
     @property
     def image_metadata_dir(self):
         """CycloneDX sstate output for this single-config, machine-specific image."""
-        machine_arch = kas_env.MACHINE.replace("-", "_")
         return (
             self.build_dir / "tmp" / "cyclonedx" / "image"
-            / machine_arch / kas_env.TARGET
+            / kas_env.MACHINE.replace("-", "_") / kas_env.TARGET
         )
 
     def deployed(self, name):
@@ -63,9 +62,16 @@ class RunRecord:
     deployed, not the current occupants of the file. Also parses
     BitBake's task-execution lines, the log observation distinguishing
     "nothing reran" from a build that redid work.
+
+    Under *profile* (the invocation requested an alignment profile through
+    its environment) the deployed alignment report is captured alongside
+    the SBOM and VEX: profile runs overwrite each other's report bytes in
+    the shared deploy directory, while a run without a profile deploys no
+    report at all — capturing one there would attribute a stale file to
+    the wrong invocation.
     """
 
-    def __init__(self, name, build, output):
+    def __init__(self, name, build, output, profile=False):
         self.name = name
         self.build = build
         self.returncode = build.returncode
@@ -76,7 +82,10 @@ class RunRecord:
         self.image_metadata_captures = {}
         if build.returncode == 0:
             self.checksums = kas_env.artifact_checksums(build.deploy_dir)
-            for doc_name in (kas_env.SBOM_NAME, kas_env.VEX_NAME):
+            captured = [kas_env.SBOM_NAME, kas_env.VEX_NAME]
+            if profile:
+                captured.append(kas_env.ALIGNMENT_REPORT_NAME)
+            for doc_name in captured:
                 path = build.deployed(doc_name)
                 if path.is_file():
                     self.document_captures[doc_name] = path.read_text()
@@ -109,15 +118,28 @@ class KasRunRecorder:
         self.engine = container_runtime
         self.results: dict[str, RunRecord] = {}
         self._pinned = False
+        self._expected_failures: set[str] = set()
 
     def __getitem__(self, name):
         return self.results[name]
 
-    def invoke(self, name, extra_env=None):
+    def prior(self, record):
+        """The invocation recorded immediately before *record*.
+
+        Byte-identity claims about an unchanged re-invocation compare a
+        run with its same-config neighbour; anchoring them on the
+        preceding record keeps them valid regardless of which other
+        configurations the matrix ran in between.
+        """
+        ordered = list(self.results.values())
+        return ordered[ordered.index(record) - 1]
+
+    def invoke(self, name, extra_env=None, expect_failure=False):
         """Run the matrix configuration under this name; return its record.
 
         *extra_env* is set in the build environment (the image-change
-        run's install-list forwarding) through the mode-appropriate
+        run's install-list forwarding, the alignment-profile scenario's
+        profile and enforcement selection) through the mode-appropriate
         channel — the wrapper's --runtime-args channel in container
         mode (a plain host export would be dropped by the wrapper's
         environment whitelist), the process environment in direct mode
@@ -130,11 +152,21 @@ class KasRunRecorder:
         observation is guarded off the failed build anyway. Zero-exit
         invocations never gate, keeping stage independence for
         assertion failures.
+
+        *expect_failure* marks a deliberate product-level rejection —
+        the strict-enforcement scenario is *supposed* to fail the build.
+        Its failure is environment-scoped by construction: the violation
+        rides that invocation's own *extra_env*, so a later invocation
+        without it cannot replay it and must not be gated. The exemption
+        is per-record; accidental failures still gate every stage.
         """
         if name in self.results:
             return self.results[name]
         for failed in self.results.values():
-            if failed.returncode != 0:
+            if (
+                failed.returncode != 0
+                and failed.name not in self._expected_failures
+            ):
                 pytest.skip(
                     f"prior kas invocation {failed.name!r} failed "
                     f"(exit {failed.returncode}); later stages would "
@@ -172,18 +204,33 @@ class KasRunRecorder:
         env["KAS_CONTAINER_ENGINE"] = self.engine
         command, env_extras = kas_env.kas_invocation(self.engine, extra_env=extra_env)
         env.update(env_extras)
-        returncode, lines = self._stream(command, env)
+        returncode, lines = self._stream(command, env, abort_on_failure=not expect_failure)
         build = KasBuildResult(
             engine=self.engine,
             returncode=returncode,
             output=lines,
             build_dir=kas_env.build_dir(),
         )
-        self.results[name] = record = RunRecord(name, build, lines)
+        if expect_failure:
+            self._expected_failures.add(name)
+        self.results[name] = record = RunRecord(
+            name,
+            build,
+            lines,
+            profile=bool((extra_env or {}).get("CYCLONEDX_PROFILE")),
+        )
         return record
 
-    def _stream(self, command, env):
-        """Run *command*, echoing live (cold builds run for tens of minutes)."""
+    def _stream(self, command, env, abort_on_failure=True):
+        """Run *command*, echoing live (cold builds run for tens of minutes).
+
+        *abort_on_failure* watches for the first failed-task line and
+        interrupts the build group; a deliberate rejection run passes
+        False, because BitBake winds down its own scheduler on failure
+        and a harness-side SIGINT would kill in-flight sstate restores
+        mid-manifest, leaving the deploy directory transitional rather
+        than merely stale.
+        """
         proc = subprocess.Popen(
             command,
             cwd=kas_env.REPO_ROOT,
@@ -202,7 +249,7 @@ class KasRunRecorder:
                 lines.append(line)
                 sys.stderr.write(line)
                 sys.stderr.flush()
-                if _TASK_FAILURE.search(line) and not task_failed.is_set():
+                if abort_on_failure and _TASK_FAILURE.search(line) and not task_failed.is_set():
                     aborted.append(line)
                     task_failed.set()
 
@@ -302,6 +349,10 @@ class RunDocuments:
     def vex(self):
         return self.document(kas_env.VEX_NAME, "image VEX")
 
+    @property
+    def alignment_report(self):
+        return self.document(kas_env.ALIGNMENT_REPORT_NAME, "alignment report")
+
 
 @pytest.fixture(scope="session")
 def container_runtime():
@@ -336,15 +387,21 @@ def cold_run(kas_build, kas_runs):
 
 
 @pytest.fixture(scope="session")
-def cyclonedx_17_validator():
-    """Validator over the vendored CycloneDX 1.7 JSON schema.
+def schema_validation():
+    """The layer's shared feature-detected CycloneDX schema-validation
+    module (`lib/schema_validation.py`), the same one the renderer's
+    requirements matrix evaluates through.
 
-    `jsonschema` is an integration-layer-only dependency: the module
-    carrying it is imported here, lazily, never at collection time, so the
-    deselected unit suite never requires it.
+    Deployed-document checks assert real verdicts, and `jsonschema` is an
+    optional dependency: the module is imported here lazily, never at
+    collection time, and this tier skips with a hint when validation
+    cannot run.
     """
     try:
-        from tests.integration import schema_validation
+        import schema_validation
     except ImportError:
         pytest.skip(kas_env.JSONSCHEMA_HINT)
-    return schema_validation.bom_validator()
+    reason = schema_validation.availability("1.7")
+    if reason is not None:
+        pytest.skip(f"{kas_env.JSONSCHEMA_HINT}\nreason: {reason}")
+    return schema_validation

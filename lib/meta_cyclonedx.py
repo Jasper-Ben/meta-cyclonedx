@@ -9,9 +9,9 @@ This module is the single production owner of SBOM and VEX document
 semantics: component identity, dependency graph construction, document
 mapping, configuration validation and rendering. It consumes normalized
 build facts and artifact facts (plain data structures) and never touches
-the BitBake data store, task state or the filesystem. The BitBake class
-in classes/ is a thin adapter that collects the facts and deploys the
-returned documents.
+the BitBake data store, task state or build-artifact filesystem. Only
+pinned normative data (schemas and SPDX vocabularies) is read by the
+renderer. The BitBake adapter collects facts and deploys returned documents.
 
 render(facts) is the primary behavioral seam of the layer.
 
@@ -25,6 +25,8 @@ config                rendered document options:
     include_unpatched_vulns       bool   (sbom-cve-check merge only)
     unpatched_vulns_state         str    (sbom-cve-check merge only)
     sbom_serial_placeholder       str    placeholder used in fragment VEX refs
+    profile                       str    alignment profile name ("" = none)
+    enforcement                   str    "report" (default) | "strict"
 timestamp             ISO-8601 string used for both document metadata blocks
 log                   callable(level, message); level is an int debug level
                       or one of "warn", "error", "note"
@@ -32,29 +34,136 @@ primary               the delivered product:
     type / name / version         primary component metadata
     external_references           optional list; when the key is absent the
                                   primary component carries none
+    creator                       optional creator-contact grammar string
+                                  naming the product manufacturer as the
+                                  creator of the delivered product
+    source_uri / deployable_uri   optional explicit URIs for the primary
+                                  component (source and deployable form)
+    licenses                      optional original licence entries for the
+                                  delivered product (its recipe LICENSE)
+    distribution_licence          optional SPDX expression; the explicitly
+                                  identified authoritative distribution
+                                  licence source of the delivered product
+    effective_licence             optional SPDX expression; the effective
+                                  licence the SBOM creator supplies for the
+                                  delivered product
+sbom_creator            creator-contact grammar string naming the entity
+                        responsible for compiling this SBOM; entries are
+                        separated by ';' and each entry is
+                        "NAME <EMAIL-or-URL>", "<URL>", a bare email
+                        address or a bare URL
 fragments             per-recipe normalized facts, keyed by recipe name, in
                       the on-disk partial-SBOM format written by
                       do_populate_cyclonedx: "pkgs", "cves", "dependencies",
-                      "bom_ref_dedup_map", "extra_components",
-                      "extra_dependencies", "extra_roots"
+                      "extra_components", "extra_dependencies", "extra_roots",
+                      plus "extra_bom_errors": rows {"file", "error"} for
+                      imported ecosystem BOM files the adapter could not
+                      read or attach in report enforcement (the graph is
+                      composed from what is usable; the rest is reported),
+                      plus creator and URI evidence keys "creator",
+                      "source_uri" and "deployable_uri" (grammar strings /
+                      URIs; explicit overrides above recorded metadata),
+                      plus licence-role evidence keys
+                      "distribution_licence" and "effective_licence" (SPDX
+                      expressions; the component "licenses" entries are
+                      original licence evidence only)
 runtime_recipes       recipe names whose components are "required"
 image_install_recipes recipe names installed by image author intent; their
                       components hang directly off the graph root
 runtime_edges         recipe -> dependency recipe edges observed from the
                       installed packages (empty when unresolved by design)
+debug_sources         recipe -> delivered file -> debug-source paths recorded
+                      in pkgdata; prefixes of other recipes become statically
+                      linked dependency edges (missing/empty = unknown
+                      static coverage, never absent dependencies)
+file_inventory         recipe -> ordered delivered-file artifact facts,
+                      collected only while an alignment profile is
+                      selected and covering only mandatory files
+                      (executables and archives, plus the deployable
+                      artifact and selected payloads below); entries
+                      under the recipe-less key "" are owned by the primary
+                      component: unowned rootfs files and deploy-directory
+                      artifacts; each entry:
+    path                        delivered path inside the root
+                                filesystem (an absolute delivered path),
+                                or a deploy-directory-relative path
+                                (stable names, no build stamps)
+    sha512                      SHA-512 of the delivered bytes (absent
+                                on defective entries)
+    executable / archive /
+      structured                taxonomy values (absent on defective
+                                entries)
+    error                       "missing", "unreadable" or
+                                "ambiguous-classification" (defective
+                                entries stay reported, never vanish)
+    source                      "deployable" for the primary
+                                deployable artifact and "selected" for
+                                explicitly selected additional files;
+                                absent for root-filesystem evidence,
+                                whether package-owned or primary-owned
+                      The adapter skips root-filesystem symlinks and
+                      other non-regular entries: their content
+                      identity belongs to the regular file they
+                      resolve to.
 included_images       ordered embedded-image documents:
     name                          recipe name of the included image
-    sbom                          its completed SBOM document
+    sbom                          its completed SBOM document, or None when
+                                  unreadable (see sbom_error)
     vex                           its completed VEX document, or None
     vex_error                     parse error text when unreadable, else None
+    sbom_error                    parse/availability error text when the
+                                  SBOM itself is unreadable, else absent
 """
 
+import bz2
 import copy
+import fnmatch
+import functools
+import importlib
+import importlib.util
+import json
+import lzma
+import os
+import posixpath
 import re
+import stat
+import struct
+import urllib.parse
 import uuid
+import zlib
 from datetime import datetime, timezone
 
+
+def _alignment_profile():
+    """
+    Load the project-owned requirements-matrix module that sits next to
+    this file. Under BitBake the layer's lib directory is not on the
+    worker's module search path, so fall back to loading by path, mirroring
+    how the adapter loads this module itself.
+    """
+    try:
+        return importlib.import_module("alignment_profile")
+    except ImportError:
+        name = "cyclonedx_alignment_profile"
+        path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                            "alignment_profile.py")
+        spec = importlib.util.spec_from_file_location(name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+
 SUPPORTED_SPEC_VERSIONS = ["1.6", "1.7"]
+
+# Vocabulary note (ADR-0011): meta-cyclonedx produces alignment evidence,
+# never a conformance claim; the conformance determination stays with the
+# manufacturer. This statement rides along in every alignment report.
+CONFORMANCE_DETERMINATION_NOTE = (
+    "meta-cyclonedx makes no TR-03183-2 or CRA conformance claim; this "
+    "alignment report is evidence for the manufacturer's conformance "
+    "determination, which also requires completeness evidence unavailable "
+    "to meta-cyclonedx."
+)
 
 # Image types supported by CycloneDX 1.6 and 1.7
 SUPPORTED_IMAGE_TYPES = [
@@ -74,11 +183,38 @@ SUPPORTED_IMAGE_TYPES = [
 ]
 
 
-def config_errors(spec_version, image_type):
+def config_errors(spec_version, image_type, profile=None, enforcement=None,
+                  deduplicate_cpe_collisions=False,
+                  expand_cve_product_aliases=False):
     """
     Validate renderer-relevant configuration and return a human-readable
     fatal error string, or None when the configuration is supported.
+
+    profile and enforcement carry the CYCLONEDX_PROFILE and
+    CYCLONEDX_PROFILE_ENFORCEMENT selections; an absent or empty profile
+    keeps the plain (unaligned) output, so demanding enforcement without a
+    profile is a configuration error.
+    Neither opt-in CPE tooling projection can coexist with a profile.
     """
+    matrix = _alignment_profile()
+    if profile:
+        baseline = matrix.PROFILES.get(profile)
+        if baseline is None:
+            return (f"Unsupported CYCLONEDX_PROFILE: {profile}. "
+                    f"Supported profiles: {', '.join(sorted(matrix.PROFILES))}")
+        if spec_version not in baseline["specVersions"]:
+            return (
+                f"Alignment profile '{profile}' supports CycloneDX "
+                f"{', '.join(baseline['specVersions'])}; CYCLONEDX_SPEC_VERSION "
+                f"'{spec_version}' is an unsupported profile/schema combination"
+            )
+    if profile and deduplicate_cpe_collisions:
+        return ("CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS cannot be enabled "
+                "with CYCLONEDX_PROFILE; projected output is not alignment evidence")
+    if profile and expand_cve_product_aliases:
+        return ("CYCLONEDX_EXPAND_CVE_PRODUCT_ALIASES cannot be enabled "
+                "with CYCLONEDX_PROFILE; projected output is not alignment evidence")
+
     if spec_version not in SUPPORTED_SPEC_VERSIONS:
         return (f"Unsupported CYCLONEDX_SPEC_VERSION: {spec_version}. "
                 f"Supported versions: {', '.join(SUPPORTED_SPEC_VERSIONS)}")
@@ -88,50 +224,702 @@ def config_errors(spec_version, image_type):
             f"Unsupported CYCLONEDX_IMAGE_TYPE value '{image_type}'. "
             f"Valid types are: {', '.join(SUPPORTED_IMAGE_TYPES)}"
         )
+
+    if enforcement and enforcement not in matrix.ENFORCEMENT_VALUES:
+        return (f"Unsupported CYCLONEDX_PROFILE_ENFORCEMENT: {enforcement}. "
+                f"Supported values: {', '.join(matrix.ENFORCEMENT_VALUES)}")
+
+    if not profile and enforcement and enforcement != "report":
+        return ("CYCLONEDX_PROFILE_ENFORCEMENT requires CYCLONEDX_PROFILE "
+                "to select an alignment profile")
     return None
 
 
-def component_identity(products_names, version, purl, external_references=None):
+def serialize_report(report):
     """
-    Build one component identity record per vulnerability-correlation
-    product name of a recipe. Names carrying a "vendor:" qualifier gain a
-    group and a vendor-qualified CPE; the purl records the Yocto/package
-    identity shared by all names of the recipe.
+    Serialize an alignment report to its canonical artifact text.
+
+    The findings are ordered by requirement identifier and the keys are
+    sorted, so equivalent normalized facts always produce byte-identical
+    output; the report carries no wall-clock time and no values derived
+    from per-render random identifiers.
     """
-    packages = []
+    return json.dumps(report, indent=2, sort_keys=True) + "\n"
 
-    # keep only the short version which can be matched against vulnerabilities databases
-    version = version.split("+git")[0]
 
-    # Ensure version is never empty (required by some SBOM profiles)
-    if not version or version.strip() == "":
-        version = "unknown"
+# A creator-assigned identity override is authoritative verbatim. The
+# semantically valid BPN/PV defaults must look like a name and like a
+# version: single identifier-like tokens, the version carrying at least
+# one digit; degenerate defaults never enter documents as identity.
+VALID_LOGICAL_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9.+_~+-]*")
+VALID_LOGICAL_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._+~+-]*")
 
-    # some packages have alternative names, so we split CVE_PRODUCT
-    # deduplicate, and iterate in a stable order: the fragment's component
-    # array rides task signatures and document assembly alike.
-    for product in sorted(set(products_names.split())):
-        # CVE_PRODUCT in recipes may include vendor information for CPE identifiers. If not,
-        # use wildcard for vendor.
-        if ":" in product:
-            vendor, product = product.split(":", 1)
-        else:
-            vendor = ""
+# Vulnerability correlation aliases survive in component properties so
+# every CVE_PRODUCT / CVE_VERSION token keeps reaching the VEX and CVE
+# matching inputs without ever becoming component identity (ADR-0006).
+ALIAS_PRODUCT_PROPERTY = "yocto:cve:product"
+ALIAS_VERSION_PROPERTY = "yocto:cve:version"
+ALIAS_CPE_PROPERTY = "yocto:cve:cpe"
 
-        pkg = {
-            "name": product,
-            "version": version,
-            "type": "library",
-            "cpe": 'cpe:2.3:*:{}:{}:{}:*:*:*:*:*:*:*'.format(vendor or "*", product, version),
-            "purl": purl,
-            "bom-ref": str(uuid.uuid4())
-        }
-        if vendor != "":
-            pkg["group"] = vendor
-        if external_references:
-            pkg["externalReferences"] = external_references
-        packages.append(pkg)
-    return packages
+# View-only rows for CPE-keyed consumers must never become inventory or VEX
+# anchors. Recipe fragments continue to carry only logical components.
+ALIAS_PROJECTION_PROPERTY = "yocto:projection:cve-product-alias"
+
+
+# Statically linked code is attributed only from the debugsrc lists BitBake's
+# own do_package records in pkgdata; delivered binaries are never parsed
+# (ADR-0002). A debug-source prefix /usr/src/debug/<BPN>/<PV>/ identifies the
+# recipe that compiled the file it names.
+DEBUG_SRC_RECIPE_PREFIX = re.compile(r"^/usr/src/debug/([^/]+)/[^/]+(?:/|$)")
+DEPENDENCY_EVIDENCE_PROPERTY = "yocto:dependency:evidence"
+
+# File inventory (BSI TR-03183-2 v2.1.0 §3.2.1 and §5.2.2): delivered
+# executables and archives arrive as normalized artifact facts and compose
+# into exact file components. The bom-ref is derived from the delivering
+# recipe and the delivered path, so reruns mint stable references without
+# randomness; file components carry artifact identity only and never a
+# purl, CPE or licence (ADR-0006).
+BSI_FILENAME_PROPERTY = "bsi:component:filename"
+BSI_EXECUTABLE_PROPERTY = "bsi:component:executable"
+BSI_ARCHIVE_PROPERTY = "bsi:component:archive"
+BSI_STRUCTURED_PROPERTY = "bsi:component:structured"
+
+
+def _file_bom_ref(recipe, path):
+    """The deterministic bom-ref of one inventoried delivered file."""
+    return f"yocto-file:{recipe}:{path}"
+
+
+# Artifact inspection signatures (ADR-0002): deterministic magic numbers
+# and file-structure metadata used only for inventory classification -
+# never to infer dependencies, embedded software or debug information.
+ARTIFACT_HEAD_SIZE = 65536
+_ELF_MAGIC = b"\x7fELF"
+_ZIP_LOCAL_MAGIC = b"PK\x03\x04"
+_ZIP_EMPTY_MAGIC = b"PK\x05\x06"
+_GZIP_MAGIC = b"\x1f\x8b"
+_XZ_MAGIC = b"\xfd7zXZ\x00"
+_BZIP2_MAGIC = b"BZh"
+_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+_7Z_MAGIC = b"7z\xbc\xaf\x27\x1c"
+_RPM_MAGIC = b"\xed\xab\xee\xdb"
+_AR_MAGIC = b"!<arch>\n"
+_CPIO_MAGICS = (b"070701", b"070707")
+_TAR_MAGIC = b"ustar"
+_SHT_SYMTAB = 2
+
+
+def _archive_kind(data):
+    """The container or compressed-stream family a signature reveals."""
+    if data.startswith((_ZIP_LOCAL_MAGIC, _ZIP_EMPTY_MAGIC)):
+        return "zip"
+    if data.startswith(_GZIP_MAGIC):
+        return "gzip"
+    if data.startswith(_XZ_MAGIC):
+        return "xz"
+    if data[0:3] == _BZIP2_MAGIC and data[3:4] in b"123456789":
+        return "bzip2"
+    if data.startswith(_ZSTD_MAGIC):
+        return "zstd"
+    if data.startswith(_7Z_MAGIC):
+        return "7z"
+    if data.startswith(_RPM_MAGIC):
+        return "rpm"
+    if data[:6] in _CPIO_MAGICS:
+        return "cpio"
+    if data[257:262] == _TAR_MAGIC:
+        return "tar"
+    if data.startswith(_AR_MAGIC):
+        return "ar"
+    return None
+
+
+def _decompressed_head(kind, data):
+    """The leading inner bytes of a single-stream compressed container."""
+    try:
+        if kind == "gzip":
+            return zlib.decompressobj(zlib.MAX_WBITS | 31).decompress(
+                data, 4096)
+        if kind == "xz":
+            return lzma.LZMADecompressor().decompress(
+                data[:ARTIFACT_HEAD_SIZE])
+        if kind == "bzip2":
+            return bz2.BZ2Decompressor().decompress(data[:ARTIFACT_HEAD_SIZE])
+    except Exception:
+        return b""
+    return b""
+
+
+def _elf_has_symbol_table(data):
+    """True when the ELF section header table still carries a symtab.
+
+    Reading the fixed-offset header and section entries is metadata
+    inspection only: an unstripped image keeps the structured content
+    metadata BSI counts, a stripped one does not (TR-03183-2 v2.1.0
+    §8.1.6); no code analysis happens here (ADR-0002).
+    """
+    if len(data) < 64:
+        return False
+    endian = "<" if data[5] == 1 else ">"
+    if data[4] == 2:  # ELFCLASS64
+        sh_off = struct.unpack_from(endian + "Q", data, 0x28)[0]
+        sh_entsize = struct.unpack_from(endian + "H", data, 0x3a)[0]
+        sh_num = struct.unpack_from(endian + "H", data, 0x3c)[0]
+    else:  # ELFCLASS32
+        sh_off = struct.unpack_from(endian + "I", data, 0x20)[0]
+        sh_entsize = struct.unpack_from(endian + "H", data, 0x2e)[0]
+        sh_num = struct.unpack_from(endian + "H", data, 0x30)[0]
+    if not sh_off or not sh_entsize or not 0 < sh_num <= 4096:
+        return False
+    for index in range(sh_num):
+        entry = sh_off + index * sh_entsize
+        if entry + 4 > len(data):
+            return False
+        if struct.unpack_from(endian + "I", data, entry)[0] == _SHT_SYMTAB:
+            return True
+    return False
+
+
+def classify_delivered_file(path, mode, data):
+    """Classify one delivered file for the mandatory file inventory.
+
+    Inputs: the delivered path, the lstat mode of the delivered entry
+    and the leading bytes (or full content) of the delivered bytes.
+    The decision table is deterministic:
+
+    - regular files only: symlinks and other special entries are not
+      separate delivered artifacts - their content identity belongs to
+      the regular file they resolve to, which is inventoried itself.
+    - executable: any mode exec bit, a shebang at offset 0 or an ELF
+      signature.
+    - archive: a recognized container or compressed-stream signature.
+    - mandatory (= inventoried here): executable or archive; ordinary
+      configuration, documentation and data files stay omitted
+      (ADR-0005).
+    - structured: the container still carries content metadata -
+      entry/directory tables (zip, tar, cpio, ar, rpm, 7z) or an ELF
+      symbol table; stripped ELFs, scripts and single-stream
+      compressed files are unstructured.
+    - error "ambiguous-classification": a recognized signature too
+      truncated or corrupt to classify; the entry is reported, never
+      guessed.
+    """
+    if not stat.S_ISREG(mode):
+        return {"inventory": False, "mandatory": False,
+                "executable": "non-executable", "archive": "no archive",
+                "structured": "unstructured"}
+    executable = (bool(mode & 0o111) or data.startswith(b"#!")
+                  or data.startswith(_ELF_MAGIC))
+    kind = _archive_kind(data)
+    structured = "unstructured"
+    error = None
+    if kind in ("zip", "tar", "cpio", "ar", "rpm", "7z"):
+        structured = "structured"
+    elif kind in ("gzip", "xz", "bzip2"):
+        inner = _decompressed_head(kind, data)
+        if _archive_kind(inner) in ("zip", "tar", "cpio", "ar", "rpm", "7z",
+                                    "gzip", "xz", "bzip2"):
+            structured = "structured"
+    if data.startswith(_ELF_MAGIC):
+        if len(data) < 64:
+            error = "ambiguous-classification"
+        elif _elf_has_symbol_table(data):
+            structured = "structured"
+    if data.startswith(_ZIP_LOCAL_MAGIC) and len(data) < 30:
+        error = "ambiguous-classification"
+    return {"inventory": True,
+            "mandatory": executable or kind is not None,
+            "executable": "executable" if executable else "non-executable",
+            "archive": "archive" if kind else "no archive",
+            "structured": structured,
+            **({"error": error} if error else {})}
+
+
+
+def plan_deploy_file_selection(patterns, deploy_files,
+                               primary_candidates=()):
+    """Plan the deploy-directory file selection (ticket #10).
+
+    Pure grammar and dedup logic for the BitBake adapter, which
+    enumerates the image deploy directory and hashes what this plans.
+    The renderer consumes the resulting entries through the
+    file_inventory facts key; this function itself never touches the
+    filesystem, keeping the selection semantics deterministic and
+    testable.
+
+    patterns: whitespace-separated tokens. Each token is a shell-style
+    glob (fnmatch; `*` crosses directory boundaries) matched against
+    deploy-directory-relative paths; a token beginning with "/" is
+    anchored at the deploy directory, and the recorded path is always
+    the relative one.
+    deploy_files: mapping of deploy-directory-relative path to
+    {"kind": "file"|"symlink", "target": the resolved relative target
+    path, or None when unresolvable}.
+    primary_candidates: ordered relative paths naming the image's own
+    deployable artifacts (the stable link names of the declared
+    IMAGE_FSTYPES); these are mandatory inventory (TR-03183-2 v2.1.0
+    §5.2.2) even when no pattern selects them.
+
+    Returns the ordered artifact plan: primary candidates first
+    (source "deployable"), then every other selection match ordered by
+    path (source "selected"), then a "missing" entry per pattern that
+    matched nothing - explicit evidence instead of silence (ADR-0004).
+    A symlink records the artifact under its (stable) link name; a
+    regular file equal to the target of an already planned or selected
+    symlink is the same artifact instance and is skipped. Broken
+    symlinks are "unreadable" evidence.
+    """
+    def normalize(token):
+        token = token.lstrip("/")
+        while token.startswith("./"):
+            token = token[2:]
+        return token
+
+    def planned(path):
+        entry = {"path": path, "source": "deployable"}
+        kind = (deploy_files.get(path) or {}).get("kind")
+        if kind is None:
+            entry["error"] = "missing"
+        elif kind == "symlink" and \
+                (deploy_files[path].get("target") is None):
+            entry["error"] = "unreadable"
+        return entry
+
+    def claimed_target(path):
+        return (deploy_files.get(path) or {}).get("target")
+
+    plan = [planned(candidate) for candidate in primary_candidates]
+    claimed = set(primary_candidates)
+    claimed.update(claimed_target(candidate)
+                   for candidate in primary_candidates
+                   if claimed_target(candidate))
+
+    tokens = [normalize(token) for token in patterns.split() if token]
+    matched_any = set()
+    for token in tokens:
+        for path in deploy_files:
+            if fnmatch.fnmatchcase(path, token):
+                matched_any.add(token)
+
+    matched = {path for path in deploy_files
+               if any(fnmatch.fnmatchcase(path, token) for token in tokens)}
+    for path in matched:
+        info = deploy_files[path]
+        if info.get("kind") == "symlink" and info.get("target"):
+            # The stable link name records the instance; claim the
+            # (possibly timestamped) target so it is never selected as
+            # a second name for the same bytes.
+            claimed.add(info["target"])
+    for path in sorted(matched - claimed):
+        entry = {"path": path, "source": "selected"}
+        if deploy_files[path].get("kind") == "symlink" and \
+                not deploy_files[path].get("target"):
+            entry["error"] = "unreadable"
+        plan.append(entry)
+
+    for token in sorted(set(tokens) - matched_any):
+        plan.append({"path": token, "source": "selected",
+                     "error": "missing"})
+    return plan
+
+
+# The dependency graph crosses the scope of delivery exactly once per
+# known path: the first external component is represented as identified —
+# creator-unverified name and identifier plus a delivery-scope marker that
+# keeps it distinct from delivered component instances — and resolution
+# stops there unless deeper evidence exists (ADR-0004, never a silent drop).
+DELIVERY_SCOPE_PROPERTY = "yocto:delivery:scope"
+
+
+# Licence roles (BSI TR-03183-2 v2.1.0 §3.2.8 and the §8.2 mapping
+# tables): ORIGINAL licences are the licences assigned by the component
+# creator and ride the CycloneDX licences field with acknowledgement
+# "declared"; DISTRIBUTION licences ("concluded") are the licences under
+# which a recipient may use the component and require a semantically
+# authoritative source; the EFFECTIVE licence is the licence under which
+# the creator of the current SBOM uses the component and rides the
+# official BSI property. The property name follows the pinned property
+# taxonomy v0.1.2 registry spelling ("Licence"); the TR-03183-2 v2.1.0
+# PDF tables carry a "License" variant of the same property. The
+# generator performs no legal or composition analysis and never derives
+# one licence role from another (ADR-0003).
+EFFECTIVE_LICENCE_PROPERTY = "bsi:component:effectiveLicence"
+ORIGINAL_LICENCE_ACKNOWLEDGEMENT = "declared"
+DISTRIBUTION_LICENCE_ACKNOWLEDGEMENT = "concluded"
+
+# Explicit licence roles use the SPDX vocabulary pinned to the selected
+# CycloneDX version. Only expression syntax is evaluated, never legal
+# compatibility or the relationship between licence roles.
+SPDX_LICENCE_REF = re.compile(
+    r"(?:DocumentRef-[A-Za-z0-9.-]+:)?LicenseRef-[A-Za-z0-9.-]+")
+
+
+@functools.lru_cache(maxsize=2)
+def _licence_vocabulary(spec_version):
+    """Pinned normative data, independent of the build's filesystem."""
+    directory = os.path.join(os.path.dirname(__file__), "..", "meta", "files",
+                             "spdx-license-list-data")
+    with open(os.path.join(directory, f"licenses-{spec_version}.json")) as stream:
+        licences = {entry["licenseId"] for entry in json.load(stream)["licenses"]}
+    with open(os.path.join(directory, f"exceptions-{spec_version}.json")) as stream:
+        exceptions = {entry["licenseExceptionId"]
+                      for entry in json.load(stream)["exceptions"]}
+    return licences, exceptions
+
+
+def _normalize_licence_expression(expression, spec_version):
+    """Validate SPDX syntax and identifiers; normalize OE operators."""
+    if not isinstance(expression, str) or not expression.strip():
+        return None
+    licences, exceptions = _licence_vocabulary(spec_version)
+    tokens = [{"&": "AND", "|": "OR"}.get(token, token)
+              for token in re.findall(r"\(|\)|[&|]|[^()\s&|]+", expression)]
+    position = 0
+
+    def operand():
+        nonlocal position
+        if position >= len(tokens):
+            return False
+        token = tokens[position]
+        position += 1
+        if token == "(":
+            if not compound() or position >= len(tokens) \
+                    or tokens[position] != ")":
+                return False
+            position += 1
+            return True
+        if not (token in licences or token.removesuffix("+") in licences
+                or SPDX_LICENCE_REF.fullmatch(token)):
+            return False
+        if position < len(tokens) and tokens[position] == "WITH":
+            position += 1
+            if position >= len(tokens) or tokens[position] not in exceptions:
+                return False
+            position += 1
+        return True
+
+    def compound():
+        nonlocal position
+        if not operand():
+            return False
+        while position < len(tokens) and tokens[position] in ("AND", "OR"):
+            position += 1
+            if not operand():
+                return False
+        return True
+
+    if not compound() or position != len(tokens):
+        return None
+    return " ".join(tokens).replace("( ", "(").replace(" )", ")")
+
+
+def _apply_distribution_licence(component, expression, spec_version, log, holder):
+    """Append an explicitly supplied distribution licence entry."""
+    normalized = _normalize_licence_expression(expression, spec_version)
+    if normalized is None:
+        _log(log, "warn", f"{holder}: distribution licence {expression!r} "
+                           f"is not a valid SPDX licence expression; "
+                           f"omitted")
+        return
+    if spec_version == "1.6" and component.get("licenses"):
+        # 1.6 permits one SPDX expression OR a list of licence objects.
+        # Keep the original declarations as evidence and publish the
+        # asserted distribution expression separately, without relabelling.
+        originals = component.pop("licenses")
+        evidence = component.setdefault("evidence", {}).setdefault("licenses", [])
+        evidence.extend(entry for entry in originals if entry not in evidence)
+    component.setdefault("licenses", []).append(
+        {"expression": normalized,
+         "acknowledgement": DISTRIBUTION_LICENCE_ACKNOWLEDGEMENT})
+
+
+def _apply_effective_licence(component, expression, spec_version, log, holder):
+    """Attach an explicitly supplied effective licence property once."""
+    normalized = _normalize_licence_expression(expression, spec_version)
+    if normalized is None:
+        _log(log, "warn", f"{holder}: effective licence {expression!r} is "
+                           f"not a valid SPDX licence expression; omitted")
+        return
+    properties = component.setdefault("properties", [])
+    if any(p.get("name") == EFFECTIVE_LICENCE_PROPERTY
+           for p in properties):
+        return
+    properties.append({"name": EFFECTIVE_LICENCE_PROPERTY,
+                       "value": normalized})
+
+
+
+def _apply_licence_evidence(component, evidence, spec_version, log, holder):
+    """Attach explicitly supplied distribution and effective licences.
+
+    Both roles exist only from a semantically authoritative source the
+    product integration supplied; neither is ever derived from original
+    licence evidence (ADR-0003).
+    """
+    if evidence.get("distribution_licence"):
+        _apply_distribution_licence(component,
+                                    evidence["distribution_licence"],
+                                    spec_version, log, holder)
+    if evidence.get("effective_licence"):
+        _apply_effective_licence(component, evidence["effective_licence"],
+                                 spec_version, log, holder)
+
+
+def _mark_original_licences(component):
+    """Make the original licence role explicit on every licence entry.
+
+    Recipe LICENSE metadata is original licence evidence only; entries
+    that already carry an acknowledgement keep whatever role the
+    document states, and none is ever rewritten into another.
+    """
+    for entry in component.get("licenses") or []:
+        if "acknowledgement" in entry:
+            continue
+        target = entry["license"] if isinstance(entry.get("license"),
+                                                 dict) else entry
+        target.setdefault("acknowledgement", ORIGINAL_LICENCE_ACKNOWLEDGEMENT)
+
+
+def _identified_component(recipe_name, add_scope):
+    """The minimal CycloneDX representation of an external dependency."""
+    component = {
+        "type": "library",
+        "name": recipe_name,
+        "version": "unknown",
+        "purl": f"pkg:yocto/{recipe_name}",
+        "bom-ref": str(uuid.uuid4()),
+    }
+    if add_scope:
+        component["scope"] = "excluded"
+    component["properties"] = [{
+        "name": DELIVERY_SCOPE_PROPERTY,
+        "value": "external",
+    }]
+    return component
+
+
+def _debugsrc_targets(debug_sources, represented_recipes):
+    """
+    Map each recipe to the represented recipes whose code its debug-source
+    records show was statically linked in. Own-prefix paths are the recipe
+    compiling itself and prefixes of unrepresented recipes carry no claim;
+    both are ignored.
+    """
+    targets = {}
+    for recipe in sorted(debug_sources):
+        found = set()
+        for paths in (debug_sources[recipe] or {}).values():
+            if isinstance(paths, str):
+                paths = paths.split()
+            for path in paths:
+                match = DEBUG_SRC_RECIPE_PREFIX.match(path)
+                if (match and match.group(1) != recipe
+                        and match.group(1) in represented_recipes):
+                    found.add(match.group(1))
+        if found:
+            targets[recipe] = sorted(found)
+    return targets
+
+
+def _add_dependency_evidence(component, origin):
+    """Record where a component's dependency evidence came from."""
+    properties = component.setdefault("properties", [])
+    entry = {"name": DEPENDENCY_EVIDENCE_PROPERTY, "value": origin}
+    if entry not in properties:
+        properties.append(entry)
+
+
+def _short_version(version):
+    """Short upstream version of a Yocto version string (drops +git suffixes)."""
+    return (version or "").split("+git")[0].strip()
+
+
+def default_logical_version(pv):
+    """
+    The logical version a PV implies: the short version when it is
+    semantically valid (identifier-shaped and carrying at least one
+    digit), otherwise the "unknown" placeholder.
+    """
+    short = _short_version(pv)
+    if VALID_LOGICAL_VERSION.fullmatch(short) and any(c.isdigit() for c in short):
+        return short
+    return "unknown"
+
+
+def logical_identity(bpn, pv, name_override=None, version_override=None):
+    """
+    Resolve the logical component identity of a recipe: the creator-
+    assigned name and version of its component instance (ADR-0006).
+
+    Explicit CycloneDX identity overrides (CYCLONEDX_COMPONENT_NAME and
+    CYCLONEDX_COMPONENT_VERSION) take precedence verbatim. The defaults
+    are BPN and the short PV, used only when semantically valid; an
+    invalid default degrades to the "unknown" placeholder.
+    """
+    default_name = (bpn or "").strip()
+    if not VALID_LOGICAL_NAME.fullmatch(default_name):
+        default_name = "unknown"
+    name = name_override.strip() if name_override else default_name
+    version = (version_override.strip() if version_override
+               else default_logical_version(pv))
+    return name, version
+
+
+def component_identity(bpn, pv, purl, cve_products=None, cve_versions=None,
+                       name_override=None, version_override=None,
+                       external_references=None):
+    """
+    Build the single logical component identity record of a recipe.
+
+    One recipe is one independently assessable logical component (ADR-0006,
+    ADR-0009): its name and version are creator-assigned — explicit
+    overrides over semantically valid BPN and PV defaults. CVE_PRODUCT and
+    CVE_VERSION are vulnerability-correlation aliases only: they never
+    create or rename the component, they carry a "vendor:" qualifier into
+    the CPE, and every token stays available through yocto:cve:product,
+    yocto:cve:version and yocto:cve:cpe properties for the VEX and CVE
+    matching inputs. The first declared product and version select the
+    component's CPE; repeated tokens keep only their first occurrence.
+    The purl records the Yocto/package identity of the build (pkg:yocto,
+    OpenEmbedded's purl prefix) alongside, never instead of, the
+    logical identity.
+    """
+    name, version = logical_identity(bpn, pv, name_override, version_override)
+
+    # BitBake defaults CVE_PRODUCT to BPN and CVE_VERSION to PV; mirror
+    # that so the function's own defaults carry complete correlation data.
+    products = list(dict.fromkeys((cve_products or "").split())) \
+        or [token for token in [(bpn or "").strip()] if token]
+    versions = list(dict.fromkeys(filter(
+        None, map(_short_version, (cve_versions or "").split())))) \
+        or [default_logical_version(pv)]
+
+    cpes = []
+    for token in products:
+        vendor, _, product = token.partition(":")
+        if not product:
+            vendor, product = "", token
+        for short in versions:
+            cpes.append("cpe:2.3:*:{}:{}:{}:*:*:*:*:*:*:*".format(
+                vendor or "*", product, short))
+
+    pkg = {
+        "name": name,
+        "version": version,
+        "type": "library",
+        "purl": purl,
+        "bom-ref": str(uuid.uuid4()),
+    }
+    if cpes:
+        pkg["cpe"] = cpes[0]
+    pkg["properties"] = (
+        [{"name": ALIAS_PRODUCT_PROPERTY, "value": token} for token in products]
+        + [{"name": ALIAS_VERSION_PROPERTY, "value": short} for short in versions]
+        + [{"name": ALIAS_CPE_PROPERTY, "value": cpe} for cpe in cpes])
+    if external_references:
+        pkg["externalReferences"] = external_references
+    return pkg
+
+
+def component_correlation_cpes(component):
+    """Every correlation CPE of a component: its own plus alias CPEs."""
+    cpes = set()
+    if component.get("cpe"):
+        cpes.add(component["cpe"])
+    for prop in component.get("properties") or []:
+        if prop.get("name") == ALIAS_CPE_PROPERTY and prop.get("value"):
+            cpes.add(prop["value"])
+    return cpes
+
+
+def identity_collisions(sbom, vex=None, require_instance_evidence=False):
+    """
+    Group the components whose CPE correlation identifiers collide.
+
+    Components sharing at least one CPE (transitively) form one collision
+    group. A group is explained when every member carries observable
+    evidence that distinguishes it from all others — package purl,
+    artifact hashes, build properties, licences, dependency targets or VEX
+    analysis. Any two members indistinguishable on all these axes are an
+    unresolved identity collision. For the opt-in tooling projection,
+    require_instance_evidence excludes package coordinates alone: different
+    names do not establish differing build instances. Returns a list of
+    dicts with keys bomRefs and correlationCpes (both sorted) and bool
+    explained, ordered by the first bomRef.
+    """
+    components_by_ref = {}
+    for component in sbom.get("components") or []:
+        ref = component.get("bom-ref")
+        if ref:
+            components_by_ref[ref] = component
+
+    dep_targets = {}
+    for entry in sbom.get("dependencies") or []:
+        ref = entry.get("ref")
+        if ref:
+            dep_targets[ref] = sorted(set(entry.get("dependsOn") or []))
+
+    vex_status = {}
+    for vuln in (vex or {}).get("vulnerabilities") or []:
+        statement_key = _vex_statement_key(vuln)
+        for affect in vuln.get("affects") or []:
+            _prefix, _sep, ref = (affect.get("ref") or "").rpartition("#")
+            if ref:
+                vex_status.setdefault(ref, []).append(statement_key)
+
+    def distinguishable_evidence(component):
+        ref = component.get("bom-ref")
+        return (
+            None if require_instance_evidence else component.get("purl"),
+            json.dumps(_canonical_evidence(component.get("hashes")), sort_keys=True),
+            json.dumps(_canonical_evidence([
+                prop for prop in component.get("properties") or []
+                if prop.get("name") not in (ALIAS_PRODUCT_PROPERTY,
+                                            ALIAS_VERSION_PROPERTY,
+                                            ALIAS_CPE_PROPERTY)]), sort_keys=True),
+            json.dumps(component.get("licenses"), sort_keys=True),
+            tuple(dep_targets.get(ref, [])),
+            tuple(sorted(vex_status.get(ref, []))))
+
+    # union-find over the shared-CPE relation
+    parents = {ref: ref for ref in components_by_ref}
+
+    def find(ref):
+        while parents[ref] != ref:
+            ref = parents[ref]
+        return ref
+
+    cpe_owner = {}
+    for ref in sorted(components_by_ref):
+        for cpe in sorted(component_correlation_cpes(components_by_ref[ref])):
+            owner = cpe_owner.get(cpe)
+            if owner is None:
+                cpe_owner[cpe] = ref
+                continue
+            root_owner, root_ref = find(owner), find(ref)
+            if root_owner != root_ref:
+                parents[root_ref] = root_owner
+
+    groups = {}
+    for ref in sorted(components_by_ref):
+        groups.setdefault(find(ref), []).append(ref)
+
+    collisions = []
+    for group in groups.values():
+        if len(group) < 2:
+            continue
+        cpes = set()
+        for ref in group:
+            cpes |= component_correlation_cpes(components_by_ref[ref])
+        evidence = [distinguishable_evidence(components_by_ref[ref])
+                    for ref in group]
+        collisions.append({
+            "bomRefs": sorted(group),
+            "correlationCpes": sorted(cpes),
+            "explained": len(set(evidence)) == len(evidence),
+        })
+    collisions.sort(key=lambda collision: collision["bomRefs"][0])
+    return collisions
 
 
 def normalize_cve_id(cve_id):
@@ -240,12 +1028,515 @@ def kernel_vex_statement(cve_id, bom_refs, placeholder, detail):
     }
 
 
+
+# Creator evidence uses a small document grammar; every contact must be
+# machine-actionable through an email address or URL, mirroring the BSI
+# requirement that a creator be identifiable by contact data.
+CREATOR_CONTACT_SEPARATOR = ";"
+_CREDITED_CONTACT = re.compile(r"^\s*(?P<name>[^<>]*?)\s*<(?P<contact>[^<>]+)>\s*$")
+_EMAIL_ADDRESS = re.compile(r"^[^@\s<>(),:;]+@[^@\s<>(),:;]+\.[^@\s<>(),:;]+$")
+
+# URI reference categories that carry the BSI source or deployable URIs.
+# Only these are filtered for trustworthy evidence and syntax-validated;
+# other external-reference types are documentation, not URIs the
+# profile requires.
+SOURCE_URI_TYPES = {"vcs", "source-distribution"}
+DEPLOYABLE_URI_TYPES = {"distribution"}
+URI_REFERENCE_TYPES = SOURCE_URI_TYPES | DEPLOYABLE_URI_TYPES | {"website"}
+
+
+def _valid_uri(uri):
+    """True when the string parses as a URI with a usable location."""
+    if not isinstance(uri, str) or not uri.strip():
+        return False
+    try:
+        parsed = urllib.parse.urlparse(uri.strip())
+    except ValueError:
+        return False
+    if parsed.scheme.lower() == "mailto":
+        return bool(_EMAIL_ADDRESS.match(parsed.path))
+    return bool(parsed.scheme and parsed.netloc)
+
+
+def _parse_contacts(spec, log=None):
+    """Parse creator-contact grammar into sorted organizationalContacts.
+
+    One contact per machine-actionable email address or URL, shaped the
+    way the CycloneDX schema's organizationalContact expects it (both
+    supported versions name the same `authors` fields); an entry is
+    "NAME <EMAIL-or-URL>", "<URL>", a bare email address or a bare URL.
+    An entry without a machine-actionable email or URL is rejected with a
+    warning and never emitted as contact data. Contacts come back sorted
+    so equivalent evidence always renders identical bytes.
+    """
+    entities = {}
+    for entry in (spec or "").split(CREATOR_CONTACT_SEPARATOR):
+        entry = entry.strip()
+        if not entry:
+            continue
+        name, contact = "", entry
+        credited = _CREDITED_CONTACT.match(entry)
+        if credited:
+            name = credited.group("name").strip()
+            contact = credited.group("contact").strip()
+        if _EMAIL_ADDRESS.match(contact):
+            kind, value = "email", contact
+        elif _valid_uri(contact):
+            if contact.lower().startswith("mailto:"):
+                kind, value = "email", contact[len("mailto:"):]
+            else:
+                kind, value = "url", contact
+        else:
+            _log(log, "warn", f"creator contact {entry!r} carries no usable "
+                              f"email address or URL; not emitted")
+            continue
+        entity = entities.setdefault(name, {"email": set(), "url": set()})
+        entity[kind].add(value)
+    contacts = []
+    for name, found in entities.items():
+        for kind in ("email", "url"):
+            contacts.extend({**({"name": name} if name else {}), kind: value}
+                            for value in sorted(found[kind]))
+    contacts.sort(key=lambda contact: (
+        contact.get("name", ""), contact.get("email", contact.get("url", ""))))
+    return contacts
+
+
+def _apply_creator_identity(component, contacts):
+    """Stamp creator contacts onto a component; never overwrite claims.
+
+    Components carry creator contacts through the schema's `authors`
+    field (an organizationalContact array); the deprecated `author`
+    string is kept alongside for the name so readers of either field
+    find the same identity. A component that already names an author or
+    carries authors of its own keeps what it states (ADR-0006: creator
+    claims are never silently rewritten).
+    """
+    if not contacts or component.get("author") or component.get("authors"):
+        return False
+    author = next((contact["name"] for contact in contacts
+                   if contact.get("name")), "")
+    if author:
+        component["author"] = author
+    component["authors"] = [dict(contact) for contact in contacts]
+    return True
+
+
+# "Semantically trustworthy upstream metadata" for creator evidence is
+# defined narrowly: only machine-readable upstream identity fields --
+# repository-type upstream purls, whose namespace is the upstream
+# organization, and fetcher-derived vcs references recorded on the
+# component. Free-form author names are never scraped into contacts.
+_UPSTREAM_PURL = re.compile(r"^pkg:(?P<type>github|gitlab|bitbucket)/"
+                            r"(?P<owner>[^/@?#]+)/(?P<project>[^/?#]+)")
+_UPSTREAM_VCS = re.compile(
+    r"^(?:(?:https?|ssh|git)://|git@)"
+    r"(?P<host>github\.com|gitlab\.com|bitbucket\.org)"
+    r"[:/]+(?P<owner>[^/@:;]+)/(?P<project>[^;?#]+?)(?:\.git)?(?:[;/?#].*)?$")
+
+
+def _upstream_creator_entities(component):
+    """Upstream creator contacts derived from recorded upstream identity."""
+    match = _UPSTREAM_PURL.match(component.get("purl") or "")
+    if match:
+        purl_type = match.group("type")
+        host = ("bitbucket.org" if purl_type == "bitbucket"
+                else f"{purl_type}.com")
+        owner, project = match.group("owner"), match.group("project")
+    else:
+        match = None
+        for reference in component.get("externalReferences") or ():
+            if reference.get("type") not in SOURCE_URI_TYPES:
+                continue
+            match = _UPSTREAM_VCS.match(reference.get("url") or "")
+            if match:
+                break
+        if not match:
+            return []
+        host = match.group("host")
+        owner, project = match.group("owner"), match.group("project")
+    project = re.sub(r"\.git$", "", project)
+    return [{"name": owner, "url": f"https://{host}/{owner}/{project}"}]
+
+
+def _canonical_evidence(value):
+    """Set-like document arrays compare independently of discovery order."""
+    if isinstance(value, dict):
+        return {key: _canonical_evidence(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return sorted((_canonical_evidence(item) for item in value),
+                      key=lambda item: json.dumps(item, sort_keys=True))
+    return value
+
+
+def _vex_statement_key(statement):
+    """Substantive statement identity; issuance times do not change analysis."""
+    content = {key: value for key, value in statement.items()
+               if key not in ("affects", "bom-ref")}
+    if "analysis" in content:
+        content["analysis"] = {
+            key: value for key, value in content["analysis"].items()
+            if key not in ("firstIssued", "lastUpdated")}
+    return json.dumps(_canonical_evidence(content), sort_keys=True)
+
+
+def _instance_context(components, dependencies, vulnerabilities=()):
+    """Keep the source graph and VEX beside each reconciliation candidate."""
+    nodes = {c["bom-ref"]: c for c in components if c.get("bom-ref")}
+    edges = {}
+    for entry in dependencies:
+        edges.setdefault(entry.get("ref"), set()).update(
+            entry.get("dependsOn") or [])
+    analyses = {}
+    for statement in vulnerabilities:
+        for affect in statement.get("affects") or []:
+            ref = (affect.get("ref") or "").rpartition("#")[2] \
+                or affect.get("ref")
+            analyses.setdefault(ref, set()).add(_vex_statement_key(statement))
+    return {"components": nodes, "dependencies": edges, "analyses": analyses}
+
+
+def _same_instance(left, right, left_context, right_context, seen):
+    """Coordinates nominate candidates; contradictory evidence vetoes a merge.
+
+    Compare dependency instances recursively in their original graphs, not
+    their document-local references. A visited pair closes a graph cycle.
+    Missing declarations may be enriched, but two differing declarations
+    must remain independently assessable.
+    """
+    left_key, right_key = _instance_key(left), _instance_key(right)
+    same_ref = left.get("bom-ref") and left.get("bom-ref") == right.get("bom-ref")
+    if not same_ref and (left_key is None or left_key != right_key):
+        return False
+    for key in left.keys() & right.keys() - {"bom-ref", "scope"}:
+        if _canonical_evidence(left[key]) != _canonical_evidence(right[key]):
+            return False
+    left_ref, right_ref = left.get("bom-ref"), right.get("bom-ref")
+    left_analysis = left_context["analyses"].get(left_ref)
+    right_analysis = right_context["analyses"].get(right_ref)
+    if left_analysis is not None and right_analysis is not None \
+            and left_analysis != right_analysis:
+        return False
+    pair = (id(left), id(right), id(left_context), id(right_context))
+    if pair in seen:
+        return True
+    seen = seen | {pair}
+    left_targets = left_context["dependencies"].get(left_ref)
+    right_targets = right_context["dependencies"].get(right_ref)
+    if left_targets is None or right_targets is None:
+        return True
+    if len(left_targets) != len(right_targets):
+        return False
+    unmatched = sorted(right_targets)
+    for target in sorted(left_targets):
+        left_node = left_context["components"].get(target)
+        for index, candidate in enumerate(unmatched):
+            right_node = right_context["components"].get(candidate)
+            if (left_node is not None and right_node is not None
+                    and _same_instance(left_node, right_node, left_context,
+                                       right_context, seen)) \
+                    or (left_node is None and right_node is None
+                        and target == candidate):
+                unmatched.pop(index)
+                break
+        else:
+            return False
+    return True
+
+
+def _index_instance(index, component, context):
+    ref = component.get("bom-ref")
+    if not ref:
+        return
+    record = (component, [(component, context)])
+    index.setdefault(("ref", ref), []).append(record)
+    key = _instance_key(component)
+    if key is not None:
+        index.setdefault(key, []).append(record)
+
+
+def _matching_instance(index, component, context):
+    candidates = index.get(_instance_key(component), [])
+    candidates = candidates + index.get(("ref", component.get("bom-ref")), [])
+    for survivor, views in candidates:
+        if all(_same_instance(previous, component, source, context, set())
+               for previous, source in views):
+            # Retain every source view: later incomplete records cannot
+            # bridge two builds that have contradictory known evidence.
+            views.append((component, context))
+            return survivor
+    return None
+
+
+def _merge_instance_evidence(existing, incoming, add_scopes):
+    """Enrich a compatible instance without replacing any source evidence."""
+    if add_scopes:
+        merged_scope = _highest_priority_scope(existing.get("scope"),
+                                               incoming.get("scope"))
+        if merged_scope:
+            existing["scope"] = merged_scope
+    for key, value in incoming.items():
+        if key not in ("bom-ref", "scope") and key not in existing:
+            existing[key] = copy.deepcopy(value)
+
+
+def _project_alias_row(sbom, owner_ref, cpe, product, version, group=None,
+                       other_cpes=()):
+    """Attach a marked CPE view row to its logical component."""
+    alias_ref = str(uuid.uuid4())
+    alias = {
+        "type": "library",
+        "name": product,
+        "version": version,
+        "bom-ref": alias_ref,
+        "cpe": cpe,
+        "properties": [
+            {"name": ALIAS_PROJECTION_PROPERTY, "value": "true"},
+            *({"name": ALIAS_CPE_PROPERTY, "value": value}
+              for value in other_cpes if value != cpe),
+        ],
+    }
+    if group:
+        alias["group"] = group
+    sbom["components"].append(alias)
+    sbom["dependencies"].append(
+        {"ref": alias_ref, "dependsOn": [owner_ref]})
+    sbom["compositions"].append(
+        {"aggregate": "unknown", "assemblies": [alias_ref]})
+    return alias_ref
+
+
+def _expand_cve_product_aliases(sbom, recipe_refs):
+    """Project secondary recipe product tokens, without changing logical facts."""
+    projected_refs = set()
+    components_by_ref = {component["bom-ref"]: component
+                         for component in sbom["components"]
+                         if component.get("bom-ref")}
+    for refs in recipe_refs.values():
+        for ref in refs:
+            logical = components_by_ref.get(ref)
+            if logical is None:
+                continue
+            properties = logical.get("properties") or []
+            products = list(dict.fromkeys(
+                prop["value"] for prop in properties
+                if prop.get("name") == ALIAS_PRODUCT_PROPERTY and prop.get("value")))
+            cpes = [prop["value"] for prop in properties
+                    if prop.get("name") == ALIAS_CPE_PROPERTY and prop.get("value")]
+            version = next((prop["value"] for prop in properties
+                            if prop.get("name") == ALIAS_VERSION_PROPERTY
+                            and prop.get("value")), logical.get("version", "unknown"))
+            seen_cpes = {logical.get("cpe")}
+            for token in products[1:]:
+                vendor, separator, product = token.partition(":")
+                if not separator:
+                    vendor, product = "*", token
+                prefix = f"cpe:2.3:*:{vendor or '*'}:{product}:"
+                product_cpes = list(dict.fromkeys(
+                    value for value in cpes if value.startswith(prefix)))
+                cpe = next((value for value in product_cpes
+                            if value.startswith(f"{prefix}{version}:")), None)
+                if cpe is None:
+                    continue
+                # Bare and explicit wildcard-vendor tokens share a CPE.
+                # The logical row already represents its own primary CPE.
+                if cpe in seen_cpes:
+                    continue
+                seen_cpes.add(cpe)
+                projected_refs.add(_project_alias_row(
+                    sbom, ref, cpe, product, version,
+                    group=vendor if separator and vendor else None,
+                    other_cpes=product_cpes))
+    return projected_refs
+
+
+def _deduplicate_cpe_collisions(sbom, vex, recipe_refs, log,
+                                projected_refs=None):
+    """Project explained native collisions, then coalesce their alias rows."""
+    native_refs = {ref for refs in recipe_refs.values() for ref in refs}
+    recipe_by_ref = {ref: recipe for recipe, refs in recipe_refs.items()
+                     for ref in refs}
+    native_components = [c for c in sbom["components"]
+                         if c.get("bom-ref") in native_refs]
+    collisions = identity_collisions(
+        {"components": native_components, "dependencies": sbom["dependencies"]},
+        vex, require_instance_evidence=True)
+    components_by_ref = {c["bom-ref"]: c for c in native_components}
+    remap = {}
+    for group in collisions:
+        if not group["explained"]:
+            continue
+        members = [components_by_ref[ref] for ref in group["bomRefs"]]
+        # A shared package coordinate does not erase differing artifact or
+        # build evidence. Prefer stable component evidence over minted refs
+        # when choosing a survivor within one explained group.
+        survivor = min(
+            members,
+            key=lambda member: (
+                member.get("purl") or "",
+                member.get("name") or "",
+                member.get("version") or "",
+                json.dumps(_canonical_evidence({
+                    key: value for key, value in member.items()
+                    if key != "bom-ref"}), sort_keys=True),
+                recipe_by_ref.get(member["bom-ref"], ""),
+                member["bom-ref"]))
+        for member in members:
+            if member is survivor:
+                continue
+            remap[member["bom-ref"]] = survivor["bom-ref"]
+            existing = survivor.setdefault("properties", [])
+            for prop in member.get("properties") or []:
+                if prop.get("name") in (ALIAS_PRODUCT_PROPERTY,
+                                        ALIAS_VERSION_PROPERTY,
+                                        ALIAS_CPE_PROPERTY) and prop not in existing:
+                    existing.append(prop)
+            if projected_refs is not None and member.get("cpe") and (
+                    member["cpe"] != survivor.get("cpe")):
+                # The absorbed recipe's primary token was not expanded (only
+                # secondary tokens are). Keep its correlation CPE visible as
+                # a view row, without transferring its files or VEX status.
+                cpe = member["cpe"]
+                parts = cpe.split(":")
+                vendor, product, version = parts[3:6]
+                projected_refs.add(_project_alias_row(
+                    sbom, member["bom-ref"], cpe, product, version,
+                    group=vendor if vendor != "*" else None))
+            _log(log, "note", "CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS: "
+                 f"merged {member.get('purl')} into {survivor.get('purl')}")
+
+    # Expansion has already added alias rows for each native instance.
+    # Native survivors retain their logical identity; aliases contributed
+    # by absorbed recipes coalesce only within the same surviving owner.
+    # An alias with the survivor's own CPE is redundant.
+    projected = ([component for component in sbom["components"]
+                  if component.get("bom-ref") in projected_refs]
+                 if projected_refs is not None else [])
+    alias_owner = {
+        entry["ref"]: entry["dependsOn"][0]
+        for entry in sbom["dependencies"]
+        if entry["ref"] in (projected_refs or ()) and entry.get("dependsOn")}
+    visible_aliases = {}
+    for alias in projected:
+        ref = alias["bom-ref"]
+        owner = remap.get(alias_owner.get(ref), alias_owner.get(ref))
+        if owner is None:
+            continue
+        native = components_by_ref.get(owner)
+        if native is not None and alias["cpe"] == native.get("cpe"):
+            remap[ref] = owner
+            continue
+        key = (owner, alias["cpe"])
+        if key in visible_aliases:
+            remap[ref] = visible_aliases[key]["bom-ref"]
+            survivor_alias = visible_aliases[key]
+            existing = survivor_alias.setdefault("properties", [])
+            for prop in alias.get("properties") or []:
+                if prop not in existing:
+                    existing.append(prop)
+        else:
+            visible_aliases[key] = alias
+
+    if not remap:
+        return
+    sbom["components"] = [c for c in sbom["components"]
+                          if c.get("bom-ref") not in remap]
+    # Both owner and target edges are rewritten, including native owners of
+    # delivered file components and the primary component's install edges.
+    rewritten = []
+    by_ref = {}
+    for entry in sbom["dependencies"]:
+        owner = remap.get(entry["ref"], entry["ref"])
+        output = by_ref.get(owner)
+        if output is None:
+            output = {**entry, "ref": owner, "dependsOn": []}
+            rewritten.append(output)
+            by_ref[owner] = output
+        for ref in entry.get("dependsOn") or []:
+            target = remap.get(ref, ref)
+            if target != owner and target not in output["dependsOn"]:
+                output["dependsOn"].append(target)
+    sbom["dependencies"] = rewritten
+
+    # Composition assemblies are references too. Distinct native instances
+    # now name the same assembly, without changing imported assemblies.
+    assemblies = set()
+    compositions = []
+    for composition in sbom.get("compositions") or []:
+        refs = [remap.get(ref, ref) for ref in composition.get("assemblies") or []]
+        refs = list(dict.fromkeys(refs))
+        if len(refs) == 1 and refs[0] in assemblies:
+            continue
+        assemblies.update(refs)
+        compositions.append({**composition, "assemblies": refs})
+    sbom["compositions"] = compositions
+
+    # Serial substitution already happened; only refs in this SBOM's own
+    # serial namespace can name an absorbed native instance.
+    prefix = f"urn:cdx:{sbom['serialNumber'].removeprefix('urn:uuid:')}/{sbom['version']}#"
+    survivor_targets = {prefix + ref for ref in remap.values()}
+    analyses = {}
+    statements = []
+    for statement in vex["vulnerabilities"]:
+        affects = []
+        for affect in statement.get("affects") or []:
+            ref = affect.get("ref", "")
+            if ref.startswith(prefix):
+                ref = prefix + remap.get(ref[len(prefix):], ref[len(prefix):])
+            target = {**affect, "ref": ref}
+            if target not in affects:
+                affects.append(target)
+        projected_targets = {affect.get("ref") for affect in affects} & survivor_targets
+        key = _vex_statement_key(statement)
+        existing = next((row for targets, row in analyses.get(key, [])
+                         if projected_targets & targets), None)
+        if existing is None:
+            existing = {**statement, "affects": affects}
+            statements.append(existing)
+            if projected_targets:
+                analyses.setdefault(key, []).append((projected_targets, existing))
+        else:
+            existing["affects"].extend(
+                affect for affect in affects if affect not in existing["affects"])
+    vex["vulnerabilities"] = statements
+
+    # Do not conceal pre-existing malformed fragments/imported documents;
+    # only verify that no removed reference remains in a projected document.
+    invalid = next((entry for entry in sbom["dependencies"]
+                    if entry["ref"] in remap or
+                    any(ref in remap for ref in entry.get("dependsOn") or [])),
+                   None)
+    if invalid is not None:
+        raise RuntimeError(
+            f"CPE collision projection left an absorbed SBOM dependency "
+            f"reference: {invalid!r}")
+    invalid = next((composition for composition in sbom["compositions"]
+                    if any(ref in remap
+                           for ref in composition.get("assemblies") or [])),
+                   None)
+    if invalid is not None:
+        raise RuntimeError(
+            f"CPE collision projection left an absorbed SBOM composition "
+            f"reference: {invalid!r}")
+    invalid = next((affect for statement in statements
+                    for affect in statement.get("affects") or []
+                    if affect.get("ref", "").startswith(prefix)
+                    and affect["ref"][len(prefix):] in remap), None)
+    if invalid is not None:
+        raise RuntimeError(
+            f"CPE collision projection left an absorbed VEX affects "
+            f"reference: {invalid!r}")
+
+
 def render(facts):
     """
     Render the SBOM and VEX documents from normalized build facts.
 
-    Returns {"sbom": ..., "vex": ...}. The documents depend only on the
-    facts; diagnostics are reported through the facts["log"] callback.
+    Returns {"sbom": ..., "vex": ...}, plus {"report": ...} when an
+    alignment profile is selected. With strict alignment enforcement and
+    at least one machine-detectable violation the renderer returns no
+    documents but {"failure": ...}. Everything depends only on the facts;
+    diagnostics are reported through the facts["log"] callback.
     """
     timestamp = facts.get("timestamp")
     log = facts.get("log")
@@ -253,6 +1544,8 @@ def render(facts):
     spec_version = config.get("spec_version") or "1.7"
     add_scopes = config.get("add_component_scopes", True)
     placeholder = config.get("sbom_serial_placeholder", "")
+    profile = config.get("profile") or ""
+    enforcement = config.get("enforcement") or "report"
 
     fragments = copy.deepcopy(facts.get("fragments") or {})
     runtime_recipes = set(facts.get("runtime_recipes") or ())
@@ -275,6 +1568,9 @@ def render(facts):
         "timestamp": timestamp,
         "tools": _create_tools_metadata()
     }
+    sbom_creators = _parse_contacts(facts.get("sbom_creator"), log)
+    if sbom_creators:
+        sbom_metadata["authors"] = sbom_creators
     sbom_metadata["component"] = {
         "type": image_type,
         "name": image_name,
@@ -283,6 +1579,20 @@ def render(facts):
     }
     if "external_references" in primary:
         sbom_metadata["component"]["externalReferences"] = primary["external_references"]
+    _apply_creator_identity(
+        sbom_metadata["component"], _parse_contacts(primary.get("creator"), log))
+    if primary.get("licenses"):
+        sbom_metadata["component"]["licenses"] = copy.deepcopy(
+            primary["licenses"])
+    for reference_key, reference_type in (("source_uri", "vcs"),
+                                          ("deployable_uri", "distribution")):
+        if primary.get(reference_key):
+            sbom_metadata["component"].setdefault(
+                "externalReferences", []).append(
+                    {"type": reference_type, "url": primary[reference_key]})
+    _mark_original_licences(sbom_metadata["component"])
+    _apply_licence_evidence(sbom_metadata["component"], primary, spec_version,
+                            log, "primary component")
 
     sbom = {
         "bomFormat": "CycloneDX",
@@ -331,27 +1641,21 @@ def render(facts):
     recipe_refs = {}
     component_recipes = {}
     ref_recipes = {}
-    # Global deduplication map that tracks all duplicate bom-refs across all recipes
-    global_bom_ref_dedup_map = {}
 
     image_recipe_names = set(fragments)
 
     # Track direct-install components without persisting debug properties in output.
     directly_installed_component_refs = set()
 
-    # first loop to fill the dictionary
-    # Iterate in a stable order: the recipe names arrive unordered, and the
-    # loops below resolve collisions on a first-one-wins basis.
+    # First loop to fill the dictionary. Iterate in a stable order: the
+    # recipe names arrive unordered and component declaration order feeds
+    # the dependency-target ordering.
     for pkg in sorted(fragments):
         pn_list = fragments[pkg]
 
-        # Merge recipe-level deduplication map into global map
-        if "bom_ref_dedup_map" in pn_list:
-            global_bom_ref_dedup_map.update(pn_list["bom_ref_dedup_map"])
-
         for pn_pkg in pn_list["pkgs"]:
-            # A recipe contributes one component per CVE_PRODUCT name; index them
-            # all so a dependency on the recipe reaches every alias component.
+            # A recipe contributes its one logical component; index it so a
+            # dependency on the recipe or its logical name reaches it.
             recipe_refs.setdefault(pkg, []).append(pn_pkg["bom-ref"])
             component_recipes.setdefault(pn_pkg["name"], pkg)
             ref_recipes[pn_pkg["bom-ref"]] = pkg
@@ -360,25 +1664,42 @@ def render(facts):
         pn_list = fragments[pkg]
 
         for pn_pkg in pn_list["pkgs"]:
-            # Avoid multiple pkgs referencing the same cpe
-            existing_component = next((sbom_pkg for sbom_pkg in sbom["components"]
-                                       if sbom_pkg["cpe"] == pn_pkg["cpe"]), None)
-            if existing_component:
-                if pkg in image_install_recipes:
-                    existing_ref = existing_component.get("bom-ref")
-                    if existing_ref:
-                        directly_installed_component_refs.add(existing_ref)
-                # Redirect references to the component that was dropped as a duplicate.
-                if existing_component.get("bom-ref"):
-                    global_bom_ref_dedup_map[pn_pkg["bom-ref"]] = existing_component["bom-ref"]
-                continue
+            # Every fragment component is an independently assessable
+            # instance and enters the inventory as-is: CPE equality never
+            # merges component instances (ADR-0006). Collisions with other
+            # instances are reported downstream, never deduplicated here.
 
             # Add scope field to indicate runtime vs build-time component
             # Can be disabled for certain SBOM profiles or tool compatibility
             if add_scopes:
                 pn_pkg["scope"] = "required" if pkg in runtime_recipes else "excluded"
 
-            if pkg in image_install_recipes:
+            # Third-party creator precedence: explicit per-recipe
+            # override, then trustworthy upstream identity metadata,
+            # then unresolved. The product manufacturer is never stamped
+            # onto bundled third-party software.
+            creator_override = _parse_contacts(pn_list.get("creator"), log)
+            if creator_override:
+                _apply_creator_identity(pn_pkg, creator_override)
+            elif not pn_pkg.get("author") and not pn_pkg.get("authors"):
+                _apply_creator_identity(
+                    pn_pkg, _upstream_creator_entities(pn_pkg))
+
+            for reference_key, reference_type in (("source_uri", "vcs"),
+                                                  ("deployable_uri",
+                                                   "distribution")):
+                if pn_list.get(reference_key):
+                    pn_pkg.setdefault("externalReferences", []).append(
+                        {"type": reference_type,
+                         "url": pn_list[reference_key]})
+
+            # Recipe LICENSE metadata enters the document only as
+            # original licence evidence; its role is made explicit here
+            # and never rewritten into another role (ADR-0003).
+            _mark_original_licences(pn_pkg)
+            _apply_licence_evidence(pn_pkg, pn_list, spec_version, log, pkg)
+
+            if pkg in image_install_recipes and pn_pkg.get("bom-ref"):
                 directly_installed_component_refs.add(pn_pkg["bom-ref"])
 
             sbom["components"].append(pn_pkg)
@@ -388,15 +1709,13 @@ def render(facts):
             vex["vulnerabilities"].append(pn_cve)
 
 
-    # Sort components by name for a stable, human-readable order.
-    # The recipe set is unordered, so insertion order above is non-deterministic.
-    sbom["components"].sort(key=lambda c: (c["name"], c["version"]))
 
     # Add dependencies.
     # Runtime edges observed from the installed packages cover RRECOMMENDS,
     # per-package RDEPENDS and generated shlib dependencies, which the recipe
     # metadata alone misses. They are empty when the caller resolved
     # dependencies by configuration instead.
+    boundary_components = {}
     for pkg in sorted(fragments):
         pn_list = fragments[pkg]
 
@@ -410,41 +1729,44 @@ def render(facts):
 
         for dep_entry in deps:
             component_ref = dep_entry["ref"]
-            if component_ref in global_bom_ref_dedup_map:
-                component_ref = global_bom_ref_dedup_map[component_ref]
 
-            # Skip if component doesn't exist in SBOM
-            if not any(comp["bom-ref"] == component_ref for comp in sbom["components"]):
-                continue
-
+            # A ref that names no component is a dangling reference; the
+            # entry is preserved for the reference-integrity finding and
+            # never silently discarded (ADR-0004).
             resolved_depends = []
 
             for depends in list(dep_entry["dependsOn"]) + extra_depends:
                 if depends not in image_recipe_names:
-                    _log(log, 2, f"Skipping dependency {depends} - not in this image")
+                    # A known dependency recipe outside the delivery item:
+                    # follow the path to it, represent it as identified and
+                    # stop — deeper resolution is not claimed without
+                    # evidence, and the edge is never dropped either.
+                    boundary = boundary_components.get(depends)
+                    if boundary is None:
+                        boundary = _identified_component(depends, add_scopes)
+                        boundary_components[depends] = boundary
+                        sbom["components"].append(boundary)
+                        _log(log, 2, f"Dependency {depends} is outside the "
+                                     f"scope of delivery; represented as "
+                                     f"identified")
+                    if boundary["bom-ref"] not in resolved_depends:
+                        resolved_depends.append(boundary["bom-ref"])
                     continue
 
                 resolved_refs = _resolve_dependency_refs(depends, recipe_refs,
                                                         component_recipes, ref_recipes)
 
                 for resolved_ref in resolved_refs:
-                    if resolved_ref in global_bom_ref_dedup_map:
-                        resolved_ref = global_bom_ref_dedup_map[resolved_ref]
 
                     if resolved_ref == component_ref:
-                        continue
-
-                    # Verify that the component exists in the SBOM
-                    # If it was filtered out by CPE deduplication, skip this dependency entry
-                    if not any(comp["bom-ref"] == resolved_ref for comp in sbom["components"]):
                         continue
 
                     if resolved_ref not in resolved_depends:
                         resolved_depends.append(resolved_ref)
 
             if resolved_depends:
-                # Recipes sharing a CPE collapse onto one component, so merge
-                # instead of emitting a second node for the same bom-ref.
+                # CycloneDX graph nodes are unique per bom-ref, so merge
+                # repeated declarations of the same component ref.
                 existing_entry = next((entry for entry in sbom["dependencies"]
                                        if entry["ref"] == component_ref), None)
                 if existing_entry:
@@ -462,23 +1784,84 @@ def render(facts):
     # its fragment under "extra_components" / "extra_dependencies", and it is
     # merged into the image BOM here.
     #
-    # These entries already carry their own bom-refs, purls and dependency
-    # edges, so they are appended verbatim: the CPE deduplication and the
-    # recipe-name dependency remapping above apply to components derived from
-    # Yocto packages and would corrupt an externally resolved tree.
-    extra_seen_refs = {c["bom-ref"] for c in sbom["components"] if c.get("bom-ref")}
+    # These entries carry their own bom-refs, purls and dependency edges,
+    # so the recipe-name dependency remapping above does not apply: it
+    # addresses Yocto-derived components and would corrupt an externally
+    # resolved tree. Components are reconciled by instance identity
+    # (logical name, version and purl), edges are merged, and everything
+    # that stays unusable is published as a composition finding.
+    merge_defects = []
+    for pkg in sorted(fragments):
+        for failure in fragments[pkg].get("extra_bom_errors") or []:
+            _log(log, "warn", f"CYCLONEDX_EXTRA_BOM_FILES: {pkg}: imported "
+                              f"BOM {failure.get('file')} is unusable: "
+                              f"{failure.get('error')}")
+            merge_defects.append({
+                "kind": "imported-bom-unusable",
+                "source": f"{pkg} ({failure.get('file')})",
+                "message": f"imported BOM {failure.get('file')} could not "
+                           f"be read: {failure.get('error')}",
+                "refs": [],
+            })
+    extra_ref_components = {}
+    extra_identity_index = {}
+    source_context = _instance_context(
+        sbom["components"], sbom["dependencies"], vex["vulnerabilities"])
+    for component in sbom["components"]:
+        ref = component.get("bom-ref")
+        if ref:
+            extra_ref_components.setdefault(ref, component)
+        _index_instance(extra_identity_index, component, source_context)
+    contributed_ref_remap = {}
     for pkg in sorted(fragments):
         pn_list = fragments[pkg]
+        context = _instance_context(
+            pn_list.get("extra_components") or [],
+            pn_list.get("extra_dependencies") or [])
         for component in pn_list.get("extra_components", []):
-            ref = component.get("bom-ref") or component.get("purl")
-            if ref:
-                if ref in extra_seen_refs:
-                    continue
-                extra_seen_refs.add(ref)
+            ref = component.get("bom-ref")
+            survivor = _matching_instance(extra_identity_index, component,
+                                           context)
+            if survivor is not None:
+                if ref:
+                    contributed_ref_remap[ref] = survivor["bom-ref"]
+                _merge_instance_evidence(survivor, component, add_scopes)
+                continue
+            # Conflicting records, including colliding bom-refs, stay
+            # represented; integrity findings expose ambiguity.
             sbom["components"].append(component)
-        for dep_entry in pn_list.get("extra_dependencies", []):
-            if dep_entry not in sbom["dependencies"]:
-                sbom["dependencies"].append(dep_entry)
+            if ref:
+                extra_ref_components.setdefault(ref, component)
+            _index_instance(extra_identity_index, component, context)
+
+    # Fold the imported edges in after the whole contributed graph is
+    # reconciled, so ref rewrites apply consistently. Edges are merged,
+    # never recomputed or flattened: the ecosystem document remains
+    # authoritative for its own resolution (no package-manager
+    # reimplementation here), this layer only composes it.
+    for pkg in sorted(fragments):
+        pn_list = fragments[pkg]
+        for edge in pn_list.get("extra_dependencies") or []:
+            edge_ref = contributed_ref_remap.get(edge.get("ref"),
+                                                 edge.get("ref"))
+            if not edge_ref:
+                _log(log, "warn", f"CYCLONEDX_EXTRA_BOM_FILES: {pkg}: "
+                                  f"contributed dependency entry without "
+                                  f"a ref; its edges cannot be attached")
+                continue
+            depends_on = [contributed_ref_remap.get(target, target)
+                          for target in edge.get("dependsOn") or []
+                          if contributed_ref_remap.get(target,
+                                                       target) != edge_ref]
+            existing_entry = next((entry for entry in sbom["dependencies"]
+                                   if entry["ref"] == edge_ref), None)
+            if existing_entry is None:
+                sbom["dependencies"].append({"ref": edge_ref,
+                                             "dependsOn": depends_on})
+            else:
+                existing_entry["dependsOn"].extend(
+                    target for target in depends_on
+                    if target not in existing_entry["dependsOn"])
 
         # Attach each contributed tree to the recipe that produced it, so the
         # modules are attributable to the binary they are linked into instead of
@@ -488,8 +1871,6 @@ def render(facts):
             continue
         owner_refs = recipe_refs.get(pkg) or []
         owner_ref = owner_refs[0] if owner_refs else None
-        if owner_ref in global_bom_ref_dedup_map:
-            owner_ref = global_bom_ref_dedup_map[owner_ref]
         if not owner_ref or not any(c.get("bom-ref") == owner_ref for c in sbom["components"]):
             _log(log, 1, f"CYCLONEDX_EXTRA_BOM_FILES: {pkg}: no component to attach "
                          f"{len(extra_roots)} contributed tree(s) to")
@@ -499,23 +1880,176 @@ def render(facts):
             owner_entry = {"ref": owner_ref, "dependsOn": []}
             sbom["dependencies"].append(owner_entry)
         for root_ref in extra_roots:
-            if root_ref in extra_seen_refs and root_ref not in owner_entry["dependsOn"]:
+            root_ref = contributed_ref_remap.get(root_ref, root_ref)
+            if root_ref not in extra_ref_components:
+                # A root no component carries: the imported document is
+                # malformed. The attach edge is published anyway and goes
+                # out as a dangling reference finding, never silently
+                # detached from the owner (ADR-0004).
+                _log(log, "warn", f"CYCLONEDX_EXTRA_BOM_FILES: {pkg}: "
+                                  f"contributed root {root_ref} names no "
+                                  f"component; the imported graph is "
+                                  f"malformed")
+                merge_defects.append({
+                    "kind": "imported-root-missing",
+                    "source": pkg,
+                    "message": f"contributed root {root_ref} names no "
+                               f"component",
+                    "refs": [root_ref],
+                })
+            if root_ref not in owner_entry["dependsOn"]:
                 owner_entry["dependsOn"].append(root_ref)
 
-    # Fold in complete SBOMs of the included embedded images.
-    # Components shared by CPE are deduplicated (parent wins); unique
-    # components are added with scope "required".
+    # Fold in complete SBOMs of the included embedded images. Components
+    # with compatible source evidence may reconcile onto the parent's
+    # bom-ref. Contradictory artifact, build, licence, dependency or VEX
+    # evidence preserves separate instances, regardless of shared coordinates.
     _merge_included_images(sbom, vex, copy.deepcopy(facts.get("included_images")) or (),
                            config, spec_version, sbom_serial_number,
-                           add_scopes, directly_installed_component_refs, log)
+                           add_scopes, directly_installed_component_refs, log,
+                           merge_defects)
+
+    # Statically linked edges observed from pkgdata debug-source records:
+    # another recipe's debug-source prefix in this recipe's file list proves
+    # that recipe's code was linked in. The edge rides the dependency graph;
+    # its evidence origin rides the depending component's properties.
+    static_targets = _debugsrc_targets(facts.get("debug_sources") or {},
+                                       set(fragments))
+    components_by_ref = {c["bom-ref"]: c for c in sbom["components"]
+                         if c.get("bom-ref")}
+    for owner in sorted(static_targets):
+        for owner_ref in recipe_refs.get(owner, []):
+            owner_entry = next((entry for entry in sbom["dependencies"]
+                                if entry["ref"] == owner_ref), None)
+            for target in static_targets[owner]:
+                for target_ref in recipe_refs.get(target, []):
+                    if target_ref == owner_ref:
+                        continue
+                    if owner_entry is None:
+                        owner_entry = {"ref": owner_ref, "dependsOn": []}
+                        sbom["dependencies"].append(owner_entry)
+                    if target_ref not in owner_entry["dependsOn"]:
+                        owner_entry["dependsOn"].append(target_ref)
+                    _add_dependency_evidence(components_by_ref[owner_ref],
+                                             "debugsrc")
+
+
+    # Compose the file inventory: every delivered mandatory file becomes
+    # an exact file component owned by the recipe's logical component,
+    # whose graph entry gains the file reference. Active only with a
+    # selected alignment profile; ordinary output stays a logical-component
+    # SBOM (ADR-0005), and the renderer never inspects files itself -
+    # classification and hashing stay artifact facts (ADR-0002). Entries
+    # the adapter could not classify carry an error kind and stay
+    # reported, never silently dropped (ADR-0004). Deploy-directory
+    # evidence (the primary deployable artifact and explicitly selected
+    # product payloads, ticket #10) arrives under the recipe-less owner
+    # key "": the primary component owns and delivers those artifacts,
+    # which no root-filesystem package manifest names.
+    file_inventory = facts.get("file_inventory") or {}
+    file_facts = []
+    for recipe in sorted(file_inventory):
+        for entry in file_inventory[recipe]:
+            file_facts.append({**entry, "recipe": recipe,
+                               "ref": _file_bom_ref(recipe, entry["path"])})
+    for artifact in file_facts:
+        if artifact.get("error"):
+            _log(log, "warn", f"File inventory: {artifact['recipe']}: "
+                              f"mandatory delivered file "
+                              f"{artifact['path']} is {artifact['error']}")
+    primary_owned_file_refs = []
+    composed_refs = set()
+    if profile:
+        for artifact in file_facts:
+            if artifact.get("error"):
+                continue
+            if artifact["ref"] in composed_refs:
+                # One artifact instance discovered through several
+                # evidences (package manifest, deployable, embedded
+                # image or explicit selection) is one file component:
+                # the artifact ref - recipe namespace plus delivered
+                # path - is the dedup key. The evidence entries all
+                # stay in the report context; the document does not
+                # duplicate.
+                continue
+            recipe = artifact["recipe"]
+            if recipe == "":
+                owner_refs = [metadata_component_ref]
+                version = image_version
+            else:
+                owner_refs = recipe_refs.get(recipe) or []
+                version = next((component.get("version")
+                                for component in
+                                (fragments.get(recipe) or {}).get("pkgs", ())
+                                if component.get("version")), "unknown")
+            name = posixpath.basename(artifact["path"])
+            sbom["components"].append({
+                "type": "file",
+                "name": name,
+                "version": version,
+                "bom-ref": artifact["ref"],
+                "hashes": [{"alg": "SHA-512",
+                            "content": artifact["sha512"]}],
+                "properties": [
+                    {"name": BSI_FILENAME_PROPERTY, "value": name},
+                    {"name": BSI_EXECUTABLE_PROPERTY,
+                     "value": artifact["executable"]},
+                    {"name": BSI_ARCHIVE_PROPERTY,
+                     "value": artifact["archive"]},
+                    {"name": BSI_STRUCTURED_PROPERTY,
+                     "value": artifact["structured"]},
+                ],
+            })
+            composed_refs.add(artifact["ref"])
+            owner_ref = owner_refs[0] if owner_refs else None
+            if owner_ref == metadata_component_ref:
+                # The graph root entry is inserted below; collect the
+                # artifact reference instead of minting a second entry
+                # for the same ref.
+                primary_owned_file_refs.append(artifact["ref"])
+            elif owner_ref:
+                owner_entry = next((dep for dep in sbom["dependencies"]
+                                    if dep["ref"] == owner_ref), None)
+                if owner_entry is None:
+                    owner_entry = {"ref": owner_ref, "dependsOn": []}
+                    sbom["dependencies"].append(owner_entry)
+                if artifact["ref"] not in owner_entry["dependsOn"]:
+                    owner_entry["dependsOn"].append(artifact["ref"])
+
+    # The component declaration order is fixed here, after EVERY append:
+    # the recipe set above is unordered, boundary, contributed and
+    # embedded components are appended in discovery order, which moves
+    # between task reruns, and everything positional downstream - leaf
+    # entries, dependency-target ranks, compositions - derives from this
+    # one deterministic order.
+    sbom["components"].sort(key=lambda c: (c.get("name") or "",
+                                           c.get("version") or "",
+                                           c.get("bom-ref") or ""))
+
+    # Every represented component participates in the dependency graph.
+    # A leaf gets a dependency entry with an empty list, so a machine can
+    # tell a known leaf apart from a component whose edges were lost.
+    dependency_entry_refs = {entry["ref"] for entry in sbom["dependencies"]}
+    for component in sbom["components"]:
+        component_ref = component.get("bom-ref")
+        if component_ref and component_ref not in dependency_entry_refs:
+            sbom["dependencies"].append({"ref": component_ref,
+                                         "dependsOn": []})
+            dependency_entry_refs.add(component_ref)
 
     # Add a root dependency node as the first entry.
     # It references metadata.component and points to all directly installed
     # components; the dependency-target sort below fixes the array order.
+    # Deploy-directory file components (ticket #10) have no delivering
+    # recipe: the primary component delivers them, so their references
+    # join the root's dependency list.
     root_dep_entry = {
         "ref": metadata_component_ref,
         "dependsOn": list(directly_installed_component_refs)
     }
+    for artifact_ref in primary_owned_file_refs:
+        if artifact_ref not in root_dep_entry["dependsOn"]:
+            root_dep_entry["dependsOn"].append(artifact_ref)
     sbom["dependencies"].insert(0, root_dep_entry)
 
     # CycloneDX dependency lists are sets; the array order is presentation.
@@ -534,13 +2068,82 @@ def render(facts):
             dep_entry["dependsOn"] = sorted(
                 targets, key=lambda ref: (dep_rank.get(ref, len(dep_rank)), ref))
 
+    # CycloneDX composition data declares how complete the dependency
+    # evidence behind each component's graph entry is. Yocto facts decide
+    # the aggregate: usable debug-source records with nothing unresolved
+    # say complete, missing or inhibited debug information says unknown,
+    # and a reference that goes nowhere says incomplete. Unknown facts
+    # never become a complete declaration (ADR-0004).
+    debug_evidence_recipes = set()
+    for recipe, files in (facts.get("debug_sources") or {}).items():
+        for paths in (files or {}).values():
+            if isinstance(paths, str):
+                paths = paths.split()
+            if paths:
+                debug_evidence_recipes.add(recipe)
+                break
+    graph_node_refs = {comp.get("bom-ref") for comp in sbom["components"]}
+    graph_node_refs.add(metadata_component_ref)
+    entries_by_ref = {}
+    for dep_entry in sbom["dependencies"]:
+        entries_by_ref.setdefault(dep_entry.get("ref"), dep_entry)
+    declared_refs = set()
+    sbom["compositions"] = []
+    for component in sbom["components"]:
+        component_ref = component.get("bom-ref")
+        if not component_ref or component_ref in declared_refs:
+            continue
+        declared_refs.add(component_ref)
+        entry = entries_by_ref.get(component_ref)
+        targets = (entry or {}).get("dependsOn") or []
+        if any(target not in graph_node_refs for target in targets):
+            aggregate = "incomplete"
+        elif ref_recipes.get(component_ref) in debug_evidence_recipes:
+            aggregate = "complete"
+        else:
+            aggregate = "unknown"
+        # The CycloneDX composition declares the completeness of exactly
+        # one assembly; 1.6 and 1.7 spell its dependencies field
+        # differently, so the declaration rides on assemblies only.
+        sbom["compositions"].append({"aggregate": aggregate,
+                                     "assemblies": [component_ref]})
+
+    graph = _graph_evidence(sbom, metadata_component_ref, ref_recipes,
+                            debug_evidence_recipes, merge_defects, log)
+    # Which dependency-evidence sources fed the graph, as coverage
+    # states the requirements matrix turns into verdicts: an absent
+    # source is unknown coverage, never a silent assumption that the
+    # dependency picture is complete (ADR-0004).
+    fragment_rows = [f for f in fragments.values() if isinstance(f, dict)]
+    imported_used = any(
+        f.get("extra_components") or f.get("extra_dependencies")
+        or f.get("extra_roots") for f in fragment_rows)
+    delivered_recipes = {r for r in ref_recipes.values() if r}
+    debug_covered = delivered_recipes & debug_evidence_recipes
+    graph["dependencyEvidence"] = {
+        "yoctoRuntimeMetadata": {
+            "coverage": "observed" if runtime_edges else "unavailable"},
+        "importedBomGraphs": {
+            "coverage": "used" if imported_used else "unavailable",
+            "defects": sum(len(f.get("extra_bom_errors") or [])
+                           for f in fragment_rows)},
+        "pkgdataDebugSources": {
+            "coverage": ("unavailable" if not debug_covered else
+                         "complete" if debug_covered == delivered_recipes
+                         else "partial")},
+    }
+    if file_facts:
+        graph["fileInventory"] = {"entries": [
+            {key: artifact.get(key)
+             for key in ("recipe", "path", "ref", "error", "source")}
+            for artifact in file_facts]}
+
     # Replace SBOM serial placeholder in VEX vulnerabilities
     # This must be done after all vulnerabilities are collected to ensure each image
     # gets its own SBOM serial number in multi-output builds (e.g., rootfs + initramfs)
-    sbom_refs = {comp["bom-ref"] for comp in sbom["components"]}
     serial_placeholder = placeholder
     resolved_vulns = []
-    covered_refs = {}
+    covered_affects = {}
     for vuln in vex["vulnerabilities"]:
         affects = []
         for affect in vuln.get("affects", []):
@@ -548,26 +2151,26 @@ def render(facts):
                 affects.append(affect)
                 continue
 
-            prefix, _, bom_ref = affect["ref"].rpartition("#")
-            bom_ref = global_bom_ref_dedup_map.get(bom_ref, bom_ref)
-            # A component dropped by CPE deduplication is covered by its duplicate.
-            if bom_ref not in sbom_refs:
-                continue
-
-            # Refs merged from another image only become comparable to this
-            # document's own, still-templated refs once the serial is substituted.
-            ref = f"{prefix}#{bom_ref}".replace(serial_placeholder, sbom_serial_number)
-            if not any(existing.get("ref") == ref for existing in affects):
-                affects.append({**affect, "ref": ref})
+            # Keep unresolved targets as evidence for report/strict
+            # validation; serial substitution must never repair the graph.
+            ref = affect["ref"]
+            if serial_placeholder:
+                ref = ref.replace(serial_placeholder, sbom_serial_number)
+            resolved_affect = {**affect, "ref": ref}
+            if resolved_affect not in affects:
+                affects.append(resolved_affect)
 
         if not affects:
             continue
 
-        # Recipes sharing a CPE report the same CVE, so keep only the first statement.
-        refs = {affect["ref"] for affect in affects if "ref" in affect}
-        if refs and refs.issubset(covered_refs.get(vuln["id"], set())):
+        # Suppress only repeated substantive statements about the same
+        # affected versions. Equal CVE IDs or analysis states are not enough.
+        statement_key = _vex_statement_key(vuln)
+        affect_keys = {json.dumps(_canonical_evidence(affect), sort_keys=True)
+                       for affect in affects}
+        if affect_keys.issubset(covered_affects.get(statement_key, set())):
             continue
-        covered_refs.setdefault(vuln["id"], set()).update(refs)
+        covered_affects.setdefault(statement_key, set()).update(affect_keys)
 
         vuln["affects"] = affects
         resolved_vulns.append(vuln)
@@ -575,8 +2178,128 @@ def render(facts):
 
     # Sort vulnerabilities by CVE id for a stable, human-readable order.
     vex["vulnerabilities"].sort(key=lambda v: v["id"])
+    projected_alias_refs = None
+    if config.get("expand_cve_product_aliases"):
+        projected_alias_refs = _expand_cve_product_aliases(sbom, recipe_refs)
+        _log(log, "note", "CYCLONEDX_EXPAND_CVE_PRODUCT_ALIASES: "
+             "CVE product alias projection enabled")
 
-    return {"sbom": sbom, "vex": vex}
+    if config.get("deduplicate_cpe_collisions"):
+        _deduplicate_cpe_collisions(
+            sbom, vex, recipe_refs, log, projected_refs=projected_alias_refs)
+        _log(log, "note", "CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS: "
+             "CPE collision projection enabled")
+
+    # Alias rows are a view, not independent build instances; collision
+    # diagnostics continue to describe only the underlying inventory.
+    collision_sbom = sbom
+    if projected_alias_refs:
+        collision_sbom = {**sbom, "components": [
+            component for component in sbom["components"]
+            if component.get("bom-ref") not in projected_alias_refs]}
+    collisions = identity_collisions(collision_sbom, vex)
+    for collision in collisions:
+        refs = ", ".join(collision["bomRefs"])
+        cpes = ", ".join(collision["correlationCpes"])
+        if collision["explained"]:
+            _log(log, 2, f"Component instances {refs} share CPE(s) {cpes} "
+                         f"with distinct evidence; kept separate")
+        else:
+            _log(log, "warn", f"Unexplained component identity collision: "
+                              f"{refs} share CPE(s) {cpes} with identical "
+                              f"artifact, build, dependency, licence and "
+                              f"vulnerability evidence; kept separate, never "
+                              f"deduplicated")
+
+    # Source and deployable URIs are emitted only from trustworthy
+    # metadata, and only when the URI is syntactically valid; an
+    # unparseable URI is dropped with a warning instead of entering the
+    # document, and the URI requirement rows report the gap.
+    for holder in [sbom_metadata["component"], *sbom["components"]]:
+        references = holder.get("externalReferences") or []
+        kept = [reference for reference in references
+                if reference.get("type") not in URI_REFERENCE_TYPES
+                or _valid_uri(reference.get("url"))]
+        if len(kept) != len(references):
+            _log(log, "warn", f"{holder.get('name') or 'metadata.component'}: "
+                              f"dropped "
+                              f"{len(references) - len(kept)} external "
+                              f"reference(s) with a syntactically invalid "
+                              f"URI")
+            holder["externalReferences"] = kept
+
+    if (config.get("expand_cve_product_aliases")
+            and config.get("deduplicate_cpe_collisions")):
+        # Every projected edge must resolve after all absorption and reference
+        # rewriting, including file-owner dependencies and composition edges.
+        refs = {sbom_metadata["component"]["bom-ref"]}
+        refs.update(c["bom-ref"] for c in sbom["components"])
+        invalid = next((entry for entry in sbom["dependencies"]
+                        if entry["ref"] not in refs or
+                        not set(entry.get("dependsOn") or []) <= refs), None)
+        if invalid is not None:
+            raise RuntimeError(
+                f"Combined CPE projections left an unresolved SBOM "
+                f"dependency reference: {invalid!r}")
+        invalid = next((composition for composition in sbom["compositions"]
+                        if not set(composition.get("assemblies") or []) <= refs),
+                       None)
+        if invalid is not None:
+            raise RuntimeError(
+                f"Combined CPE projections left an unresolved SBOM "
+                f"composition reference: {invalid!r}")
+        prefix = (f"urn:cdx:{sbom['serialNumber'].removeprefix('urn:uuid:')}"
+                  f"/{sbom['version']}#")
+        invalid = next((affect for statement in vex["vulnerabilities"]
+                        for affect in statement.get("affects") or []
+                        if affect.get("ref", "").startswith(prefix)
+                        and affect["ref"][len(prefix):] not in refs), None)
+        if invalid is not None:
+            raise RuntimeError(
+                f"Combined CPE projections left an unresolved VEX affects "
+                f"reference: {invalid!r}")
+
+    if not profile:
+        return {"sbom": sbom, "vex": vex}
+
+    baseline, findings = _alignment_profile().evaluate(
+        profile, spec_version, sbom, vex, facts, collisions=collisions,
+        graph=graph)
+    report = {
+        "alignmentProfile": profile,
+        "alignmentEnforcement": enforcement,
+        "profileBaseline": baseline,
+        "conformanceDetermination": CONFORMANCE_DETERMINATION_NOTE,
+        "findings": findings,
+    }
+    if enforcement == "strict":
+        # The gate reports EVERY machine-detectable violation, not just
+        # the first: the same findings a report-mode build publishes,
+        # aggregated deterministically by requirement identifier.
+        violations = sorted(
+            (dict(
+                {"requirementId": finding["requirementId"],
+                 "diagnosticMessage": finding["diagnosticMessage"]},
+                **({"bomRefs": finding["bomRefs"]}
+                   if finding.get("bomRefs") else {}))
+             for finding in findings
+             if finding["verdict"] == "unmet"
+             and finding["applicability"] == "applicable"),
+            key=lambda violation: violation["requirementId"])
+        unmet = [violation["requirementId"] for violation in violations]
+        if unmet:
+            return {"failure": {
+                "alignmentEnforcement": "strict",
+                "unmetRequirementIds": unmet,
+                "violations": violations,
+                "diagnosticMessage": (
+                    f"Alignment profile {profile} with strict enforcement "
+                    f"rejects the output over {len(unmet)} unmet requirement(s): "
+                    f"{', '.join(unmet)}. Strict enforcement is an alignment "
+                    "gate and makes no conformance claim."),
+                "report": report,
+            }}
+    return {"sbom": sbom, "vex": vex, "report": report}
 
 
 def merge_sbom_cve_check(sbom, vex, report, config, log=None):
@@ -584,7 +2307,8 @@ def merge_sbom_cve_check(sbom, vex, report, config, log=None):
     Map a completed sbom-cve-check report onto the VEX document.
 
     Issues are attached to the logical components they match in the SBOM
-    (by CPE first, falling back to the recipe purl), duplicate statements
+    (by any correlation CPE — the component's own or a CVE alias — first,
+    falling back to the recipe purl), duplicate statements
     already covered by the VEX are skipped, and every remaining issue
     becomes one statement per analysis (id, detail, state). The VEX is
     modified in place; returns the number of added statements.
@@ -593,8 +2317,11 @@ def merge_sbom_cve_check(sbom, vex, report, config, log=None):
     refs_by_cpe = {}
     refs_by_pn = {}
     for component in sbom.get("components", []):
-        if component.get("cpe"):
-            refs_by_cpe.setdefault(component["cpe"], []).append(component["bom-ref"])
+        if any(prop.get("name") == ALIAS_PROJECTION_PROPERTY
+               for prop in component.get("properties") or []):
+            continue
+        for cpe in sorted(component_correlation_cpes(component)):
+            refs_by_cpe.setdefault(cpe, []).append(component["bom-ref"])
         purl = component.get("purl", "")
         if purl.startswith("pkg:yocto/"):
             refs_by_pn.setdefault(purl.split("/")[-1].split("@")[0], []).append(component["bom-ref"])
@@ -672,20 +2399,70 @@ def _sbom_cve_check_analysis(issue, include_unpatched, unpatched_state):
     return analysis
 
 
+def _instance_key(component):
+    """Package coordinates used to find candidates, never proof of identity."""
+    name = component.get("name")
+    if name is None or not component.get("purl"):
+        return None
+    return (name, component.get("version"), component["purl"])
+
+
 def _merge_included_images(sbom, vex, included_images, config, spec_version,
                            sbom_serial_number, add_scopes,
-                           directly_installed_component_refs, log):
+                           directly_installed_component_refs, log,
+                           merge_defects=None):
     """
     Merge the completed SBOM and VEX of each embedded image into the parent
-    documents, remapping bom-refs of components that share a CPE with the
-    parent and the VEX references to the parent SBOM serial number.
+    documents, remapping bom-refs of components that are the same instance
+    as one of the parent's (compatible identity, artifact, build, licence,
+    dependency and VEX evidence), and rewriting the parent SBOM serial.
+
+    Defective input is recorded in merge_defects and reported; the graph
+    is never repaired by dropping nodes, edges, scopes or VEX statements
+    (ADR-0004).
     """
-    extra_seen_image_refs = {c["bom-ref"] for c in sbom["components"] if c.get("bom-ref")}
+    if merge_defects is None:
+        merge_defects = []
+    extra_seen_image_refs = {c["bom-ref"] for c in sbom["components"]
+                             if c.get("bom-ref")}
+    identity_index = {}
+    context = _instance_context(
+        sbom["components"], sbom["dependencies"], vex["vulnerabilities"])
+    for component in sbom["components"]:
+        _index_instance(identity_index, component, context)
     for img in included_images:
         img_name = img["name"]
         img_sbom_data = img["sbom"]
         img_vex_data = img.get("vex")
         img_vex_error = img.get("vex_error")
+        img_sbom_error = img.get("sbom_error")
+
+        if img_sbom_data is None:
+            # The adapter could not read the embedded document at all.
+            # The delivered payload stays represented - as a firmware
+            # component of unknown version, hung off the graph root -
+            # and the unreadable evidence becomes a composition finding,
+            # never a silently missing delivery-item part (ADR-0004).
+            _log(log, "warn", f"CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES: "
+                              f"cannot read SBOM for {img_name}: "
+                              f"{img_sbom_error or 'no document'}")
+            merge_defects.append({
+                "kind": "embedded-sbom-unusable",
+                "source": img_name,
+                "message": f"embedded image SBOM could not be read: "
+                           f"{img_sbom_error or 'no document'}",
+                "refs": [],
+            })
+            orphan_ref = str(uuid.uuid4())
+            orphan_comp = {"type": "firmware", "name": img_name,
+                           "version": "unknown", "bom-ref": orphan_ref}
+            if add_scopes:
+                orphan_comp["scope"] = "required"
+            sbom["components"].append(orphan_comp)
+            extra_seen_image_refs.add(orphan_ref)
+            directly_installed_component_refs.add(orphan_ref)
+            continue
+
 
         img_spec = img_sbom_data.get("specVersion")
         if img_spec and img_spec != spec_version:
@@ -695,29 +2472,25 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
         # The UUID portion of the included SBOM's serialNumber appears verbatim in its VEX affects refs.
         included_serial = (img_sbom_data.get("serialNumber") or "").removeprefix("urn:uuid:")
 
-        # Map included bom-refs to parent bom-refs for components that share the same CPE.
+        # Reconcile only compatible evidence in both source graphs.
+        context = _instance_context(
+            img_sbom_data.get("components") or [],
+            img_sbom_data.get("dependencies") or [],
+            (img_vex_data or {}).get("vulnerabilities") or [])
         included_bom_ref_remap = {}
         for inc_comp in img_sbom_data.get("components") or []:
-            inc_cpe = inc_comp.get("cpe")
             inc_ref = inc_comp.get("bom-ref")
-            if not inc_ref or not inc_cpe:
+            if not inc_ref:
                 continue
-            existing = next(
-                (c for c in sbom["components"] if c.get("cpe") == inc_cpe), None
-            )
-            if existing:
+            existing = _matching_instance(identity_index, inc_comp, context)
+            if existing is not None:
                 included_bom_ref_remap[inc_ref] = existing["bom-ref"]
-                if add_scopes:
-                    merged_scope = _highest_priority_scope(existing.get("scope"), inc_comp.get("scope"))
-                    if merged_scope:
-                        existing["scope"] = merged_scope
+                _merge_instance_evidence(existing, inc_comp, add_scopes)
 
-        # Add components unique to the included image (no CPE match in the parent SBOM).
+        # Add components unique to the included image (no instance match in the parent SBOM).
         for inc_comp in img_sbom_data.get("components") or []:
             inc_ref = inc_comp.get("bom-ref")
             if inc_ref and inc_ref in included_bom_ref_remap:
-                continue
-            if inc_ref and inc_ref in extra_seen_image_refs:
                 continue
             if add_scopes and "scope" not in inc_comp:
                 inc_comp = dict(inc_comp)
@@ -725,6 +2498,7 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
             sbom["components"].append(inc_comp)
             if inc_ref:
                 extra_seen_image_refs.add(inc_ref)
+            _index_instance(identity_index, inc_comp, context)
 
         # Represent the included image itself as a firmware component in the parent SBOM.
         inc_metadata_comp = (img_sbom_data.get("metadata") or {}).get("component") or {}
@@ -745,6 +2519,32 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
         inc_metadata_ref = inc_metadata_comp.get("bom-ref")
         if inc_metadata_ref:
             included_bom_ref_remap[inc_metadata_ref] = img_firmware_ref
+        else:
+            # No root to hang the graph on: the document is malformed.
+            # Its components and edges stay in the merged graph and the
+            # missing attachment is published as a finding instead of
+            # being tidied away (ADR-0004).
+            unattached = sorted({
+                included_bom_ref_remap.get(entry.get("ref", ""),
+                                           entry.get("ref", ""))
+                for entry in img_sbom_data.get("dependencies") or []
+                if entry.get("ref")
+                and included_bom_ref_remap.get(entry.get("ref", ""),
+                                               entry.get("ref", "")) not in
+                extra_seen_image_refs})
+            _log(log, "warn", f"CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES: "
+                              f"{img_name} SBOM has no metadata.component "
+                              f"bom-ref; its graph cannot be attached as "
+                              f"a tree")
+            merge_defects.append({
+                "kind": "embedded-root-missing",
+                "source": img_name,
+                "message": "embedded image SBOM has no metadata.component "
+                           "root" + (f"; unattached graph reference(s): "
+                                     + ", ".join(unattached)
+                                     if unattached else ""),
+                "refs": unattached,
+            })
 
         def remap_ref(ref, _remap=included_bom_ref_remap):
             return _remap.get(ref, ref)
@@ -752,20 +2552,18 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
         # Add dependency edges from the included SBOM, remapping shared bom-refs.
         # Merge into an existing dep entry when the ref is already present in the parent.
         for dep_entry in img_sbom_data.get("dependencies") or []:
+            # Edges of the embedded graph ride along as they are; refs that
+            # resolve to nothing after remapping become reference-integrity
+            # findings and are never dropped to tidy the merged graph.
             r_ref = remap_ref(dep_entry.get("ref", ""))
-            if not r_ref or not any(c.get("bom-ref") == r_ref for c in sbom["components"]):
+            if not r_ref:
                 continue
             r_depends = []
             for dr in dep_entry.get("dependsOn") or []:
                 rdr = remap_ref(dr)
-                if rdr == r_ref:
+                if rdr == r_ref or rdr in r_depends:
                     continue
-                if not any(c.get("bom-ref") == rdr for c in sbom["components"]):
-                    continue
-                if rdr not in r_depends:
-                    r_depends.append(rdr)
-            if not r_depends:
-                continue
+                r_depends.append(rdr)
             existing_entry = next((x for x in sbom["dependencies"] if x["ref"] == r_ref), None)
             if existing_entry:
                 for rdr in r_depends:
@@ -780,6 +2578,14 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
         # Merge VEX vulnerabilities: remap included SBOM serial and shared bom-refs, avoid CVE ID duplicates.
         if img_vex_error:
             _log(log, "warn", f"CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES: cannot parse VEX for {img_name}: {img_vex_error}")
+            merge_defects.append({
+                "kind": "embedded-vex-unusable",
+                "source": img_name,
+                "message": f"embedded image VEX could not be read: "
+                           f"{img_vex_error}; its SBOM graph was still "
+                           f"merged",
+                "refs": [],
+            })
             continue
         if img_vex_data is None:
             _log(log, 1, f"CYCLONEDX_EXTRA_RUNTIME_IMAGE_RECIPES: no VEX for {img_name}")
@@ -797,18 +2603,14 @@ def _merge_included_images(sbom, vex, included_images, config, spec_version,
                 if "#" in ref:
                     prefix, bom_ref_part = ref.rsplit("#", 1)
                     ref = f"{prefix}#{remap_ref(bom_ref_part)}"
-                bom_ref_in_ref = ref.rsplit("#", 1)[-1] if "#" in ref else ""
-                if bom_ref_in_ref and not any(
-                    c.get("bom-ref") == bom_ref_in_ref for c in sbom["components"]
-                ):
-                    continue
-                remapped_affects.append({"ref": ref})
+                remapped_affects.append({**affect, "ref": ref})
             if not remapped_affects:
                 continue
+            statement_key = _vex_statement_key(inc_vuln)
             existing_vuln = next(
-                (v for v in vex["vulnerabilities"] if v.get("id") == cve_id), None
-            )
-            if existing_vuln:
+                (v for v in vex["vulnerabilities"]
+                 if _vex_statement_key(v) == statement_key), None)
+            if existing_vuln is not None:
                 for a in remapped_affects:
                     if a not in existing_vuln["affects"]:
                         existing_vuln["affects"].append(a)
@@ -889,9 +2691,9 @@ def _add_document_extensions(config, spec_version, doc, log=None):
 
 def _resolve_dependency_refs(depends, recipe_refs, component_recipes, ref_recipes):
     """
-    Replace a dependency token by the bom-refs of every component its recipe
-    contributes. A recipe with several CVE_PRODUCT names yields one component
-    per name and the dependency applies to all of them.
+    Replace a dependency token by the bom-refs of the components its recipe
+    contributes. A recipe contributes its one logical component, so a
+    well-formed fragment resolves to exactly one component.
     """
 
     # Recipe name
@@ -907,6 +2709,87 @@ def _resolve_dependency_refs(depends, recipe_refs, component_recipes, ref_recipe
         return []
 
     return list(recipe_refs[recipe])
+
+
+def _graph_integrity(sbom, root_ref):
+    """
+    Reference integrity of the finished dependency graph: unique bom-refs,
+    resolvable references, and an unambiguous root. Detection only — the
+    graph is never repaired by dropping nodes or edges (ADR-0004).
+    """
+    entries = sbom.get("dependencies") or []
+    node_refs = set()
+    duplicates = []
+    for component in sbom.get("components") or []:
+        ref = component.get("bom-ref")
+        if not ref:
+            continue
+        if ref in node_refs or ref == root_ref:
+            duplicates.append(ref)
+        node_refs.add(ref)
+    if root_ref in node_refs:
+        duplicates.append(root_ref)
+
+    dangling = []
+    entry_counts = {}
+    targets_of = {}
+    for entry in entries:
+        ref = entry.get("ref")
+        targets = list(entry.get("dependsOn") or [])
+        if ref:
+            entry_counts[ref] = entry_counts.get(ref, 0) + 1
+            targets_of.setdefault(ref, []).extend(targets)
+            if ref not in node_refs and ref != root_ref:
+                dangling.append(ref)
+        for target in targets:
+            if target not in node_refs and target != root_ref:
+                dangling.append(target)
+
+    ambiguous = []
+    if any(root_ref in (entry.get("dependsOn") or []) for entry in entries):
+        ambiguous.append(root_ref)
+    ambiguous.extend(ref for ref, count in entry_counts.items() if count > 1)
+    reachable = {root_ref}
+    frontier = [root_ref]
+    while frontier:
+        for target in targets_of.get(frontier.pop(), []):
+            if target in node_refs and target not in reachable:
+                reachable.add(target)
+                frontier.append(target)
+    ambiguous.extend(ref for ref in node_refs if ref not in reachable)
+    return {"duplicates": sorted(set(duplicates)),
+            "dangling": sorted(set(dangling)),
+            "ambiguous": sorted(set(ambiguous))}
+
+
+def _graph_evidence(sbom, root_ref, ref_recipes, debug_evidence_recipes,
+                    merge_defects, log):
+    """
+    Summarize the graph facts the requirements matrix evaluates: reference
+    integrity (logged even without a profile, so defects are never silent),
+    the bom-refs of components outside the scope of delivery, and the bom-
+    refs of delivered recipes whose debug-source evidence is unavailable.
+    """
+    integrity = _graph_integrity(sbom, root_ref)
+    for label, refs in (("duplicate bom-ref value", integrity["duplicates"]),
+                        ("dangling dependency reference", integrity["dangling"]),
+                        ("ambiguous dependency-graph root", integrity["ambiguous"])):
+        if refs:
+            _log(log, "warn", f"Graph integrity: {label}: {', '.join(refs)}")
+    boundary_refs = sorted({
+        component["bom-ref"] for component in sbom.get("components") or []
+        if component.get("bom-ref") and any(
+            property.get("name") == DELIVERY_SCOPE_PROPERTY
+            for property in component.get("properties") or [])})
+    static_unknown_refs = sorted({
+        component["bom-ref"] for component in sbom.get("components") or []
+        if component.get("bom-ref")
+        and ref_recipes.get(component["bom-ref"]) is not None
+        and ref_recipes.get(component["bom-ref"]) not in debug_evidence_recipes})
+    return {"rootRef": root_ref, "integrity": integrity,
+            "boundaryRefs": boundary_refs,
+            "staticUnknownRefs": static_unknown_refs,
+            "mergeDefects": merge_defects}
 
 
 def _highest_priority_scope(*scopes):

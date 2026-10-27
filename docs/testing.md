@@ -24,13 +24,39 @@ tools/kas`), and the wrapper's container-image version stays in
   lockstep with the pin; a missing-or-unfetchable checkout or a pin
   mismatch skips the matrix with the reason rather than erroring.
 - Network access (upstream clones + source downloads).
-- The `jsonschema` Python package, used only by the integration layer to
-  validate the deployed documents against the CycloneDX 1.7 JSON schema
-  vendored under `tests/integration/vendor/cyclonedx/` (attribution and
-  pin in its README). Unit runs never import it; if it is missing, the
-  schema-validation tests skip with an install hint, e.g.
-  `sudo apt-get install python3-jsonschema` or
+- The `jsonschema` Python package, an optional dependency used to
+  validate documents against the official CycloneDX JSON schemas
+  vendored under `lib/data/cyclonedx/` (attribution and pin in its
+  README). The renderer feature-detects it: the unit suite runs and
+  stays green without it, and without an alignment profile never
+  imports it. Under an alignment profile without the library the
+  schema requirements report `unverifiable`, never a silent pass. The
+  integration tier asserts real deployed-document verdicts, so its
+  schema-validation tests skip with an install hint when the package
+  is missing, e.g. `sudo apt-get install python3-jsonschema` or
   `python3 -m pip install jsonschema`.
+
+Additionally, `tests/integration/test_sbomqs_differential.py` is a
+maintainer-only differential check against `sbomqs` v2 JSON output
+(exercised with v2.1.3). It compares the tool's four `Structural`
+features—declared specification, supported version, file format and
+schema validity—with the project matrix's structural requirements.
+Each external feature must be evaluated and score 10/10; a positive
+overall quality score is not a validation verdict. Only an absent
+binary skips the tests; command failures or incompatible JSON fail.
+
+Run just these checks without rebuilding the image:
+
+```sh
+pytest -q -m integration tests/integration/test_sbomqs_differential.py -rs
+```
+
+Disagreements remain failures of the differential job, not changes to
+the project-owned release gate. With v2.1.3, the invalid-purl fixture
+exposes a coverage difference: the matrix rejects `not-a-purl` as
+`REQ-IDEN-002`, while sbomqs' structural features pass. Its structural
+category does not include a purl-syntax check. This failure is retained
+for maintainer review; identifier validation is not relaxed.
 
 ## Invocation modes
 
@@ -107,6 +133,24 @@ the kas wrapper and records every run against the same workspace:
   claim is identical in both modes. It must appear in the rootfs
   manifest and as a component with a dependency edge in the deployed
   SBOM.
+
+**Alignment-profile scenario** —
+`tests/integration/test_alignment_profile.py`
+reuses the same recorder for the profile acceptance runs, configured
+only through the public channel (the `env:` variables
+`CYCLONEDX_PROFILE`/`CYCLONEDX_PROFILE_ENFORCEMENT`, plus
+`CYCLONEDX_PRIMARY_COMPONENT_CREATOR` for one controlled violation): a
+report-enforcement run deploying SBOM, VEX and the alignment report; an
+identical re-invocation proving the deployed bytes deterministic; the
+violation through both enforcements (report publishes it, strict fails
+the build at the CycloneDX generation task without deploying anything
+new — an *expected* failure that gates nothing downstream); and a final
+plain re-invocation restoring the baseline bytes and removing the
+profile's report artifacts from the deploy directory (sstate installs
+never delete, and R2 compares whole deploy-directory checksum maps).
+This scenario is development-branch evidence only: a branch may claim
+support for the profile only after running an equivalent scenario on
+that branch itself.
 
 R2/R4 comparisons are byte-level; cross-regeneration comparisons (R3)
 use the `canonicalize` helper and never claim byte-identity. The

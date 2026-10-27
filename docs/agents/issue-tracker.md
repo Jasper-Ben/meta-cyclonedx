@@ -21,6 +21,14 @@ Issues and specs for this repo live as GitHub issues on the maintained fork (`Ja
   remove an edge via `DELETE .../issues/<child>/dependencies/blocked_by/<blocker-db-id>`.
   A ticket is unblocked when every blocker is closed; `issue_dependencies_summary.blocked_by` reports the live open-blocker count.
 
+## Integration branches and spec delivery
+
+- **Integration branch**: one branch per spec/epic, named `integration/<feature-slug>` (slug matches the former `.scratch/<feature-slug>/` directory, e.g. `integration/tr-03183-alignment`). All ticket work merges into it.
+- **PRs**: open a **draft PR from the integration branch to `main`**; mark it ready when the whole spec is implemented. It is the only PR per spec; ticket branches never open PRs.
+- **Ticket branches**: `ticket/<N>-<slug>` (`N` = issue number), created as `git worktree add .worktrees/ticket-<N> -b ticket/<N>-<slug> integration/<feature-slug>`. Remove the worktree with `git worktree remove` and the branch with `git branch -d` once merged.
+- **Merge**: merge a ticket branch into the integration branch with `git merge --no-ff ticket/<N>-<slug>`, commit message `Merge ticket #<N>: <title>`, body listing the branch and the issue.
+- **Resolve**: `gh issue close <N> --comment "Implemented on \`integration/<feature-slug>\` via \`ticket/<N>-<slug>\`."` — no status label beyond the last triage role.
+
 ## Triage state
 
 Status is carried by the five canonical labels (see `triage-labels.md`). A closed ticket is done; do not add a status label beyond its last triage role.

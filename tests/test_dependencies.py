@@ -1,6 +1,7 @@
 """Dependency graph behavior: root node, token resolution, merging, pruning."""
 
-from helpers import default_facts, dep, fragment, pkg, ref_of, render_docs, root_entry
+from helpers import (default_facts, dep, dep_entry, fragment, pkg,
+                     ref_of, render_docs, root_entry)
 
 
 def test_root_node_is_first_and_lists_directly_installed_components():
@@ -31,8 +32,9 @@ def test_recipe_name_token_resolves_to_the_recipe_components():
 
 
 def test_dependency_on_recipe_resolves_when_component_name_differs():
-    # A recipe named binutils whose components are named libb (CVE_PRODUCT):
-    # the dependency names the recipe, and reaches its component anyway.
+    # A recipe named binutils whose logical component is named libb
+    # (identity override): the dependency names the recipe, and reaches
+    # its component anyway.
     facts = default_facts(fragments={
         "app": fragment(pkgs=[pkg("app", "1", "ref-app")],
                         dependencies=[dep("ref-app", ["binutils"])]),
@@ -44,41 +46,44 @@ def test_dependency_on_recipe_resolves_when_component_name_differs():
     assert entry["dependsOn"] == ["ref-libb"]
 
 
-def test_dependency_token_reaches_every_alias_component_of_a_recipe():
+def test_dependency_token_resolves_to_the_recipes_single_logical_component():
+    # One recipe is one logical component (ADR-0006); the recipe token
+    # reaches exactly that component.
     facts = default_facts(fragments={
-        "alias-owner": fragment(
-            pkgs=[pkg("alias-a", "1", "ref-a1"), pkg("alias-b", "1", "ref-a2")]),
-        "consumer": fragment(pkgs=[pkg("consumer", "1", "ref-c")],
-                             dependencies=[dep("ref-c", ["alias-owner"])]),
+        "libc": fragment(pkgs=[pkg("glibc", "2.40", "ref-libc")],
+                         dependencies=[dep("ref-libc", ["app"])]),
+        "app": fragment(pkgs=[pkg("app", "1", "ref-app")]),
     })
     sbom, _vex, _logs = render_docs(facts)
 
-    entry = next(e for e in sbom["dependencies"] if e["ref"] == "ref-c")
-    assert sorted(entry["dependsOn"]) == ["ref-a1", "ref-a2"]
+    entry = next(e for e in sbom["dependencies"] if e["ref"] == "ref-libc")
+    assert entry["dependsOn"] == ["ref-app"]
 
 
-def test_dependency_on_a_recipe_outside_the_image_is_pruned():
+def test_dependency_on_a_recipe_outside_the_image_identifies_the_boundary():
+    # The known path continues through the first component outside the
+    # scope of delivery; it is never pruned from the evidence (ADR-0004).
     facts = default_facts(fragments={
         "app": fragment(pkgs=[pkg("app", "1", "ref-app")],
                         dependencies=[dep("ref-app", ["busybox", "ghost"])]),
         "busybox": fragment(pkgs=[pkg("busybox", "1.36", "ref-b")]),
     })
-    sbom, _vex, logs = render_docs(facts)
+    sbom, _vex, _logs = render_docs(facts)
 
     entry = next(e for e in sbom["dependencies"] if e["ref"] == "ref-app")
-    assert entry["dependsOn"] == ["ref-b"]
-    assert any("ghost" in message for _level, message in logs)
+    ghost = next(c for c in sbom["components"] if c["name"] == "ghost")
+    assert entry["dependsOn"] == ["ref-b", ghost["bom-ref"]]
 
 
-def test_self_dependency_is_dropped():
+def test_self_dependency_edge_is_dropped_from_the_component_entry():
     facts = default_facts(fragments={
         "app": fragment(pkgs=[pkg("app", "1", "ref-app")],
                         dependencies=[dep("ref-app", ["app"])]),
     })
     sbom, _vex, _logs = render_docs(facts)
 
-    assert "ref-app" not in [e["ref"] for e in sbom["dependencies"]
-                             if e["ref"] != sbom["metadata"]["component"]["bom-ref"]]
+    entry = dep_entry(sbom, "ref-app")
+    assert entry["dependsOn"] == []
 
 
 def test_runtime_edges_are_merged_into_existing_recipe_edges():
@@ -106,14 +111,15 @@ def test_runtime_edges_alone_produce_dependency_entries():
     assert entry["dependsOn"] == ["ref-libc"]
 
 
-def test_fragments_without_edges_have_no_dependency_node():
+def test_fragments_without_edges_still_get_a_leaf_dependency_node():
     facts = default_facts(fragments={
         "busybox": fragment(pkgs=[pkg("busybox", "1.36", "ref-b")]),
     })
     sbom, _vex, _logs = render_docs(facts)
 
     refs = [e["ref"] for e in sbom["dependencies"]]
-    assert refs == [sbom["metadata"]["component"]["bom-ref"]]
+    assert refs == [sbom["metadata"]["component"]["bom-ref"], "ref-b"]
+    assert dep_entry(sbom, "ref-b")["dependsOn"] == []
 
 
 def test_dependency_component_refs_point_at_rendered_components():

@@ -2,7 +2,8 @@
 
 import meta_cyclonedx
 
-from helpers import TIMESTAMP, default_config, document, fragment, pkg
+from helpers import (TIMESTAMP, default_config, default_facts, document, fragment,
+                     pkg, render_docs)
 
 CPE_A = "cpe:2.3:*:*:openssl:3.2:*:*:*:*:*:*:*"
 
@@ -38,6 +39,27 @@ def test_ignored_issue_attaches_to_cpe_matched_component():
     assert "JUSTIFICATION: config disabled" in statement["analysis"]["detail"]
     prefix = f"urn:cdx:{sbom['serialNumber'].split(':')[-1]}/1#"
     assert statement["affects"] == [{"ref": prefix + "ref-o"}]
+
+
+def test_issues_match_secondary_correlation_alias_cpes():
+    identity = meta_cyclonedx.component_identity(
+        "openssl", "3.2", "pkg:yocto/meta/openssl3@3.2",
+        cve_products="libopenssl openssl")
+    identity["bom-ref"] = "ref-o"
+    sbom, vex, _logs = render_docs(default_facts(
+        fragments={"openssl": fragment(pkgs=[identity])}))
+    assert identity["cpe"] == "cpe:2.3:*:*:libopenssl:3.2:*:*:*:*:*:*:*"
+
+    added = meta_cyclonedx.merge_sbom_cve_check(
+        sbom, vex,
+        report([{"name": "openssl", "cpes": [CPE_A],
+                 "issue": [{"id": "CVE-2024-3", "status": "Patched",
+                            "detail": "fixed"}]}]),
+        base_config())
+
+    assert added == 1
+    assert vex["vulnerabilities"][0]["affects"] == [
+        {"ref": f"urn:cdx:{sbom['serialNumber'].split(':')[-1]}/1#ref-o"}]
 
 
 def test_issues_fall_back_to_the_recipe_purl_without_cpe_match():

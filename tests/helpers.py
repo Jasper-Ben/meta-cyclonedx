@@ -23,13 +23,11 @@ def pkg(name, version, bom_ref, cpe=None, purl=None, **extra):
     return component
 
 
-def fragment(pkgs=(), cves=(), dependencies=(), dedup=None, **extra):
+def fragment(pkgs=(), cves=(), dependencies=(), **extra):
     """A recipe fragment in the on-disk do_populate_cyclonedx format."""
     result = {"pkgs": list(pkgs), "cves": list(cves)}
     if dependencies:
         result["dependencies"] = list(dependencies)
-    if dedup:
-        result["bom_ref_dedup_map"] = dict(dedup)
     result.update(extra)
     return result
 
@@ -120,6 +118,57 @@ def render_docs(facts):
     return docs["sbom"], docs["vex"], logs
 
 
+def render_all(facts):
+    """Render and capture diagnostics; returns (docs, logs).
+
+    Use when the test needs the full renderer return value, e.g. the
+    alignment report or a strict-enforcement failure.
+    """
+    logs = []
+    facts.setdefault("log", lambda level, message: logs.append((level, message)))
+    return meta_cyclonedx.render(facts), logs
+
+
+def profile_config(**overrides):
+    """Renderer config that selects the TR-03183-2.1 alignment profile."""
+    config = default_config(profile="tr03183-2.1", enforcement="report")
+    config.update(overrides)
+    return config
+
+
+def file_entry(path, sha512=None, executable="executable",
+               archive="no archive", structured="unstructured", error=None):
+    """One delivered-file artifact fact (adapter-normalized classification).
+
+    Values carry the pinned taxonomy's spellings directly; error entries
+    record why a mandatory artifact could not be inventoried (missing,
+    unreadable or ambiguous-classification) instead of vanishing.
+    """
+    entry = {"path": path, "executable": executable, "archive": archive,
+             "structured": structured}
+    if sha512 is not None:
+        entry["sha512"] = sha512
+    if error is not None:
+        entry["error"] = error
+    return entry
+
+
+def file_ref(recipe, path):
+    """The bom-ref convention for inventoried delivered files."""
+    return f"yocto-file:{recipe}:{path}"
+
+
+def file_components(sbom):
+    return [c for c in sbom["components"] if c.get("type") == "file"]
+
+
+def file_component(sbom, recipe, path):
+    ref = file_ref(recipe, path)
+    matches = [c for c in sbom["components"] if c.get("bom-ref") == ref]
+    assert len(matches) == 1, f"expected exactly one file component {ref}, got {len(matches)}"
+    return matches[0]
+
+
 def component_names(sbom):
     return [c["name"] for c in sbom["components"]]
 
@@ -155,3 +204,9 @@ def vuln_by_id(vex, cve_id):
 
 def affect_refs(vuln):
     return [a["ref"] for a in vuln["affects"]]
+
+
+def finding_by_id(report, requirement_id):
+    matches = [f for f in report["findings"] if f["requirementId"] == requirement_id]
+    assert len(matches) == 1, f"expected exactly one finding {requirement_id}, got {len(matches)}"
+    return matches[0]

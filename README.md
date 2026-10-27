@@ -4,6 +4,9 @@
 > you are on the correct branch for your Yocto release, as the feature set and
 > default configurations may vary!**
 
+The branch support policy for the BSI TR-03183-2 alignment capability is in
+[docs/release-branches.md](docs/release-branches.md).
+
 `meta-cyclonedx` is a [Yocto](https://www.yoctoproject.org/) meta-layer which
 produces [CycloneDX](https://cyclonedx.org/) Software Bill of Materials
 (aka [SBOMs](https://www.ntia.gov/SBOM)) from your target root filesystem.
@@ -25,6 +28,9 @@ This layer generates **CycloneDX** compliant SBOMs with the following features:
 - Include component licenses.
 - Added option to reduce the SBOM size by limiting SBOM collection to run-time
   packages ([which might potentially come at some expense](#potentially-missing-packages-after-runtime-filtering))
+- Optional BSI TR-03183-2 alignment profile with `report` and `strict`
+  enforcement, publishing a machine-readable alignment report beside the SBOM
+  and VEX ([guide](docs/alignment-profile.md)).
 
 This repository was originally forked from the
 [BG Networks repository](https://github.com/bgnetworks/meta-dependencytrack).
@@ -54,6 +60,13 @@ BBLAYERS += "${BSPDIR}/sources/meta-cyclonedx"
 > **:warning: Breaking change when upgrading to Wrynose or later:**
 > Starting with Wrynose the `CYCLONEDX_INCLUDE_UNPATCHED_VULNS` option requires
 > the `sbom-cve-check` class, see [sbom-cve-check Results](#sbom-cve-check-results).
+
+> **:warning: Breaking change in the release carrying TR-03183-2 alignment
+> support:** components are now named and versioned by creator-assigned
+> logical identity instead of CVE aliases, and CPE-equality deduplication is
+> removed; component names, versions, counts and references change in every
+> generated SBOM, with no compatibility mode. See the
+> [migration guidance](docs/migration/tr-03183-alignment.md).
 
 To enable and configure the layer simply inherit the `cyclonedx-export` class
 in your `local.conf` file:
@@ -174,6 +187,59 @@ Multiple recipe names are separated by spaces. Each listed recipe must have
 already run `do_populate_cyclonedx` during the build, otherwise an error is
 raised and the recipe is skipped.
 
+### CPE Collision Deduplication (Opt-In)
+
+For CPE-keyed vulnerability tools, set
+`CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS = "1"` to merge native recipe
+components in transitively connected shared-CPE groups **only when** every
+member has distinguishable artifact, build, dependency, licence or VEX
+evidence. Different package purls or correlation aliases alone do not
+distinguish build instances. It defaults to `"0"`; indistinguishable
+duplicates remain separate and retain their unresolved-collision warning
+even when enabled. Each independent group keeps the component with the
+lexicographically lowest package purl; equal or absent purls are resolved
+by stable component evidence. The survivor
+keeps every member's correlation-alias properties, while its dependency, VEX
+and delivered-file ownership references absorb those of the other components.
+A build-log note names each merge.
+
+This is a tooling projection, not a truthful inventory of separate build
+instances: the identities and per-instance distinctions of absorbed
+components are no longer present in the output. It cannot be combined
+with `CYCLONEDX_PROFILE`; that configuration fails at parse time.
+Imported and embedded SBOM component graphs are not deduplicated.
+
+### CVE Product Alias Expansion (Opt-In)
+
+Set `CYCLONEDX_EXPAND_CVE_PRODUCT_ALIASES = "1"` for CPE-keyed tools
+that do not inspect `yocto:cve:*` properties. Each distinct secondary
+`CVE_PRODUCT` correlation CPE of a recipe gains one projected component,
+regardless of how many `CVE_VERSION` values the recipe declares. A bare
+product and its explicit `*`-vendor token share a CPE and yield only one row;
+an alias matching the logical component's primary CPE adds no row.
+Vendor-qualified tokens use the vendor as `group` and the bare product as
+`name`. Each projected row uses the first short correlation version in its
+`version` and `cpe` fields;
+the other CPE versions remain in its `yocto:cve:cpe` properties. A dependency
+edge from each alias to the logical component expresses the composition;
+`yocto:projection:cve-product-alias = "true"` identifies these view-only
+rows for filtering. The primary and logical components remain unchanged;
+aliases own no delivered files and receive no VEX statements.
+
+This flag defaults to `"0"` and changes no default output. Enabled output
+adds tooling-only components and is not a truthful inventory of separately
+built software. Imported and embedded graphs are not expanded. It cannot
+be combined with `CYCLONEDX_PROFILE`; that combination fails at parse time.
+
+When both flags are enabled, expansion runs **before** collision
+deduplication: aliases shared across recipes collapse to one CPE-carrying
+row per correlation token. A distinct primary CPE of an absorbed recipe
+remains visible as a marked view row. File ownership and VEX stay anchored
+to the surviving logical component; merged dependency and composition
+references follow that survivor. Neither flag changes recipe fragments,
+the default inventory, or alignment-profile evidence
+([ADR-0013](docs/adr/0013-keep-cpe-projections-at-render-boundary.md)).
+
 ### Recipe-contributed CycloneDX Fragments
 
 Language ecosystems that resolve their own dependency trees — cargo, npm, go —
@@ -292,6 +358,81 @@ Neither affects cross-image lookup. The included image can use a different
 If its internal image data is missing, a warning is emitted and the image
 is skipped without failing the export.
 
+### Logical Component Identity
+
+Each recipe contributes exactly one logical component: an independently
+assessable component instance with a creator-assigned name and version.
+The defaults are the recipe's `BPN` and `PV` (shortened: `+git...`
+suffixes are dropped), used only when semantically valid — a name-like
+and version-like value; degenerate values degrade to the `"unknown"`
+placeholder. Explicit overrides take precedence verbatim:
+
+```sh
+# Per-recipe, in the recipe or a .bbappend:
+CYCLONEDX_COMPONENT_NAME = "upstream-widget"
+CYCLONEDX_COMPONENT_VERSION = "2.4.1"
+```
+
+`CVE_PRODUCT` and `CVE_VERSION` are vulnerability-correlation aliases
+only: they never create or rename components. Every whitespace-separated
+alias token (including `vendor:`-qualified tokens, which qualify the
+correlation CPE) remains available in the component's
+`yocto:cve:product`, `yocto:cve:version` and `yocto:cve:cpe` properties,
+so all aliases keep reaching CVE and VEX matching. The Yocto/package
+identity of the build stays in the component purl (`pkg:yocto/...`,
+OpenEmbedded's purl prefix) alongside the logical identity.
+
+The component's single `cpe` uses the first declared `CVE_PRODUCT` token
+crossed with the first declared `CVE_VERSION` token; repeated aliases are
+deduplicated without changing declaration order in the properties.
+Other aliases remain available for in-layer vulnerability matching, but
+CPE-keyed external tools match the selected `cpe` field only.
+
+By default, two component instances that share a CPE are never deduplicated:
+they remain separate while their artifact, build, dependency, licence or
+vulnerability evidence differs; indistinguishable duplicates produce a
+`REQ-IDEN-001` alignment finding (see the alignment profile below) and a
+build warning. The opt-in CPE tooling projection described above may merge
+explained native instances, but never indistinguishable duplicates. Backported
+fixes are recorded as VEX statements and never
+change the logical component version. See
+`docs/migration/component-identity-cutover.md` for the breaking change
+history.
+
+### Dependency Graph
+
+The primary component (the delivered product) is the root of the
+dependency graph, and every component in the SBOM carries a `bom-ref`
+and exactly one `dependencies` entry - leaves with an empty list, so a
+machine can tell a known leaf apart from lost edges.
+
+Known dependency recipes outside the scope of delivery are no longer
+pruned: each path is followed to the first component outside the
+delivery item, which joins the document as an identified component
+(recipe name, `pkg:yocto/...` purl, scope `excluded` and a
+`yocto:delivery:scope: external` property that keeps it distinct from
+delivered instances). Resolution stops there; deeper dependencies are
+not claimed without evidence.
+
+Statically linked code is attributed from the debug-source lists
+BitBake's own `do_package` already records in pkgdata: a
+`/usr/src/debug/<BPN>/<PV>/` prefix of another recipe in a file's debug
+sources identifies the recipe whose code was linked in and becomes a
+dependency edge marked with a `yocto:dependency:evidence: debugsrc`
+property. No delivered binary is ever parsed. Missing or inhibited
+debug info (`INHIBIT_PACKAGE_DEBUG_SPLIT`) yields an honest unknown,
+never an absence-of-dependencies claim.
+
+CycloneDX `compositions` data declares the completeness of the
+dependency evidence per component - `complete`, `incomplete` or
+`unknown` - derived from those facts; unknown evidence never becomes a
+`complete` declaration. Inconsistent references (duplicate `bom-ref`s,
+dangling dependency references, ambiguous graph roots) are reported as
+alignment findings with the affected references and are never silently
+repaired: report enforcement publishes the graph as the build evidence
+states it, strict enforcement fails on it. See
+`docs/migration/graph-integrity-cutover.md` for the behavior changes.
+
 ### Component Scopes
 
 When including both runtime and build-time packages, meta-cyclonedx uses
@@ -389,6 +530,12 @@ The licenses data is taken from the component recipe
 (see [LICENSE](https://docs.yoctoproject.org/singleindex.html#term-LICENSE).
 Single licenses are matched against a list of [known SPDX licenses](/https://github.com/iris-GmbH/meta-cyclonedx/tree/main/meta/files/spdx-license-list-data)
 where possible.
+
+These are original licence evidence only - the licences the component
+creator assigned, carried with the CycloneDX acknowledgement `declared`.
+The distribution and effective licence roles and their authoritative
+sources are documented under "Licence Roles" in the alignment profile
+section below.
 
 If multiple licenses are specified using `&` or `|`, the license is converted
 into a [SPDX license expression](https://spdx.github.io/spdx-spec/v2.3/SPDX-license-expressions/#).
@@ -533,6 +680,291 @@ The following CycloneDX 1.7 features are **not currently supported** due to the 
 
 If you have specific requirements for these features, consider using external SBOM enrichment tools after generation or contributing implementations that integrate with specialized crypto scanners.
 
+### BSI TR-03183-2 Alignment Profile
+
+Selecting an **alignment profile** makes meta-cyclonedx apply BSI TR-03183-2
+mappings and checks and publish a machine-processable **alignment report**
+next to the SBOM and the separate VEX document. The alignment capability is
+**not a conformance claim**: meta-cyclonedx never labels an SBOM, product or
+manufacturer conformant with TR-03183-2 or the CRA. The **conformance
+determination** remains the manufacturer's own conclusion and requires
+completeness evidence that meta-cyclonedx cannot see.
+
+The full usage, integration and interpretation guide is
+[docs/alignment-profile.md](docs/alignment-profile.md); what to expect when
+upgrading across this release is in
+[docs/migration/tr-03183-alignment.md](docs/migration/tr-03183-alignment.md).
+
+```sh
+# Versioned alignment profile; empty disables alignment output (default).
+# "tr03183-2.1" pins the profile baseline to BSI TR-03183-2 v2.1.0 and the
+# BSI CycloneDX property taxonomy v0.1.2 on CycloneDX 1.6 or 1.7.
+CYCLONEDX_PROFILE = "tr03183-2.1"
+
+# Alignment enforcement (default: "report"):
+#   report - publish SBOM, VEX and alignment report despite known gaps
+#   strict - fail the build on machine-detectable violations or missing
+#            required assertions (still no conformance claim)
+CYCLONEDX_PROFILE_ENFORCEMENT = "report"
+```
+
+Unsupported profile names, unsupported enforcement values, enforcement
+without a profile, and profile selections below CycloneDX 1.6 fail during
+configuration.
+
+The report is deployed as `${CYCLONEDX_EXPORT_BASENAME}.alignment-report.json`
+(configurable via `CYCLONEDX_EXPORT_ALIGNMENT_REPORT`). It is byte-for-byte
+deterministic for equivalent build facts: it records the exact profile
+baseline (TR-03183-2 v2.1.0, BSI CycloneDX property taxonomy v0.1.2, the
+selected CycloneDX schema and the requirements-matrix version), and one
+finding per requirements-matrix row with a stable requirement identifier,
+its normative source, applicability, verdict (`verified`, `asserted`,
+`unmet` or `unverifiable`), evidence origin, affected component references
+where applicable and a diagnostic message. Caller assertions can only ever
+produce `asserted` findings, never `verified` ones, and `unverifiable`
+findings never block the output.
+
+#### Validation Before Publication
+
+With a profile selected, every emitted document is validated before
+publication. Every check is a requirements-matrix row, so its verdict
+rides the alignment report and gates strict enforcement exactly like
+every other finding:
+
+- **Official CycloneDX schema.** Every emitted SBOM and VEX validates
+  against the official JSON schema of the selected CycloneDX version
+  (`REQ-FMT-002`, `REQ-FMT-003`). The official schemas are vendored
+  with the layer under `lib/data/cyclonedx/` (provenance and pin in
+  the README there); the `jsonschema` library is feature-detected. A
+  build host without it records `unverifiable` schema findings - a
+  validator that cannot run never reports a silent pass, and
+  `unverifiable` never blocks `strict` enforcement.
+- **BSI property taxonomy.** Every `bsi:` property is validated against
+  the pinned registry of the profile baseline (property taxonomy
+  v0.1.2, vendored verbatim under `lib/data/` and mirrored as the
+  matrix's own registry): only registered names count and only in the
+  locations the registry allows (`REQ-TAX-001`), values must sit in the
+  registry's value domains (`REQ-TAX-002`), and per-component
+  cardinality must hold - the executable/archive/structured triple
+  complete exactly once when it applies, filename and licence
+  properties at most once (`REQ-TAX-003`). Drift away from the pinned
+  registry is an `unmet` finding in report mode and a
+  strict-enforcement rejection.
+- **Identifier syntax.** Emitted identifiers stay parseable downstream:
+  every purl parses as a Package URL (`REQ-IDEN-002`), every CPE -
+  component field or correlation alias - is a formatted CPE 2.3 string
+  (`REQ-IDEN-003`), and every SHA-512 is lowercase hex of 512 bits
+  riding `components[].hashes[]` under the `SHA-512` algorithm
+  (`REQ-IDEN-004`).
+- **Vulnerability separation.** No vulnerability data hides anywhere in
+  the SBOM - a document-wide scan catches embedded or nested records
+  the renderer copied verbatim (`REQ-VULN-001`) - and every VEX
+  assertion resolves to a logical, non-file component of the product:
+  files are delivery detail, never vulnerability subjects
+  (`REQ-VULN-002`).
+- **Enforcement equivalence.** A defect that yields an `unmet` finding
+  in report mode rejects the same input under `strict` enforcement -
+  there is one requirements matrix and one verdict path. The structured
+  strict failure lists every machine-detectable violation at once
+  (`violations`, ordered by requirement identifier, each with its
+  diagnostic message and affected bom-refs), so one build reports the
+  complete repair list.
+- **Report enforcement publishes documents with findings** - that
+  includes a schema-invalid document: it is published with loud
+  `unmet` findings naming the violated schema locations, and the
+  finding keeps the alignment report honest about the defect. **Strict
+  enforcement refuses publication** of the same document before any
+  artifact is deployed. This split is deliberate: report mode exists
+  to make gaps visible in CI, strict mode to gate them.
+
+#### Creator and URI Evidence
+
+With a profile selected, the product integration supplies the creator
+metadata explicitly; meta-cyclonedx never infers creators from free-form
+text and never names the product manufacturer as the creator of bundled
+third-party software.
+
+```sh
+# Entity responsible for compiling this SBOM (metadata.authors).
+# Entries are separated by ';' and each entry is
+#   "NAME <email-or-url>", "<URL>", a bare email address or a bare URL.
+CYCLONEDX_SBOM_CREATOR = "Acme SBOM Team <sbom@acme.example>; https://acme.example"
+
+# Creator of the delivered product (metadata.component); same grammar.
+CYCLONEDX_PRIMARY_COMPONENT_CREATOR = "Acme GmbH <product@acme.example>"
+
+# Per-recipe creator override for third-party components; takes
+# precedence over trustworthy upstream metadata (see below).
+CYCLONEDX_COMPONENT_CREATOR = ""
+```
+
+For third-party components the creator precedence is: the explicit
+`CYCLONEDX_COMPONENT_CREATOR` override, then **semantically trustworthy
+upstream metadata** — only the machine-readable upstream repository
+identity already recorded for the component: an upstream repository purl
+(`pkg:github|gitlab|bitbucket/...`, whose namespace is the upstream
+organization) or a fetcher-derived `vcs` external reference, from which
+the upstream organization and repository URL are derived — then
+unresolved, which the alignment report records as `unverifiable`
+(never `verified`, never fabricated).
+
+Source and deployable URIs follow the same trust rule: they are emitted
+only from the explicit override variables
+(`CYCLONEDX_COMPONENT_SOURCE_URI`, `CYCLONEDX_COMPONENT_DEPLOYABLE_URI`,
+`CYCLONEDX_PRIMARY_COMPONENT_SOURCE_URI`,
+`CYCLONEDX_PRIMARY_COMPONENT_DEPLOYABLE_URI`) or from metadata the layer
+already records (SRC_URI-derived references, layer revisions), and every
+emitted URI is syntax-validated; recorded URIs that fail validation are
+not emitted and are reported as `unmet`. Equivalent normalized evidence
+always produces identical creator, URI and report output.
+
+#### Licence Roles
+
+Recipe `LICENSE` metadata is **original licence** evidence - the
+licences assigned by a component's creator - with the `declared`
+acknowledgement. CycloneDX 1.7 carries it in `licenses`; when a
+distribution expression is also supplied, CycloneDX 1.6 carries the
+original declarations in `evidence.licenses` and the distribution
+expression in `licenses`, respecting 1.6's single-expression constraint.
+Distribution and effective licences exist only when explicitly supplied;
+neither is inferred from `LICENSE` or from the other role:
+
+```python
+# The licence under which recipients may use the component; an SPDX
+# licence expression, the explicitly identified semantically
+# authoritative source (recipe scope: components built here; image
+# scope: the delivered product).
+CYCLONEDX_DISTRIBUTION_LICENCE = "MIT"
+
+# The licence under which the creator of this SBOM uses the component;
+# optional, represented with the bsi:component:effectiveLicence
+# property only where supplied.
+CYCLONEDX_EFFECTIVE_LICENCE = ""
+```
+
+The renderer validates expressions against the SPDX licence and exception
+lists pinned to the selected CycloneDX version. `WITH` exceptions such as
+`GPL-2.0-only WITH Linux-syscall-note` are supported; OE `&` and `|`
+operators normalize to SPDX `AND` and `OR`. No legal or composition
+analysis is performed. Missing required original or distribution evidence
+is `unmet`, never filled by relabelling another role (ADR-0003).
+Caller-supplied licence assertions remain `asserted`, never `verified`.
+
+The versioned mapping from each baseline requirement to its CycloneDX
+representation and evaluation rule is project-owned data in
+`lib/alignment_profile.py`; an existing profile never floats to a newer
+guideline, taxonomy or schema version.
+
+Note: at this stage the profile's requirements matrix covers the
+TR-03183-2 v2.1.0 data-field, dependency-graph and mandatory file
+inventory baseline. Where the build itself cannot establish completeness
+(component discovery, dependency depth beyond the scope of delivery,
+missing debug information), the findings are `unverifiable` - a valid
+result that never blocks the output.
+
+#### File Inventory
+
+With an alignment profile selected, the build additionally inventories
+the **mandatory delivered files** and represents each as a CycloneDX
+`type: file` component (ADR-0005): every delivered executable and
+archive in the final root filesystem, the image's **primary deployable
+artifact**, and the **additional files** the product integration selects
+below. Files created by post-install scripts or image customization are
+included even without package ownership. Without a profile the inventory
+is fully inactive - no file is read, hashed or represented, and the
+SBOM is byte-comparable to earlier logical-component output. This
+default is intentional: ordinary configuration, documentation and data
+files stay omitted unless an explicit selection includes them.
+
+Representation per inventoried file:
+
+- `name`: the delivered filename (path basename); the `version` is the
+  creator-assigned version of the delivering recipe's logical
+  component - or, for unowned rootfs files and deploy-directory artifacts,
+  of the primary component
+- `hashes`: one SHA-512 over the delivered bytes - the artifact
+  identity; modes, paths and timestamps never enter the hash
+- `properties`: the pinned taxonomy's `bsi:component:filename`
+  (`executable|non-executable`), `bsi:component:archive`
+  (`archive|no archive`) and `bsi:component:structured`
+  (`structured|unstructured`) values
+- `bom-ref`: the deterministic `yocto-file:<recipe>:<delivered path>`
+  (`yocto-file::<absolute rootfs path>` for unowned rootfs files,
+  `yocto-file::<relative deploy path>` for deploy-directory artifacts)
+- graph participation: the delivering logical component's dependency
+  entry gains the file reference; the primary component owns unclaimed
+  rootfs files and deploy-directory artifacts. Each file is a leaf with
+  an empty list and never copies its owner's CPE, purl, licences, creator
+  or vulnerability findings (ADR-0006). VEX targets logical instances only.
+
+Classification is deterministic artifact inspection (ADR-0002): mode
+exec bits, `#!` shebangs and ELF signatures decide executability;
+container and compressed-stream magics (zip, tar, cpio, ar/deb, rpm,
+7z, gzip, xz, bzip2, zstd) decide archive status; `structured` reflects
+the metadata the artifact still carries - entry tables for archives,
+an ELF symbol table (a stripped ELF is `unstructured`) - inspected one
+nesting level deep for compressed tars. No binary analysis, dependency
+inference, debug-info extraction or plugin/`dlopen()` discovery ever
+happens; static-link attribution comes from pkgdata debug-source
+records only. Symlinks are not inventoried as separate artifacts: a
+link is a second name for the regular file it resolves to, which is
+inventoried itself. Discovery walks the final root filesystem in a
+`do_rootfs` post-function, after rootfs customization and while pseudo
+is active. Pkgdata `files_info` records attribute known paths but do not
+limit discovery; uninstalled package paths do not become missing files.
+Only mandatory regular files are hashed. The final deployment reuses
+this inventory snapshot rather than reopening the rootfs outside pseudo.
+
+Mandatory artifacts that are missing, unreadable or too truncated to
+classify never vanish from the output: they produce `REQ-FILE-00x`
+alignment findings naming the affected file references (`REQ-FILE-001`
+inventory coverage, `REQ-FILE-002` artifact inspection, `REQ-FILE-003`
+graph participation, `REQ-FILE-004` primary deployable artifact,
+`REQ-FILE-005` additional-file selection). `report` enforcement
+publishes documents and findings; `strict` enforcement fails on them.
+
+##### Primary deployable artifact and selected additional files
+
+The delivered image itself belongs to the mandatory inventory even
+though no root-filesystem package manifest names it. Because image
+assembly finishes after `do_rootfs`, the artifact bytes are not final
+during the document generation inside `do_rootfs`; hashing them there
+would chase a moving target. Image recipes with a profile therefore
+generate the final documents once more in `do_deploy_cyclonedx`, which
+now runs after `do_image_complete`: there the primary artifact's content is
+final, its bytes are hashed, and the entry joins the same file-
+inventory facts (`source: deployable`, owned by the primary component
+under the recipe-less facts key). Names come from the stable
+`${IMAGE_LINK_NAME}.<IMAGE_FSTYPES>` lineage (the same lineage the
+export basename follows), never the `DATETIME`-stamped filenames, and
+hashes cover content only - equivalent rebuilds, including
+sstate-restored artifacts under a fresh build stamp, reproduce identical
+inventories.
+
+```python
+# Explicitly selected additional deployed files (default: "").
+# Whitespace-separated shell-style globs (fnmatch; `*` crosses
+# directory boundaries) matched against paths relative to the image
+# deploy directory ${DEPLOY_DIR_IMAGE}; a leading "/" anchors there too.
+# This includes payloads deployed by kernel, bootloader and firmware
+# recipes, not just the image recipe's private staging directory.
+# A selection that resolves to nothing is a REQ-FILE-005 finding,
+# never silently skipped.
+CYCLONEDX_ADDITIONAL_FILES = "bzImage* *.efi firmware/*.bin initramfs-*.cpio.gz"
+```
+
+Kernel, bootloader, firmware, trusted-execution-environment, initramfs,
+embedded-image and other product payloads selected this way use the
+same deterministic classification, SHA-512 identity, BSI properties and
+graph rules as root-filesystem file components; they carry the primary
+component's version and hang off the graph root. Repeated discovery of
+one artifact instance through package, deployable or selection evidence
+deduplicates by artifact reference (recipe namespace plus delivered
+path): one component, one graph edge, one composition; the same bytes
+delivered at a different path remain distinct artifact instances.
+Deploy-phase cost: one deploy-directory walk plus SHA-512 of each
+deployable and selected file.
+
 ### Minimal SBOM Configuration
 
 Meta-cyclonedx supports generating a **minimal SBOM** that includes only the essential information required by the CycloneDX specification. This is useful for:
@@ -626,6 +1058,24 @@ CYCLONEDX_SPLIT_LICENSE_EXPRESSIONS = "1"
 # as a CycloneDX properties array (default: "").
 CYCLONEDX_COMPONENT_PROPERTIES = ""
 
+# Explicit logical component identity overrides (default: "" = BPN/PV).
+CYCLONEDX_COMPONENT_NAME = ""
+CYCLONEDX_COMPONENT_VERSION = ""
+
+# Creator evidence (contact grammar "NAME <email-or-url>", "<URL>",
+# a bare email address or a bare URL; ';' separates multiple contacts).
+# The product manufacturer is never the creator of third-party components.
+CYCLONEDX_SBOM_CREATOR = ""
+CYCLONEDX_PRIMARY_COMPONENT_CREATOR = ""
+CYCLONEDX_COMPONENT_CREATOR = ""
+
+# Explicit source/deployable URIs; the only sources besides recorded
+# metadata are these overrides, and URIs are syntax-validated (default: "").
+CYCLONEDX_COMPONENT_SOURCE_URI = ""
+CYCLONEDX_COMPONENT_DEPLOYABLE_URI = ""
+CYCLONEDX_PRIMARY_COMPONENT_SOURCE_URI = ""
+CYCLONEDX_PRIMARY_COMPONENT_DEPLOYABLE_URI = ""
+
 # CycloneDX 1.7 optional features
 CYCLONEDX_ADD_LICENSE_DETAILS = "1"  # Include license text for custom licenses
 CYCLONEDX_ADD_CITATION = "1"         # Document SBOM provenance
@@ -634,6 +1084,31 @@ CYCLONEDX_TLP_MARKING = ""           # TLP marking (CLEAR|GREEN|AMBER|AMBER_AND_
 # Space-separated list of recipes to always include with scope "required",
 # even if they do not produce rootfs packages (default: "").
 CYCLONEDX_EXTRA_RUNTIME_RECIPES = ""
+
+# CPE-keyed tooling-only merge of distinguishable native instances sharing
+# a correlation CPE (default: "0"; absorbed identities and per-instance
+# distinctions are lost, so output is not a truthful inventory).
+# Cannot be combined with CYCLONEDX_PROFILE.
+CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS = "0"
+
+# CPE-keyed tooling-only alias rows (default: "0"; not a truthful inventory
+# of separate builds). Filter projected rows by the
+# yocto:projection:cve-product-alias = "true" property.
+# Cannot be combined with CYCLONEDX_PROFILE.
+CYCLONEDX_EXPAND_CVE_PRODUCT_ALIASES = "0"
+
+# BSI TR-03183-2 alignment profile (default: "", no alignment output)
+CYCLONEDX_PROFILE = ""                    # or "tr03183-2.1"
+CYCLONEDX_PROFILE_ENFORCEMENT = "report"  # or "strict"
+CYCLONEDX_EXPORT_ALIGNMENT_REPORT = "${CYCLONEDX_EXPORT_BASENAME}.alignment-report.json"
+
+# Profile-gated: explicitly selected additional deployed files.
+# Whitespace-separated globs relative to the image deploy directory
+# ${DEPLOY_DIR_IMAGE}; a leading "/" anchors there too (default: "").
+# The primary deployable
+# artifact is always inventoried under a profile; ordinary data files
+# are not.
+CYCLONEDX_ADDITIONAL_FILES = ""
 ```
 
 ### Use with non-rootfs image recipes

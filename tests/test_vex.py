@@ -1,4 +1,4 @@
-"""VEX document behavior: reference resolution, coverage dedup, ordering."""
+"""VEX document behavior: reference resolution, statement coverage, ordering."""
 
 from helpers import (affect_refs, default_facts, dep, fragment, pkg, render_docs,
                      vuln, vuln_by_id)
@@ -26,17 +26,9 @@ def test_no_placeholder_survives_into_the_vex():
     assert "<SBOM_SERIAL>" not in str(vex)
 
 
-def test_statements_beyond_the_last_component_are_dropped():
-    facts = default_facts(fragments={
-        "openssl": fragment(pkgs=[pkg("openssl", "3.2", "ref-o")],
-                            cves=[vuln("CVE-2024-1", "ref-nonexistent")]),
-    })
-    _sbom, vex, _logs = render_docs(facts)
-
-    assert vex["vulnerabilities"] == []
-
-
-def test_duplicate_cve_across_recipes_sharing_a_cpe_is_stated_once():
+def test_colliding_instances_keep_their_own_statements():
+    # CPE equality never merges statements: each independently assessable
+    # instance keeps its own statement of the shared CVE.
     shared_cpe = "cpe:2.3:*:*:widget:1.0:*:*:*:*:*:*:*"
     facts = default_facts(fragments={
         "widget-a": fragment(pkgs=[pkg("widget", "1.0", "ref-a", cpe=shared_cpe)],
@@ -46,10 +38,11 @@ def test_duplicate_cve_across_recipes_sharing_a_cpe_is_stated_once():
     })
     sbom, vex, _logs = render_docs(facts)
 
-    statement = vuln_by_id(vex, "CVE-2024-9")
     serial = sbom["serialNumber"].split("urn:uuid:")[-1]
-    # the dropped duplicate's reference resolves to the surviving component
-    assert affect_refs(statement) == [f"urn:cdx:{serial}/1#ref-a"]
+    statements = [v for v in vex["vulnerabilities"] if v["id"] == "CVE-2024-9"]
+    assert len(statements) == 2
+    assert sorted(affect_refs(v)[0] for v in statements) == [
+        f"urn:cdx:{serial}/1#ref-a", f"urn:cdx:{serial}/1#ref-b"]
 
 
 def test_vulnerabilities_are_ordered_by_identifier():
@@ -79,3 +72,20 @@ def test_independently_assessable_instances_keep_disjoint_statements():
     assert len(statements) == 2
     assert [affect_refs(s) for s in statements] == [
         [f"urn:cdx:{serial}/1#ref-1"], [f"urn:cdx:{serial}/1#ref-2"]]
+
+
+def test_different_analyses_of_the_same_target_are_not_silently_discarded():
+    statements = [
+        vuln("CVE-2024-42", "ref-busybox", state="not_affected",
+             detail="code is absent"),
+        vuln("CVE-2024-42", "ref-busybox", state="not_affected",
+             detail="code is unreachable"),
+    ]
+    facts = default_facts()
+    facts["fragments"]["busybox"]["cves"] = statements
+    sbom, vex, _logs = render_docs(facts)
+    assert {v["analysis"]["detail"] for v in vex["vulnerabilities"]} == {
+        "code is absent", "code is unreachable"}
+    serial = sbom["serialNumber"].removeprefix("urn:uuid:")
+    assert all(affect_refs(v) == [f"urn:cdx:{serial}/1#ref-busybox"]
+               for v in vex["vulnerabilities"])

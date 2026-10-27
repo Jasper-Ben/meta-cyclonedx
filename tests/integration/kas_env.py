@@ -34,6 +34,11 @@ TARGET = "core-image-minimal"
 #: `<image>-<machine><IMAGE_NAME_SUFFIX>.manifest`.
 SBOM_NAME = f"{TARGET}.cyclonedx.bom.json"
 VEX_NAME = f"{TARGET}.cyclonedx.vex.json"
+#: The alignment report deployed by a profile run: the class default is
+#: `${CYCLONEDX_EXPORT_BASENAME}.alignment-report.json` and kas.yml fixes
+#: the basename, so the name derives from the same coordinates as the
+#: SBOM/VEX names above.
+ALIGNMENT_REPORT_NAME = SBOM_NAME.removesuffix(".bom.json") + ".alignment-report.json"
 MANIFEST_NAME = f"{TARGET}-{MACHINE}.rootfs.manifest"
 
 #: Tag-pinned kas tool submodule (its wrapper script pins the container image).
@@ -96,6 +101,42 @@ FIXTURES_IMAGE_EXTRA_RECIPE = (
 )
 IMAGE_EXTRA_INSTALL_ENV = {"CORE_IMAGE_EXTRA_INSTALL": IMAGE_EXTRA_RECIPE_NAME}
 
+#: The alignment-profile acceptance scenario: the profile selector and its
+#: enforcement reach BitBake through the same env-forwarding channel as
+#: `CORE_IMAGE_EXTRA_INSTALL` (kas.yml's `env:` block declares every key;
+#: values must contain no whitespace, see runtime_env_args). `report`
+#: enforcement publishes SBOM, VEX and alignment report despite findings.
+ALIGNMENT_PROFILE = "tr03183-2.1"
+ALIGNMENT_REPORT_ENV = {
+    "CYCLONEDX_PROFILE": ALIGNMENT_PROFILE,
+    "CYCLONEDX_PROFILE_ENFORCEMENT": "report",
+}
+
+#: The strict scenario's one controlled, machine-detectable violation: a
+#: primary-component creator that parses as a bare contact entry but
+#: carries no machine-actionable email or URL. The renderer rejects it
+#: with a loud warning (so nothing about it is silently dropped), the
+#: REQ-COMP-012 finding turns `unmet`, report enforcement still publishes,
+#: and strict enforcement rejects the output. The value must stay free of
+#: whitespace, angle brackets, `@`, and any parsable URI scheme: it has to
+#: ride the word-split --runtime-args channel untouched.
+ALIGNMENT_STRICT_VIOLATION_CREATOR = "AcmeGmbH"
+ALIGNMENT_VIOLATION_CREATOR_ENV = {
+    "CYCLONEDX_PRIMARY_COMPONENT_CREATOR": ALIGNMENT_STRICT_VIOLATION_CREATOR
+}
+ALIGNMENT_VIOLATION_REPORT_ENV = {
+    **ALIGNMENT_REPORT_ENV,
+    **ALIGNMENT_VIOLATION_CREATOR_ENV,
+}
+ALIGNMENT_STRICT_ENV = {
+    "CYCLONEDX_PROFILE": ALIGNMENT_PROFILE,
+    "CYCLONEDX_PROFILE_ENFORCEMENT": "strict",
+    **ALIGNMENT_VIOLATION_CREATOR_ENV,
+}
+
+#: Glob matching every deployed alignment-report artifact (file or link).
+ALIGNMENT_REPORT_GLOB = "*.cyclonedx.alignment-report.json"
+
 SKIP_HINT = (
     "no container runtime found: install Podman (https://podman.io, "
     "preferred) or Docker and re-run `pytest -m integration`; set "
@@ -103,14 +144,17 @@ SKIP_HINT = (
 )
 
 
-#: CycloneDX schema validation uses the `jsonschema` library — an
-#: integration-layer-only dependency the unit suite never imports; the
-#: schema itself is vendored under tests/integration/vendor/cyclonedx.
+#: CycloneDX schema validation is feature-detected: the renderer degrades
+#: to `unverifiable` findings without the `jsonschema` library, which the
+#: unit suite never requires; the deployed-document oracle asserts real
+#: verdicts and skips with this hint when validation cannot run. The
+#: official schemas are vendored under lib/data/cyclonedx.
 JSONSCHEMA_HINT = (
     "the `jsonschema` Python package is not installed: install it for the "
-    "integration layer, e.g. `sudo apt-get install python3-jsonschema` or "
-    "`python3 -m pip install jsonschema` (integration-only dependency, "
-    "documented in docs/testing.md; unit runs never import it)"
+    "deployed-document validation tier, e.g. "
+    "`sudo apt-get install python3-jsonschema` or "
+    "`python3 -m pip install jsonschema` (optional dependency, documented "
+    "in docs/testing.md; unit runs never require it)"
 )
 
 #: The engine-override value selecting direct mode: the kas tool installed
@@ -590,6 +634,35 @@ def workspace_env():
     env["KAS_WORK_DIR"] = str(REPO_ROOT)
     env.update({key: str(value) for key, value in dirs.items()})
     return env
+
+
+def deploy_dir(workspace=WORKSPACE):
+    """The documented output location: TMPDIR/deploy/images/<machine>.
+
+    The same path the run recorder snapshots per invocation; exposed here
+    so harness code without a recorded build (profile-scenario cleanup)
+    addresses the very same directory.
+    """
+    return build_dir(workspace) / "tmp" / "deploy" / "images" / MACHINE
+
+
+def remove_deployed_alignment_reports(directory):
+    """Delete deployed alignment-report artifacts under *directory*.
+
+    A baseline (profile-less) invocation restores the deployed SBOM and
+    VEX bytes through do_deploy_cyclonedx's sstate install — but an
+    sstate install never *removes* files. Profile runs would otherwise
+    leave their reports in the shared deploy directory forever, and the
+    rest of the matrix compares whole deploy-dir checksum maps for byte
+    identity (R2). The profile scenario therefore cleans up exactly what
+    it introduced: report files and their symlinks, nothing else.
+    """
+    removed = []
+    for path in sorted(directory.glob(ALIGNMENT_REPORT_GLOB)):
+        if path.is_symlink() or path.is_file():
+            path.unlink()
+            removed.append(path)
+    return removed
 
 
 def runtime_env_args(env):
