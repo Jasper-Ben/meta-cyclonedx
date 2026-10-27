@@ -70,10 +70,20 @@ and alignment-profile output share the corrected model.
    Ordinary output retains this model by default. Integrators targeting
    CPE-keyed tools may explicitly opt into the lossy
    [`CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS`](../../README.md#cpe-collision-deduplication-opt-in)
-   projection or the view-only
+   and/or view-only
    [`CYCLONEDX_EXPAND_CVE_PRODUCT_ALIASES`](../../README.md#cve-product-alias-expansion-opt-in)
-   projection. Alignment-profile output accepts neither flag.
+   projections. Together the flags expand aliases first, then deduplicate
+   the projected rows across recipes; neither flag changes the fragment
+   identity model, and alignment-profile output accepts neither flag
+   ([ADR-0013](../adr/0013-keep-cpe-projections-at-render-boundary.md)).
 
+
+7. **Winning correlation alias.** For multi-alias recipes the component
+   `cpe` now uses the first declared `CVE_PRODUCT` token crossed with the
+   first declared `CVE_VERSION` token, not the alphabetically first.
+   CPE-keyed findings may re-key to that alias; no findings are lost
+   from in-layer matching because all aliases remain in `yocto:cve:*`
+   properties in declaration order.
 
 7. **Winning correlation alias.** For multi-alias recipes the component
    `cpe` now uses the first declared `CVE_PRODUCT` token crossed with the

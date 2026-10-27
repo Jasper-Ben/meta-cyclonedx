@@ -139,6 +139,33 @@ def test_duplicate_products_and_multiple_versions_keep_one_row_per_product():
     }
 
 
+def test_bare_and_wildcard_vendor_tokens_project_one_row_per_cpe():
+    gcc_cpe = "cpe:2.3:*:*:gcc:6.6:*:*:*:*:*:*:*"
+    vendor_cpe = "cpe:2.3:*:acme:gcc:6.6:*:*:*:*:*:*:*"
+    for tokens, expected_group in (
+            (("gcc", "*:gcc"), None),
+            (("*:gcc", "gcc"), "*")):
+        facts = alias_facts(expand_cve_product_aliases=True)
+        logical = facts["fragments"]["kernel"]["pkgs"][0]
+        logical["properties"].extend(
+            {"name": "yocto:cve:product", "value": token}
+            for token in (*tokens, "acme:gcc"))
+        logical["properties"].extend([
+            {"name": "yocto:cve:cpe", "value": gcc_cpe},
+            {"name": "yocto:cve:cpe", "value": vendor_cpe},
+        ])
+
+        sbom, _vex, _logs = render_docs(facts)
+        aliases = [component for component in sbom["components"]
+                   if {"name": "yocto:projection:cve-product-alias",
+                       "value": "true"} in component.get("properties", [])]
+        assert [(alias["cpe"], alias.get("group")) for alias in aliases] == [
+            (ALIAS_CPE, None), (gcc_cpe, expected_group), (vendor_cpe, "acme")]
+        assert all(next(entry for entry in sbom["dependencies"]
+                        if entry["ref"] == alias["bom-ref"])["dependsOn"]
+                   == ["ref-kernel"] for alias in aliases)
+
+
 def test_expansion_preserves_primary_included_imported_and_embedded_graphs():
     from helpers import document, vex_document
 
@@ -595,3 +622,150 @@ def test_profile_with_alias_expansion_is_rejected_at_configuration_gate():
     assert meta_cyclonedx.config_errors(
         "1.7", "firmware", profile="", enforcement="report",
         expand_cve_product_aliases=True) is None
+
+
+def test_combined_projection_merges_shared_upstream_and_cross_recipe_aliases():
+    """Expansion must feed dedup: both recipes contribute the same secondary CPE."""
+    facts = default_facts(
+        config=default_config(expand_cve_product_aliases=True,
+                              deduplicate_cpe_collisions=True),
+        fragments={
+            "alpha": fragment(
+                pkgs=[pkg("alpha", "13", "ref-a", cpe=CPE,
+                          properties=[
+                              {"name": "yocto:cve:product", "value": "gcc"},
+                              {"name": "yocto:cve:product", "value": "gcc_bridge"},
+                              {"name": "yocto:cve:version", "value": "13"},
+                              {"name": "yocto:cve:cpe", "value": CPE},
+                              {"name": "yocto:cve:cpe", "value": BRIDGE_CPE}])],
+                dependencies=[dep("ref-a", ["beta"])],
+                cves=[vuln("CVE-2025-81", "ref-a")]),
+            "beta": fragment(
+                pkgs=[pkg("beta", "13", "ref-b", cpe=CPE,
+                          properties=[
+                              {"name": "yocto:cve:product", "value": "gcc"},
+                              {"name": "yocto:cve:product", "value": "gcc_bridge"},
+                              {"name": "yocto:cve:version", "value": "13"},
+                              {"name": "yocto:cve:cpe", "value": CPE},
+                              {"name": "yocto:cve:cpe", "value": BRIDGE_CPE}])],
+                cves=[vuln("CVE-2025-81", "ref-b")],
+                extra_components=[{"type": "file", "name": "beta.so",
+                                   "bom-ref": "file:beta.so"}],
+                extra_roots=["file:beta.so"]),
+        },
+        image_install_recipes=["alpha", "beta"])
+    sbom, vex, _logs = render_docs(facts)
+    assert {cpe: sum(component.get("cpe") == cpe
+                     for component in sbom["components"])
+            for cpe in (CPE, BRIDGE_CPE)} == {CPE: 1, BRIDGE_CPE: 1}
+    assert {component["bom-ref"] for component in sbom["components"]} == {
+        "ref-a", "file:beta.so",
+        next(component["bom-ref"] for component in sbom["components"]
+             if component.get("cpe") == BRIDGE_CPE)}
+    assert "file:beta.so" in next(entry for entry in sbom["dependencies"]
+                                  if entry["ref"] == "ref-a")["dependsOn"]
+    alias_ref = next(component["bom-ref"] for component in sbom["components"]
+                     if component.get("cpe") == BRIDGE_CPE)
+    assert next(entry for entry in sbom["dependencies"]
+                if entry["ref"] == alias_ref)["dependsOn"] == ["ref-a"]
+    assert sum(composition.get("assemblies") == [alias_ref]
+               for composition in sbom["compositions"]) == 1
+    assert len(vex["vulnerabilities"]) == 1
+    assert vex["vulnerabilities"][0]["affects"] == [{
+        "ref": f"urn:cdx:{sbom['serialNumber'].removeprefix('urn:uuid:')}/1#ref-a"}]
+    refs = {component["bom-ref"] for component in sbom["components"]} | {
+        sbom["metadata"]["component"]["bom-ref"]}
+    assert all(entry["ref"] in refs and set(entry["dependsOn"]) <= refs
+               for entry in sbom["dependencies"])
+    assert all(set(composition["assemblies"]) <= refs
+               for composition in sbom["compositions"])
+    repeated_sbom, repeated_vex, _ = render_docs(copy.deepcopy(facts))
+    def stable(value):
+        return re.sub(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                      r"[0-9a-f]{4}-[0-9a-f]{12}", "<uuid>",
+                      json.dumps(value, sort_keys=True))
+    assert stable((sbom, vex)) == stable((repeated_sbom, repeated_vex))
+
+    plain_facts = copy.deepcopy(facts)
+    plain_facts["config"] = default_config()
+    off_facts = copy.deepcopy(facts)
+    off_facts["config"] = default_config(
+        expand_cve_product_aliases=False,
+        deduplicate_cpe_collisions=False)
+    assert stable(render_docs(plain_facts)[:2]) == stable(
+        render_docs(off_facts)[:2])
+    assert meta_cyclonedx.config_errors(
+        "1.7", "firmware", "tr03183-2.1", "report",
+        expand_cve_product_aliases=True,
+        deduplicate_cpe_collisions=True) is not None
+
+
+def test_combined_pipeline_absorbs_alias_row_whose_cpe_matches_a_logical_row():
+    facts = twin_facts(expand_cve_product_aliases=True,
+                       deduplicate_cpe_collisions=True)
+    for recipe in ("libgcc", "gcc-runtime"):
+        facts["fragments"][recipe]["pkgs"][0].setdefault("properties", []).extend([
+            {"name": "yocto:cve:product", "value": "*:gcc"},
+            {"name": "yocto:cve:version", "value": "13"},
+            {"name": "yocto:cve:cpe", "value": CPE},
+        ])
+
+    sbom, vex, _logs = render_docs(facts)
+    assert len([component for component in sbom["components"]
+                if component.get("cpe") == CPE]) == 1
+    assert not any({"name": "yocto:projection:cve-product-alias",
+                    "value": "true"} in component.get("properties", [])
+                   for component in sbom["components"])
+    assert_no_removed_references(sbom, vex, {"ref-z"})
+    refs = {component["bom-ref"] for component in sbom["components"]} | {
+        sbom["metadata"]["component"]["bom-ref"]}
+    assert all(set(composition["assemblies"]) <= refs
+               for composition in sbom["compositions"])
+
+
+def test_combined_projection_retains_absorbed_recipes_distinct_primary_cpe():
+    runtime_cpe = "cpe:2.3:*:*:runtime:13:*:*:*:*:*:*:*"
+    facts = default_facts(
+        config=default_config(expand_cve_product_aliases=True,
+                              deduplicate_cpe_collisions=True),
+        fragments={
+            "alpha": fragment(pkgs=[pkg(
+                "alpha", "13", "ref-a", cpe=CPE, properties=[
+                    {"name": "yocto:cve:product", "value": "gcc"},
+                    {"name": "yocto:cve:product", "value": "gcc_bridge"},
+                    {"name": "yocto:cve:version", "value": "13"},
+                    {"name": "yocto:cve:cpe", "value": CPE},
+                    {"name": "yocto:cve:cpe", "value": BRIDGE_CPE}])]),
+            "beta": fragment(pkgs=[pkg(
+                "beta", "13", "ref-b", cpe=runtime_cpe, properties=[
+                    {"name": "yocto:cve:product", "value": "runtime"},
+                    {"name": "yocto:cve:product", "value": "gcc_bridge"},
+                    {"name": "yocto:cve:version", "value": "13"},
+                    {"name": "yocto:cve:cpe", "value": runtime_cpe},
+                    {"name": "yocto:cve:cpe", "value": BRIDGE_CPE}])],
+                cves=[vuln("CVE-2025-82", "ref-b")]),
+        },
+        image_install_recipes=["alpha", "beta"])
+    sbom, vex, _logs = render_docs(facts)
+    assert {component["cpe"] for component in sbom["components"]} == {
+        CPE, BRIDGE_CPE, runtime_cpe}
+    assert len(sbom["components"]) == 3
+    assert_no_removed_references(sbom, vex, {"ref-b"})
+    assert next(c for c in sbom["components"] if c["cpe"] == runtime_cpe)[
+        "version"] == "13"
+
+
+def test_combined_projection_does_not_absorb_imported_projection_markers():
+    imported = pkg("foreign", "13", "ref-imported", cpe=CPE,
+                   properties=[{"name": "yocto:projection:cve-product-alias",
+                                "value": "true"}])
+    facts = twin_facts(expand_cve_product_aliases=True,
+                       deduplicate_cpe_collisions=True)
+    facts["fragments"]["libgcc"]["extra_components"] = [imported]
+    facts["fragments"]["libgcc"]["extra_dependencies"] = [
+        dep("ref-imported", ["ref-a"])]
+    sbom, _vex, _logs = render_docs(facts)
+    assert next(component for component in sbom["components"]
+                if component["bom-ref"] == "ref-imported") == imported
+    assert next(entry for entry in sbom["dependencies"]
+                if entry["ref"] == "ref-imported") == dep("ref-imported", ["ref-a"])

@@ -56,6 +56,12 @@ carry only what the
   their logical component. These tooling-only rows own no files or VEX
   statements; alignment profiles reject the flag at parse time. Default
   output remains unchanged.
+- **Combined CPE tooling view**: enabling both opt-in flags expands
+  CVE product aliases before deduplicating explained recipe collisions.
+  Shared alias rows collapse across recipes, while distinct primary CPEs
+  of absorbed recipes remain available as marked view rows. Dependencies,
+  VEX targets and delivered-file ownership resolve to survivors. Neither
+  option is compatible with an alignment profile.
 - **File inventory**: delivered executables, archives and the primary
   deployable artifact are represented as file components with SHA-512
   artifact identities; `CYCLONEDX_ADDITIONAL_FILES` selects further
