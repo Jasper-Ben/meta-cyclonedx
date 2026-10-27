@@ -212,11 +212,14 @@ Imported and embedded SBOM component graphs are not deduplicated.
 ### CVE Product Alias Expansion (Opt-In)
 
 Set `CYCLONEDX_EXPAND_CVE_PRODUCT_ALIASES = "1"` for CPE-keyed tools
-that do not inspect `yocto:cve:*` properties. Every distinct secondary
-`CVE_PRODUCT` token of a recipe gains one projected component, regardless
-of how many `CVE_VERSION` values the recipe declares. Vendor-qualified tokens
-use the vendor as `group` and the bare product as `name`. Each projected row
-uses the first short correlation version in its `version` and `cpe` fields;
+that do not inspect `yocto:cve:*` properties. Each distinct secondary
+`CVE_PRODUCT` correlation CPE of a recipe gains one projected component,
+regardless of how many `CVE_VERSION` values the recipe declares. A bare
+product and its explicit `*`-vendor token share a CPE and yield only one row;
+an alias matching the logical component's primary CPE adds no row.
+Vendor-qualified tokens use the vendor as `group` and the bare product as
+`name`. Each projected row uses the first short correlation version in its
+`version` and `cpe` fields;
 the other CPE versions remain in its `yocto:cve:cpe` properties. A dependency
 edge from each alias to the logical component expresses the composition;
 `yocto:projection:cve-product-alias = "true"` identifies these view-only
@@ -1081,6 +1084,12 @@ CYCLONEDX_TLP_MARKING = ""           # TLP marking (CLEAR|GREEN|AMBER|AMBER_AND_
 # Space-separated list of recipes to always include with scope "required",
 # even if they do not produce rootfs packages (default: "").
 CYCLONEDX_EXTRA_RUNTIME_RECIPES = ""
+
+# CPE-keyed tooling-only merge of distinguishable native instances sharing
+# a correlation CPE (default: "0"; absorbed identities and per-instance
+# distinctions are lost, so output is not a truthful inventory).
+# Cannot be combined with CYCLONEDX_PROFILE.
+CYCLONEDX_DEDUPLICATE_CPE_COLLISIONS = "0"
 
 # CPE-keyed tooling-only alias rows (default: "0"; not a truthful inventory
 # of separate builds). Filter projected rows by the
