@@ -1,4 +1,4 @@
-"""Opt-in CPE collision view through the public renderer and configuration gate."""
+"""Opt-in CPE tooling views through the public renderer and configuration gate."""
 
 import copy
 import json
@@ -10,6 +10,86 @@ from helpers import (default_config, default_facts, dep, fragment, pkg,
                      render_docs, vuln)
 
 CPE = "cpe:2.3:*:*:gcc:13:*:*:*:*:*:*:*"
+ALIAS_CPE = "cpe:2.3:*:*:linux_kernel:6.6:*:*:*:*:*:*:*"
+PRIMARY_CPE = "cpe:2.3:*:*:linux:6.6:*:*:*:*:*:*:*"
+
+
+def alias_facts(**config):
+    return default_facts(
+        config=default_config(**config),
+        fragments={"kernel": fragment(
+            pkgs=[pkg("linux-yocto", "6.6", "ref-kernel", cpe=PRIMARY_CPE,
+                      properties=[
+                          {"name": "yocto:cve:product", "value": "linux"},
+                          {"name": "yocto:cve:product", "value": "linux_kernel"},
+                          {"name": "yocto:cve:version", "value": "6.6"},
+                          {"name": "yocto:cve:cpe", "value": PRIMARY_CPE},
+                          {"name": "yocto:cve:cpe", "value": ALIAS_CPE}])],
+            cves=[vuln("CVE-2025-1", "ref-kernel")],
+            extra_components=[{"type": "file", "name": "vmlinux",
+                               "version": "6.6", "bom-ref": "file:vmlinux"}],
+            extra_roots=["file:vmlinux"])},
+        image_install_recipes=["kernel"], runtime_recipes=["kernel"])
+
+
+def test_second_recipe_alias_projects_one_marked_component_without_owning_files_or_vex():
+    sbom, vex, logs = render_docs(alias_facts(expand_cve_product_aliases=True))
+    logical = next(c for c in sbom["components"] if c["name"] == "linux-yocto")
+    aliases = [c for c in sbom["components"] if any(
+        prop.get("name") == "yocto:projection:cve-product-alias"
+        for prop in c.get("properties", []))]
+    assert len(aliases) == 1
+    alias = aliases[0]
+    assert alias["name"] == "linux_kernel"
+    assert alias["cpe"] == ALIAS_CPE
+    assert alias["bom-ref"] != logical["bom-ref"]
+    assert {"aggregate": "unknown", "assemblies": [alias["bom-ref"]]} in (
+        sbom["compositions"])
+    assert next(e for e in sbom["dependencies"] if e["ref"] == alias["bom-ref"])[
+        "dependsOn"] == [logical["bom-ref"]]
+    assert "file:vmlinux" in next(e for e in sbom["dependencies"]
+                                  if e["ref"] == logical["bom-ref"])["dependsOn"]
+    assert "file:vmlinux" not in next(e for e in sbom["dependencies"]
+                                      if e["ref"] == alias["bom-ref"])["dependsOn"]
+    assert len(vex["vulnerabilities"]) == 1
+    serial = sbom["serialNumber"].removeprefix("urn:uuid:")
+    assert vex["vulnerabilities"][0]["affects"] == [
+        {"ref": f"urn:cdx:{serial}/1#{logical['bom-ref']}"}]
+    assert any(level == "note" and "CYCLONEDX_EXPAND_CVE_PRODUCT_ALIASES" in message
+               for level, message in logs)
+
+
+def test_alias_flag_off_keeps_exact_rendered_bytes():
+    plain, plain_vex, _ = render_docs(alias_facts())
+    off, off_vex, _ = render_docs(alias_facts(expand_cve_product_aliases=False))
+
+    def stable(sbom, vex):
+        return re.sub(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                      r"[0-9a-f]{4}-[0-9a-f]{12}", "<uuid>",
+                      json.dumps((sbom, vex), sort_keys=True))
+
+    assert stable(plain, plain_vex) == stable(off, off_vex)
+    assert {component["name"] for component in plain["components"]} == {
+        "linux-yocto", "vmlinux"}
+
+
+
+def test_alias_expansion_does_not_project_imported_components():
+    facts = alias_facts(expand_cve_product_aliases=True)
+    imported = pkg("foreign", "6.6", "ref-imported", cpe=PRIMARY_CPE,
+                   properties=[
+                       {"name": "yocto:cve:product", "value": "linux"},
+                       {"name": "yocto:cve:product", "value": "linux_kernel"},
+                       {"name": "yocto:cve:version", "value": "6.6"},
+                       {"name": "yocto:cve:cpe", "value": ALIAS_CPE}])
+    facts["fragments"]["kernel"]["extra_components"].append(imported)
+
+    sbom, _vex, _logs = render_docs(facts)
+    aliases = [c for c in sbom["components"] if any(
+        prop.get("name") == "yocto:projection:cve-product-alias"
+        for prop in c.get("properties", []))]
+    assert len(aliases) == 1
+    assert next(c for c in sbom["components"] if c["bom-ref"] == "ref-imported") == imported
 
 
 def twin_facts(**config):
@@ -183,3 +263,15 @@ def test_profile_with_deduplication_is_rejected_at_configuration_gate():
     assert meta_cyclonedx.config_errors(
         "1.7", "firmware", profile="", enforcement="report",
         deduplicate_cpe_collisions=True) is None
+
+
+def test_profile_with_alias_expansion_is_rejected_at_configuration_gate():
+    for spec_version in ("1.6", "1.7"):
+        for enforcement in ("report", "strict"):
+            assert "CYCLONEDX_EXPAND_CVE_PRODUCT_ALIASES" in (
+                meta_cyclonedx.config_errors(
+                    spec_version, "firmware", profile="tr03183-2.1",
+                    enforcement=enforcement, expand_cve_product_aliases=True) or "")
+    assert meta_cyclonedx.config_errors(
+        "1.7", "firmware", profile="", enforcement="report",
+        expand_cve_product_aliases=True) is None

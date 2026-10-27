@@ -255,6 +255,22 @@ components are no longer present in the output. It cannot be combined
 with `CYCLONEDX_PROFILE`; that configuration fails at parse time.
 Imported and embedded SBOM component graphs are not deduplicated.
 
+### CVE Product Alias Expansion (Opt-In)
+
+Set `CYCLONEDX_EXPAND_CVE_PRODUCT_ALIASES = "1"` for CPE-keyed tools
+that do not inspect `yocto:cve:*` properties. For a recipe with multiple
+`CVE_PRODUCT` tokens, each secondary product gains a projected component
+whose `cpe` carries that alias. A dependency edge from the alias to the
+logical component expresses the composition; the property
+`yocto:projection:cve-product-alias = "true"` identifies these view-only
+rows. The logical component remains the inventory and VEX anchor: aliases
+own no delivered files and receive no VEX statements.
+
+This flag defaults to `"0"` and changes no default output. Enabled output
+adds tooling-only components and is not a truthful inventory of separately
+built software. Imported and embedded graphs are not expanded. It cannot
+be combined with `CYCLONEDX_PROFILE`; that combination fails at parse time.
+
 ### Recipe-contributed CycloneDX Fragments
 
 Language ecosystems that resolve their own dependency trees — cargo, npm, go —
